@@ -380,6 +380,7 @@ class Editor(QMainWindow):
         self.voiceover_dialog=None; self.voiceover_target=None
         self.transport_timer=QTimer(self); self.transport_timer.setInterval(40); self.transport_timer.timeout.connect(self.transport_tick)
         self.pending_seek=None; self.worker=None; self.recovery_enabled=recovery
+        self._closing=False
         self.update_job=None; self.update_download_job=None; self.update_artifact=None
         self.setWindowTitle(f'Framecut {APP_VERSION} · Neues Projekt')
         self.resize(1460,980); self.setMinimumSize(1120,740)
@@ -2761,7 +2762,7 @@ class Editor(QMainWindow):
         else:self.error(result.get('error','Unbekannter Fehler'))
 
     def check_for_updates(self,silent=False):
-        if self.update_job or self.update_download_job:
+        if self._closing or self.update_job or self.update_download_job:
             return
         manifest_url=configured_manifest_url()
         if not manifest_url:
@@ -2945,8 +2946,15 @@ class Editor(QMainWindow):
                 event.ignore();return
             self.render_queue.clear(); self.update_render_queue_button()
         if self.can_discard():
+            self._closing=True
+            self.autosave_timer.stop(); self.live_preview_timer.stop(); self.transport_timer.stop()
+            self.preview_queued=False; self.preview_play_requested=False
             self.transport_stop()
             self.cancel_preview(wait=True)
+            for attribute in ('update_job','update_download_job'):
+                job=getattr(self,attribute,None)
+                if job is not None:
+                    job.requestInterruption(); job.wait(); setattr(self,attribute,None); job.deleteLater()
             self.clear_recovery();self.player.stop();self.player.setSource(QUrl());self.cache.cleanup();event.accept()
         else:event.ignore()
 

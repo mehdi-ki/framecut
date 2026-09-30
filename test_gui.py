@@ -18,12 +18,18 @@ import test_core
 class GuiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # GUI tests must not start network update checks while windows are
+        # being created and destroyed; production keeps the default endpoint.
+        cls.update_env=patch.dict(os.environ, {'FRAMECUT_DISABLE_UPDATE_CHECK':'1'}, clear=False)
+        cls.update_env.start()
         cls.app=QApplication.instance() or QApplication([])
         cls.app.setStyle('Fusion');cls.app.setStyleSheet(STYLE)
         test_core.EditorCoreTest.setUpClass()
 
     @classmethod
-    def tearDownClass(cls):test_core.EditorCoreTest.tearDownClass()
+    def tearDownClass(cls):
+        test_core.EditorCoreTest.tearDownClass()
+        cls.update_env.stop()
 
     def wait_job(self,w):
         # Complex animated video effects can take a little longer on the

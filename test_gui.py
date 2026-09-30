@@ -236,7 +236,11 @@ class GuiTest(unittest.TestCase):
             self.assertTrue(w.snap_box.isCheckable())
             self.assertEqual(w.snap_box.toolTip(),'Einrasten ein/aus')
             self.assertEqual(w.subtitle_export_button.toolTip(),'Untertitel exportieren')
-            self.assertGreaterEqual(len(w.findChildren(QToolButton)),17)
+            # The v3.10 toolbar deliberately exposes fewer primary buttons;
+            # secondary actions are grouped behind labelled popup buttons.
+            self.assertGreaterEqual(len(w.findChildren(QToolButton)),14)
+            self.assertTrue(any(button.accessibleName()=='Weitere Timeline-Aktionen'
+                                for button in w.findChildren(QToolButton)))
             timeline=Timeline(); timeline.resize(900,320); timeline.show(); QTest.qWait(30)
             received=[]
             timeline.context_requested.connect(lambda uid,pos: received.append((uid,pos)))

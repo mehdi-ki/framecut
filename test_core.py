@@ -7,10 +7,10 @@ import unittest
 from pathlib import Path
 from dataclasses import replace,asdict
 from array import array
-from core import (Clip,import_clip,import_image_sequence,parse_subtitle_file,subtitle_cues_from_clips,write_subtitle_file,split_clip,edited_clip,snap_time,validate_timeline,
+from core import (Clip,import_clip,import_image_sequence,parse_subtitle_file,subtitle_cues_from_clips,write_subtitle_file,split_clip,edited_clip,slip_clip,roll_edit,slide_edit,snap_time,validate_timeline,
                   save_project,load_project,render,probe,ExportCancelled,length,keyframe_expression,
                   volume_keyframe_expression,speed_keyframe_expression,speed_ramp_duration,curve_progress,
-                  audio_effect_filters,normalize_export_settings,resolve_export_encoder,
+                  audio_effect_filters,tracking_expression,normalize_export_settings,resolve_export_encoder,
                   relink_project_media,archive_project,extract_project_archive,create_proxy_files,
                   PROXY_PROFILES,proxy_path_for,cache_size,prune_cache,preview_acceleration_info,normalize_markers,
                   normalize_master_mixer,master_audio_filters,EFFECT_PRESETS,TRANSITION_TYPES,KEYFRAME_CURVES)
@@ -50,6 +50,29 @@ class EditorCoreTest(unittest.TestCase):
         with self.assertRaises(ValueError):validate_timeline([c,replace(c,uid='another',position=2)],self.tracks)
         validate_timeline([c,replace(c,uid='another',position=2,track=2)],self.tracks)
         with self.assertRaises(ValueError):validate_timeline([replace(c,track=-1)],self.tracks)
+
+    def test_professional_trim_modes_keep_timeline_geometry(self):
+        previous=replace(import_clip(self.blue),start=0,end=1,position=0,track=1)
+        middle=replace(import_clip(self.red),start=0,end=1,position=1,track=1,uid='trim-middle')
+        following=replace(import_clip(self.blue),start=.4,end=1.4,position=2,track=1,uid='trim-following')
+
+        slipped=slip_clip(replace(import_clip(self.blue),start=.25,end=2.25),.25)
+        self.assertAlmostEqual(slipped.start,.5)
+        self.assertAlmostEqual(slipped.end,2.5)
+        self.assertAlmostEqual(slipped.position,0)
+        self.assertAlmostEqual(slipped.length,2.0)
+
+        rolled_left,rolled_right=roll_edit(previous,middle,1.25)
+        self.assertAlmostEqual(rolled_left.finish,1.25)
+        self.assertAlmostEqual(rolled_right.position,1.25)
+        self.assertAlmostEqual(rolled_left.length+rolled_right.length,previous.length+middle.length)
+
+        slid_left,slid_middle,slid_right=slide_edit(previous,middle,following,1/24)
+        self.assertAlmostEqual(slid_left.finish,slid_middle.position)
+        self.assertAlmostEqual(slid_middle.finish,slid_right.position)
+        self.assertAlmostEqual(slid_left.position,previous.position)
+        self.assertAlmostEqual(slid_right.finish,following.finish)
+        validate_timeline([slid_left,slid_middle,slid_right],self.tracks)
 
     def test_legacy_migration_and_roundtrip(self):
         old=self.root/'old.framecut'
@@ -344,9 +367,11 @@ class EditorCoreTest(unittest.TestCase):
         clip=replace(import_clip(self.tone),end=2,volume=.6,
                      audio_noise_reduction=8,audio_eq_low=3,audio_eq_mid=-2,audio_eq_high=4,
                      audio_compressor_enabled=True,audio_compressor_threshold=-20,
-                     audio_compressor_ratio=5,audio_channel_mode='mono',audio_pan=-.25)
+                     audio_compressor_ratio=5,audio_voice_isolation=.65,audio_channel_mode='mono',audio_pan=-.25)
         filters=audio_effect_filters(clip)
         self.assertTrue(any(value.startswith('afftdn=') for value in filters))
+        self.assertTrue(any(value.startswith('dialoguenhance=') for value in filters))
+        self.assertTrue(any(value.startswith('speechnorm=') for value in filters))
         self.assertEqual(sum(value.startswith('equalizer=') for value in filters),3)
         self.assertTrue(any(value.startswith('acompressor=') for value in filters))
         self.assertIn('pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1',filters)
@@ -361,8 +386,37 @@ class EditorCoreTest(unittest.TestCase):
         loaded=load_project(project)['clips'][0]
         for field in ('audio_noise_reduction','audio_eq_low','audio_eq_mid','audio_eq_high',
                       'audio_compressor_enabled','audio_compressor_threshold','audio_compressor_ratio',
-                      'audio_channel_mode','audio_pan'):
+                      'audio_voice_isolation','audio_channel_mode','audio_pan'):
             self.assertEqual(getattr(loaded,field),getattr(clip,field))
+
+    def test_step8_local_ai_video_tools_roundtrip_and_render(self):
+        """Tracking, object fill and a transparent derivative reach the render graph."""
+        tracked=replace(import_clip(self.blue),end=2,mask_type='rectangle',mask_x=.15,mask_y=.2,
+                        mask_width=.35,mask_height=.4,mask_feather=.03,
+                        tracking_keyframes=[
+                            {'time':0,'x':.15,'y':.2,'width':.35,'height':.4,'score':.99},
+                            {'time':1,'x':.25,'y':.24,'width':.35,'height':.4,'score':.94},
+                            {'time':2,'x':.32,'y':.28,'width':.35,'height':.4,'score':.91},
+                        ],object_removal_enabled=True)
+        validate_timeline([tracked],self.tracks)
+        self.assertIn('if(lt',tracking_expression(tracked,'x'))
+        tracked_target=self.root/'step8-tracked-object.mp4';render([tracked],self.tracks,tracked_target,(320,180))
+        self.assertTrue(probe(tracked_target)[1]);ff('-i',tracked_target,'-f','null','-')
+
+        transparent=self.root/'step8-transparent.mov'
+        ff('-f','lavfi','-i','color=c=red@0.5:s=320x180:r=30','-t',1,'-vf','format=rgba',
+           '-c:v','qtrle','-pix_fmt','argb',transparent)
+        background=replace(import_clip(self.blue),end=1,track=2,background_removal_enabled=True,
+                           background_removed_path=str(transparent))
+        validate_timeline([background],self.tracks)
+        background_target=self.root/'step8-background.mp4';render([background],self.tracks,background_target,(320,180))
+        self.assertTrue(probe(background_target)[1]);ff('-i',background_target,'-f','null','-')
+
+        project=self.root/'step8-ai.framecut';save_project(project,[tracked,background],'720p · 16:9',self.tracks)
+        loaded=load_project(project)['clips']
+        self.assertEqual(loaded[0].tracking_keyframes,tracked.tracking_keyframes)
+        self.assertTrue(loaded[0].object_removal_enabled)
+        self.assertEqual(Path(loaded[1].background_removed_path),transparent.resolve())
 
     def test_step5_audio_ducking_render(self):
         """A ducked music bed is lowered while the foreground voice is present."""

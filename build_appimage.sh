@@ -14,7 +14,7 @@ mkdir -p -- "$APPDIR/usr/bin" "$APPDIR/usr/lib/framecut/$APP_VERSION" \
     "$APPDIR/usr/share/icons/hicolor/scalable/apps" \
     "$APPDIR/usr/share/mime/packages"
 
-for file in app.py core.py preview.py style.py timeline.py transcription.py requirements.txt start.sh update.py update_system.py VERSION LICENSE README.md START_HIER.txt; do
+for file in app.py ai_tools.py core.py preview.py style.py timeline.py transcription.py requirements.txt start.sh update.py update_system.py VERSION LICENSE README.md START_HIER.txt; do
     cp -a -- "$SCRIPT_DIR/$file" "$APPDIR/usr/lib/framecut/$APP_VERSION/$file"
 done
 sed "s/^X-AppImage-Version=.*/X-AppImage-Version=$APP_VERSION/" "$SCRIPT_DIR/framecut.desktop" > "$APPDIR/framecut.desktop"

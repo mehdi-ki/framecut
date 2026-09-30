@@ -1,4 +1,4 @@
-"""Framecut 3.11 — native Linux multitrack editor."""
+"""Framecut 3.17 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -23,18 +23,19 @@ from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_
                   archive_project,extract_project_archive,find_relink_candidates,relink_project_media,missing_project_media,create_proxy_files,
                   preview_acceleration_info,cache_size,prune_cache,
                   ExportCancelled,validate_timeline,length,normalize_markers,edited_clip,retime_keyframes,retime_volume_keyframes,retime_speed_keyframes,
-                  normalize_track_states,normalize_track_names,normalize_master_mixer)
+                  normalize_track_states,normalize_track_names,normalize_master_mixer,slip_clip,roll_edit,slide_edit,retime_tracking_keyframes)
 from timeline import Timeline,MediaList
 from style import STYLE
 from update_system import (configured_manifest_url,download_verified,fetch_manifest,
                            install_downloaded,preferred_kinds,select_artifact,update_cache_directory,
                            update_checks_disabled)
 from transcription import transcribe_media
+from ai_tools import AIToolError, remove_background_media, track_motion
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.11'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.17'
 except OSError:
-    APP_VERSION = '3.11'
+    APP_VERSION = '3.17'
 
 
 def label(text,name=None):
@@ -680,6 +681,10 @@ class Editor(QMainWindow):
         self.gpu_preview_info=preview_acceleration_info()
         self.render_queue=[]; self.render_current=None; self.render_queue_paused=False
         self.mode='timeline'; self.playhead=0.0
+        # Source-monitor state is intentionally transient.  It is not part of
+        # the project file: In/Out marks describe the current source-editing
+        # session and are cleared whenever the timeline changes.
+        self.source_clip_uid=None; self.source_in=None; self.source_out=None
         self.transport_rate=0.0; self.transport_rate_pending=None
         self.voiceover_capture=None; self.voiceover_input=None; self.voiceover_recorder=None
         self.voiceover_dialog=None; self.voiceover_target=None
@@ -706,7 +711,12 @@ class Editor(QMainWindow):
                    ('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('Ctrl+B',self.split),('S',self.split),
                    ('Ctrl+C',self.copy_selection),('Ctrl+V',self.paste_selection),('Ctrl+Shift+V',self.ripple_insert),
                    ('Ctrl+D',self.duplicate_selection),('Ctrl+G',self.group_selection),('Ctrl+Shift+G',self.ungroup_selection),
-                   ('Ctrl+Shift+Delete',self.ripple_delete),
+                   ('Ctrl+Shift+Delete',self.ripple_delete),('Q',self.ripple_trim_in),('W',self.ripple_trim_out),
+                   ('I',self.set_source_in),('O',self.set_source_out),
+                   ('R',self.roll_to_playhead),('Alt+Left',lambda:self.slide_selected(-1)),
+                   ('Alt+Right',lambda:self.slide_selected(1)),
+                   ('Shift+Alt+Left',lambda:self.slip_selected(-1)),
+                   ('Shift+Alt+Right',lambda:self.slip_selected(1)),
                    ('Ctrl+A',self.select_all),('J',self.transport_j),('K',self.transport_stop),('L',self.transport_l),
                    ('Ctrl+K',self.open_command_palette),('F11',self.toggle_cinema_preview),
                    ('Space',self.toggle_play),('Delete',self.remove),('Backspace',self.remove),
@@ -846,6 +856,15 @@ class Editor(QMainWindow):
         controls.addWidget(button('Clip ansehen',self.source_preview)); controls.addStretch()
         self.cinema_button=button('⛶ Cinema',self.toggle_cinema_preview); self.cinema_button.setObjectName('iconButton'); controls.addWidget(self.cinema_button)
         self.time_label=label('00:00.0 / 00:00.0','muted'); controls.addWidget(self.time_label); pl.addLayout(controls)
+        source_controls=QHBoxLayout(); source_controls.setContentsMargins(0,0,0,0); source_controls.setSpacing(4)
+        self.source_range_label=label('Quelle: Clip ansehen für In/Out','muted'); self.source_range_label.setObjectName('sourceRangeLabel'); source_controls.addWidget(self.source_range_label,1)
+        self.source_in_button=button('I  In',self.set_source_in); self.source_in_button.setObjectName('sourceMarkButton'); self.source_in_button.setToolTip('Quell-In am aktuellen Quellbild setzen · I')
+        self.source_out_button=button('O  Out',self.set_source_out); self.source_out_button.setObjectName('sourceMarkButton'); self.source_out_button.setToolTip('Quell-Out am aktuellen Quellbild setzen · O')
+        self.source_clear_button=button('×',self.clear_source_marks); self.source_clear_button.setObjectName('sourceMarkButton'); self.source_clear_button.setToolTip('Quell-In/Out auf den gesamten Clip zurücksetzen')
+        self.source_insert_button=button('Insert',self.insert_source_range); self.source_insert_button.setObjectName('sourceEditButton'); self.source_insert_button.setToolTip('Markierten Quellbereich am Abspielkopf einfügen und spätere Clips verschieben')
+        self.source_overwrite_button=button('Overwrite',self.overwrite_source_range); self.source_overwrite_button.setObjectName('sourceEditButton'); self.source_overwrite_button.setToolTip('Markierten Quellbereich am Abspielkopf überschreiben')
+        for widget in (self.source_in_button,self.source_out_button,self.source_clear_button,self.source_insert_button,self.source_overwrite_button): source_controls.addWidget(widget)
+        pl.addLayout(source_controls)
         top.addWidget(preview)
         inspector,inspector_outer=panel(); inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
         inspector_scroll=QScrollArea(); inspector_scroll.setWidgetResizable(True); inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -867,6 +886,8 @@ class Editor(QMainWindow):
         self.audio_compressor_threshold=QDoubleSpinBox(); self.audio_compressor_threshold.setRange(-60,0); self.audio_compressor_threshold.setDecimals(1); self.audio_compressor_threshold.setSingleStep(1); self.audio_compressor_threshold.setSuffix(' dB')
         self.audio_compressor_ratio=QDoubleSpinBox(); self.audio_compressor_ratio.setRange(1,20); self.audio_compressor_ratio.setDecimals(1); self.audio_compressor_ratio.setSingleStep(.5); self.audio_compressor_ratio.setSuffix('×')
         self.audio_ducking=QDoubleSpinBox(); self.audio_ducking.setRange(0,100); self.audio_ducking.setDecimals(0); self.audio_ducking.setSuffix(' %')
+        self.audio_voice_isolation=QDoubleSpinBox(); self.audio_voice_isolation.setRange(0,100); self.audio_voice_isolation.setDecimals(0); self.audio_voice_isolation.setSuffix(' %')
+        self.audio_voice_isolation.setToolTip('Lokale Sprachisolierung: Dialog hervorheben und Hintergrund reduzieren')
         self.audio_channel_mode=QComboBox()
         channel_titles={'stereo':'Stereo','mono':'Mono','left':'Linker Kanal auf Stereo','right':'Rechter Kanal auf Stereo'}
         for value in AUDIO_CHANNEL_MODES: self.audio_channel_mode.addItem(channel_titles[value],value)
@@ -924,6 +945,14 @@ class Editor(QMainWindow):
         self.effect_preset_apply_button=button('Preset anwenden',self.apply_effect_preset)
         self.stabilization=QDoubleSpinBox(); self.stabilization.setRange(0,100); self.stabilization.setDecimals(0); self.stabilization.setSuffix(' %')
         self.stabilization.setToolTip('Lokale Deshake-Stabilisierung. Höhere Werte suchen stärker, können aber Bildrand verändern.')
+        self.background_removal_enabled=QCheckBox('Freistellung verwenden')
+        self.background_remove_button=button('Hintergrund entfernen',self.start_background_removal)
+        self.background_clear_button=button('Freistellung zurücksetzen',self.clear_background_removal)
+        self.background_remove_status=label('Noch keine Freistellung erzeugt.','muted'); self.background_remove_status.setWordWrap(True)
+        self.track_motion_button=button('Motion-Tracking starten',self.start_motion_tracking)
+        self.clear_tracking_button=button('Tracking löschen',self.clear_motion_tracking)
+        self.tracking_status=label('Kein Tracking vorhanden.','muted'); self.tracking_status.setWordWrap(True)
+        self.object_removal_enabled=QCheckBox('Objekt im Bereich entfernen')
         self.chroma_key_enabled=QCheckBox('Greenscreen aktiv')
         self.chroma_key_color=QLineEdit('#00ff00'); self.chroma_key_color.setMaxLength(7); self.chroma_key_color.setPlaceholderText('#00ff00')
         self.chroma_key_similarity=QDoubleSpinBox(); self.chroma_key_similarity.setRange(0,100); self.chroma_key_similarity.setDecimals(0); self.chroma_key_similarity.setSuffix(' %')
@@ -983,7 +1012,7 @@ class Editor(QMainWindow):
         audio_form=QFormLayout(); audio_form.addRow('Rauschunterdrückung',self.audio_noise_reduction)
         audio_form.addRow('EQ Tiefen',self.audio_eq_low); audio_form.addRow('EQ Mitten',self.audio_eq_mid); audio_form.addRow('EQ Höhen',self.audio_eq_high)
         audio_form.addRow('Kompressor',self.audio_compressor_enabled); audio_form.addRow('Kompressor-Schwelle',self.audio_compressor_threshold); audio_form.addRow('Kompressor-Ratio',self.audio_compressor_ratio)
-        audio_form.addRow('Audio-Ducking',self.audio_ducking); audio_form.addRow('Kanäle',self.audio_channel_mode); audio_form.addRow('Panorama',self.audio_pan)
+        audio_form.addRow('Audio-Ducking',self.audio_ducking); audio_form.addRow('Sprachisolierung',self.audio_voice_isolation); audio_form.addRow('Kanäle',self.audio_channel_mode); audio_form.addRow('Panorama',self.audio_pan)
         il.addWidget(label('AUDIO · MIX UND KANÄLE','heading')); il.addLayout(audio_form)
         il.addWidget(label('BILDTRANSFORMATION','heading')); il.addLayout(transform_form)
         color_form=QFormLayout(); color_form.addRow('Helligkeit',self.brightness); color_form.addRow('Kontrast',self.contrast); color_form.addRow('Sättigung',self.saturation); color_form.addRow('Filter',self.filter_preset)
@@ -994,6 +1023,12 @@ class Editor(QMainWindow):
         il.addWidget(label('VIDEO-EFFEKTE','heading')); il.addLayout(effects_form)
         mask_form=QFormLayout(); mask_form.addRow('Maskentyp',self.mask_type); mask_form.addRow('Maske X',self.mask_x); mask_form.addRow('Maske Y',self.mask_y); mask_form.addRow('Maskenbreite',self.mask_width); mask_form.addRow('Maskenhöhe',self.mask_height); mask_form.addRow('Maskenweichheit',self.mask_feather)
         il.addWidget(label('MASKEN','heading')); il.addLayout(mask_form)
+        ai_form=QFormLayout()
+        background_buttons=QHBoxLayout(); background_buttons.setContentsMargins(0,0,0,0); background_buttons.addWidget(self.background_remove_button,1); background_buttons.addWidget(self.background_clear_button,1)
+        tracking_buttons=QHBoxLayout(); tracking_buttons.setContentsMargins(0,0,0,0); tracking_buttons.addWidget(self.track_motion_button,1); tracking_buttons.addWidget(self.clear_tracking_button,1)
+        ai_form.addRow('Hintergrund',background_buttons); ai_form.addRow('',self.background_removal_enabled); ai_form.addRow('',self.background_remove_status)
+        ai_form.addRow('Tracking',tracking_buttons); ai_form.addRow('',self.tracking_status); ai_form.addRow('Objekt entfernen',self.object_removal_enabled)
+        il.addWidget(label('KI-WERKZEUGE · LOKAL','heading')); il.addLayout(ai_form)
         transition_form=QFormLayout(); transition_form.addRow('Übergang',self.transition_type); transition_form.addRow('Dauer',self.transition_duration)
         il.addWidget(label('ÜBERGANG','heading')); il.addLayout(transition_form)
         il.addWidget(label('KEYFRAMES · TRANSFORM + VIDEOEFFEKTE','heading'))
@@ -1009,7 +1044,7 @@ class Editor(QMainWindow):
         speed_ramp_buttons=QHBoxLayout(); speed_ramp_buttons.setContentsMargins(0,0,0,0); speed_ramp_buttons.addWidget(self.speed_ramp_set_button,1); speed_ramp_buttons.addWidget(self.speed_ramp_remove_button,1); il.addLayout(speed_ramp_buttons)
         il.addWidget(self.speed_ramp_list)
         il.addWidget(button('Bild zurücksetzen',self.reset_transform)); il.addWidget(button('Übernehmen',self.apply_properties,True)); il.addWidget(button('Audio aus Video extrahieren',self.extract_audio))
-        hint=label('Höhere Videospuren liegen vorne.\nTon aller Spuren wird gemischt.\n\nGleiche Spur: keine Überlappung.\nShift beim Ziehen: ohne Einrasten.\n\nSpurkopf: M = stumm schalten · L = Spur sperren.\nAudio: Rauschunterdrückung, 3-Band-EQ, Kompressor, Ducking, Kanalmodus und Panorama.\nDucking auf einem Musikclip senkt ihn automatisch, sobald andere Audiospuren aktiv sind.\nBildtransformation: Zoom, Position, Crop, Rotation und Spiegeln.\nFarbkorrektur: Helligkeit, Kontrast, Sättigung, Presets und .cube/.3dl-LUTs.\nEffekt-Presets: Clean, Cinematic, Dream, Noir, Vivid und Soft Focus.\nAdjustment-Layer legt Effekte über die darunterliegende Komposition.\nVideoeffekte: Deckkraft, Unschärfe, Schärfe, Stabilisierung, Greenscreen und Masken.\nKeyframes animieren Zoom, Bildposition, Rotation, Deckkraft und Unschärfe; Kurven: Linear, Ease in, Ease out und Ease in/out.\nSpeed-Ramping: mehrere Geschwindigkeits-Punkte zwischen 0,25× und 4× setzen.\nFreeze-Frame hält das letzte Bild; Reverse spielt Bild und Ton rückwärts.\nÜbergänge: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Blur, Pixelize, Circle, Radial sowie Fade to White.\nEinblenden / Ausblenden sind weiche Übergänge für Bild und Ton.\nTextclips liegen automatisch über dem Video.\nTextstil: Schrift, Fett/Kursiv, Kontur, Schatten und Hintergrund.\nTextanimation: Ein-/Ausblenden oder Hereinschieben.\nSRT/VTT importiert Cue-Zeiten als Textclips auf eigenen Spuren.\nAudio extrahieren erstellt eine eigene Audiodatei.\n\nShortcuts: Leertaste = Play/Pause · J = rückwärts · K = Pause · L = vorwärts\nPfeile = 1 s bewegen · Entf = Clip löschen','muted'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
+        hint=label('Höhere Videospuren liegen vorne.\nTon aller Spuren wird gemischt.\n\nGleiche Spur: keine Überlappung.\nShift beim Ziehen: ohne Einrasten.\n\nSpurkopf: M = stumm schalten · L = Spur sperren.\nAudio: Rauschunterdrückung, 3-Band-EQ, Kompressor, Ducking, Sprachisolierung, Kanalmodus und Panorama.\nDucking auf einem Musikclip senkt ihn automatisch, sobald andere Audiospuren aktiv sind.\nBildtransformation: Zoom, Position, Crop, Rotation und Spiegeln.\nFarbkorrektur: Helligkeit, Kontrast, Sättigung, Presets und .cube/.3dl-LUTs.\nEffekt-Presets: Clean, Cinematic, Dream, Noir, Vivid und Soft Focus.\nAdjustment-Layer legt Effekte über die darunterliegende Komposition.\nVideoeffekte: Deckkraft, Unschärfe, Schärfe, Stabilisierung, Greenscreen und Masken.\nKI-Werkzeuge: lokale Hintergrundfreistellung, Motion-Tracking und Objektentfernung; kein Cloud-Upload.\nKeyframes animieren Zoom, Bildposition, Rotation, Deckkraft und Unschärfe; Kurven: Linear, Ease in, Ease out und Ease in/out.\nSpeed-Ramping: mehrere Geschwindigkeits-Punkte zwischen 0,25× und 4× setzen.\nFreeze-Frame hält das letzte Bild; Reverse spielt Bild und Ton rückwärts.\nÜbergänge: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Blur, Pixelize, Circle, Radial sowie Fade to White.\nEinblenden / Ausblenden sind weiche Übergänge für Bild und Ton.\nTextclips liegen automatisch über dem Video.\nTextstil: Schrift, Fett/Kursiv, Kontur, Schatten und Hintergrund.\nTextanimation: Ein-/Ausblenden oder Hereinschieben.\nSRT/VTT importiert Cue-Zeiten als Textclips auf eigenen Spuren.\nAudio extrahieren erstellt eine eigene Audiodatei.\n\nShortcuts: Leertaste = Play/Pause · J = rückwärts · K = Pause · L = vorwärts\nPfeile = 1 s bewegen · Entf = Clip löschen','muted'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
         top.addWidget(inspector); top.setSizes([78,300,760,330]); vertical.addWidget(top)
         bottom,bl=panel(); bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
         bar=QHBoxLayout(); bar.setContentsMargins(10,5,10,5); bar.setSpacing(6)
@@ -1026,6 +1061,18 @@ class Editor(QMainWindow):
         paste_button=timeline_tool_button('⎘','Einfügen · Strg+V',self.paste_selection,'edit-paste')
         insert_button=timeline_tool_button('↳','Insert einfügen · Strg+Shift+V',self.insert_selection,'insert-object')
         overwrite_button=timeline_tool_button('▣','Overwrite einfügen',self.overwrite_selection,'document-save-as')
+
+        trim_menu=QMenu(self); trim_menu.setTitle('Professionelle Trim-Werkzeuge')
+        trim_menu.addAction('Ripple-In zum Abspielkopf · Q',self.ripple_trim_in)
+        trim_menu.addAction('Ripple-Out zum Abspielkopf · W',self.ripple_trim_out)
+        trim_menu.addSeparator()
+        trim_menu.addAction('Roll-Schnitt zum Abspielkopf · R',self.roll_to_playhead)
+        trim_menu.addSeparator()
+        trim_menu.addAction('Slide links · Alt+←',lambda:self.slide_selected(-1))
+        trim_menu.addAction('Slide rechts · Alt+→',lambda:self.slide_selected(1))
+        trim_menu.addAction('Slip links · Umschalt+Alt+←',lambda:self.slip_selected(-1))
+        trim_menu.addAction('Slip rechts · Umschalt+Alt+→',lambda:self.slip_selected(1))
+        trim_button=timeline_menu_button('⟷','Professionelle Trim-Werkzeuge',trim_menu,'edit-cut')
 
         marker_menu=QMenu(self); marker_menu.setTitle('Marker')
         marker_menu.addAction('Marker hinzufügen',lambda:self.add_marker('marker'))
@@ -1049,6 +1096,7 @@ class Editor(QMainWindow):
         more_button=timeline_menu_button('⋯','Weitere Timeline-Aktionen',more_menu,'view-more')
 
         bar.addWidget(timeline_tool_group('VERLAUF',[undo_button,redo_button]))
+        bar.addWidget(timeline_tool_group('TRIMMEN',[trim_button]))
         bar.addWidget(timeline_tool_group('BEARBEITEN',[split_button,remove_button,copy_button,paste_button]))
         bar.addWidget(timeline_tool_group('EINFÜGEN',[insert_button,overwrite_button]))
         bar.addWidget(timeline_tool_group('MARKER',[marker_button]))
@@ -1091,12 +1139,16 @@ class Editor(QMainWindow):
                       self.text_background_opacity,self.text_background_padding,self.text_animation_duration,
                       self.transform_scale,self.transform_x,self.transform_y,self.rotation,self.crop_left,self.crop_top,self.crop_right,self.crop_bottom,
                       self.brightness,self.contrast,self.saturation,self.lut_path,self.opacity,self.blur,self.sharpen,self.stabilization,
+                      self.audio_voice_isolation,
                       self.chroma_key_color,self.chroma_key_similarity,self.chroma_key_blend,
                       self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather):
             field.editingFinished.connect(self.apply_properties)
         self.flip_horizontal.clicked.connect(self.apply_properties); self.flip_vertical.clicked.connect(self.apply_properties)
         self.freeze_enabled.clicked.connect(self.apply_properties); self.reverse_clip.clicked.connect(self.apply_properties)
         self.audio_compressor_enabled.clicked.connect(self.apply_properties)
+        self.audio_voice_isolation.editingFinished.connect(self.apply_properties)
+        self.background_removal_enabled.clicked.connect(self.apply_properties)
+        self.object_removal_enabled.clicked.connect(self.apply_properties)
         self.audio_channel_mode.activated.connect(lambda *_: self.apply_properties())
         self.text_bold.clicked.connect(self.apply_properties); self.text_italic.clicked.connect(self.apply_properties)
         self.text_background_enabled.clicked.connect(self.apply_properties)
@@ -1106,6 +1158,7 @@ class Editor(QMainWindow):
         self.mask_type.activated.connect(lambda *_: self.apply_properties())
         self.transition_type.activated.connect(lambda *_: self.apply_properties()); self.transition_duration.editingFinished.connect(self.apply_properties)
         vertical.addWidget(bottom); vertical.setStretchFactor(0,4); vertical.setStretchFactor(1,3); vertical.setChildrenCollapsible(False); vertical.setSizes([480,420]); outer.addWidget(vertical,1); self.setCentralWidget(root)
+        self.update_source_monitor_controls()
 
     def error(self,message): QMessageBox.warning(self,'Framecut',str(message))
 
@@ -1221,9 +1274,37 @@ class Editor(QMainWindow):
             menu.addSeparator()
             if clip.kind!='text' and clip.source_type!='adjustment':
                 menu.addAction('▶ Clip ansehen',self.source_preview)
+            if clip.kind in ('video','audio') and clip.source_type in ('video','audio'):
+                source_menu=menu.addMenu('Quellmonitor')
+                source_menu.addAction('Quell-In setzen · I',self.set_source_in)
+                source_menu.addAction('Quell-Out setzen · O',self.set_source_out)
+                source_menu.addAction('Quellmarken löschen',self.clear_source_marks)
+                source_menu.addSeparator()
+                source_menu.addAction('Markierten Bereich als Insert einfügen',self.insert_source_range)
+                source_menu.addAction('Markierten Bereich als Overwrite einfügen',self.overwrite_source_range)
             if clip.kind=='text':
                 menu.addAction('Text im Inspector bearbeiten',self.focus_text_editor)
             menu.addAction('Am Abspielkopf teilen',self.split)
+            if clip.kind in ('video','audio') and clip.source_type in ('video','audio'):
+                trim_menu=menu.addMenu('Professionelle Trim-Werkzeuge')
+                trim_menu.addAction('Ripple-In zum Abspielkopf · Q',self.ripple_trim_in)
+                trim_menu.addAction('Ripple-Out zum Abspielkopf · W',self.ripple_trim_out)
+                trim_menu.addAction('Roll-Schnitt zum Abspielkopf · R',self.roll_to_playhead)
+                trim_menu.addSeparator()
+                trim_menu.addAction('Slide links · Alt+←',lambda:self.slide_selected(-1))
+                trim_menu.addAction('Slide rechts · Alt+→',lambda:self.slide_selected(1))
+                trim_menu.addAction('Slip links · Umschalt+Alt+←',lambda:self.slip_selected(-1))
+                trim_menu.addAction('Slip rechts · Umschalt+Alt+→',lambda:self.slip_selected(1))
+            if clip.kind=='video' and clip.source_type in ('video','image'):
+                ai_menu=menu.addMenu('KI-Werkzeuge')
+                ai_menu.addAction('Hintergrund entfernen',self.start_background_removal)
+                if clip.background_removed_path:
+                    ai_menu.addAction('Freistellung deaktivieren',self.clear_background_removal)
+                ai_menu.addSeparator()
+                ai_menu.addAction('Motion-Tracking starten',self.start_motion_tracking).setEnabled(clip.source_type=='video')
+                if clip.tracking_keyframes:
+                    ai_menu.addAction('Tracking löschen',self.clear_motion_tracking)
+                ai_menu.addAction('Objekt entfernen aktivieren',lambda:self.set_object_removal_enabled(True))
             speed_menu=None
             if clip.kind in ('video','audio') and clip.source_type!='adjustment':
                 speed_menu=menu.addMenu('Geschwindigkeit')
@@ -1373,9 +1454,11 @@ class Editor(QMainWindow):
                        keyframes=[dict(frame) for frame in clip.keyframes],
                        volume_keyframes=[dict(frame) for frame in clip.volume_keyframes],
                        speed_keyframes=[dict(frame) for frame in clip.speed_keyframes],
+                       tracking_keyframes=[dict(point) for point in clip.tracking_keyframes],
                        source_paths=list(clip.source_paths))
 
     def set_selection(self, uids, anchor=None, expand_groups=False):
+        previous_current=self.current
         available = {clip.uid: clip for clip in self.clips}
         result = []
         for uid in uids:
@@ -1388,8 +1471,13 @@ class Editor(QMainWindow):
                     result.append(clip.uid)
         self.selection = result
         self.current = anchor if anchor in result else (result[-1] if result else None)
+        if self.mode=='source' and self.current!=previous_current:
+            self.player.pause(); self.pending_seek=None; self.player.setSource(QUrl()); self.mode='timeline'
+            self.source_clip_uid=None; self.source_in=None; self.source_out=None
+            self.video_stack.setCurrentIndex(0); self.placeholder.setText('Clip ausgewählt · „Clip ansehen“ startet die Quellvorschau.')
         self.fill_inspector()
         self.timeline.set_selection(self.selection, self.current)
+        self.update_source_monitor_controls()
 
     def timeline_selection_changed(self, payload):
         if not isinstance(payload, (list, tuple)):
@@ -1413,11 +1501,13 @@ class Editor(QMainWindow):
                 self.text_background_enabled,self.text_background_color,self.text_background_opacity,self.text_background_padding,
                 self.text_animation,self.text_animation_duration,self.text_x,self.text_y,
                 self.audio_noise_reduction,self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high,self.audio_compressor_enabled,
-                self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_channel_mode,self.audio_pan,
+                self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_voice_isolation,self.audio_channel_mode,self.audio_pan,
                 self.transform_scale,self.transform_x,self.transform_y,self.rotation,self.crop_left,self.crop_top,
                 self.crop_right,self.crop_bottom,self.flip_horizontal,self.flip_vertical,self.brightness,self.contrast,
                 self.saturation,self.filter_preset,self.effect_preset,self.effect_preset_apply_button,self.lut_path,self.lut_browse_button,self.opacity,self.blur,self.sharpen,self.stabilization,
                 self.chroma_key_enabled,self.chroma_key_color,self.chroma_key_similarity,self.chroma_key_blend,
+                self.background_removal_enabled,self.background_remove_button,self.background_clear_button,
+                self.track_motion_button,self.clear_tracking_button,self.object_removal_enabled,
                 self.mask_type,self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather,
                 self.transition_type,self.transition_duration,
                 self.keyframe_time,self.keyframe_curve,self.keyframe_list,self.keyframe_set_button,self.keyframe_remove_button,
@@ -1690,12 +1780,28 @@ class Editor(QMainWindow):
             ('Timeline abspielen / pausieren', 'Leertaste', self.toggle_play),
             ('Vollbildvorschau öffnen / schließen', 'F11', self.toggle_cinema_preview),
             ('Clip teilen', 'S / Ctrl+B', self.split),
+            ('Ripple-In zum Abspielkopf', 'Q', self.ripple_trim_in),
+            ('Ripple-Out zum Abspielkopf', 'W', self.ripple_trim_out),
+            ('Roll-Schnitt zum Abspielkopf', 'R', self.roll_to_playhead),
+            ('Quell-In setzen', 'I', self.set_source_in),
+            ('Quell-Out setzen', 'O', self.set_source_out),
+            ('Quellmarken löschen', '—', self.clear_source_marks),
+            ('Quellbereich als Insert einfügen', '—', self.insert_source_range),
+            ('Quellbereich als Overwrite einfügen', '—', self.overwrite_source_range),
+            ('Slide-Schnitt links', 'Alt+←', lambda: self.slide_selected(-1)),
+            ('Slide-Schnitt rechts', 'Alt+→', lambda: self.slide_selected(1)),
+            ('Slip-Schnitt links', 'Umschalt+Alt+←', lambda: self.slip_selected(-1)),
+            ('Slip-Schnitt rechts', 'Umschalt+Alt+→', lambda: self.slip_selected(1)),
             ('Auswahl entfernen', 'Entf', self.remove),
             ('Rückgängig', 'Ctrl+Z', self.undo),
             ('Wiederholen', 'Ctrl+Shift+Z', self.redo),
             ('Textclip hinzufügen', '+ Text', self.add_text),
             ('Adjustment-Layer hinzufügen', '+ Adjustment-Layer', self.add_adjustment_layer),
             ('Automatische Untertitel erstellen', '—', self.automatic_subtitle_dialog),
+            ('KI-Hintergrund entfernen', '—', self.start_background_removal),
+            ('Motion-Tracking starten', '—', self.start_motion_tracking),
+            ('Tracking löschen', '—', self.clear_motion_tracking),
+            ('Objektentfernung aktivieren', '—', lambda: self.set_object_removal_enabled(True)),
             ('Audio-Mixer öffnen', '—', self.open_mixer),
             ('Render-Queue öffnen', '—', self.show_render_queue),
             ('Timeline einpassen', '—', self.fit_timeline),
@@ -1803,6 +1909,7 @@ class Editor(QMainWindow):
         clone=lambda c: replace(c, keyframes=[dict(frame) for frame in c.keyframes],
                                 volume_keyframes=[dict(frame) for frame in c.volume_keyframes],
                                 speed_keyframes=[dict(frame) for frame in c.speed_keyframes],
+                                tracking_keyframes=[dict(point) for point in c.tracking_keyframes],
                                 source_paths=list(c.source_paths))
         return ([clone(c) for c in self.clips],
                 list(self.tracks),self.current,
@@ -1822,6 +1929,7 @@ class Editor(QMainWindow):
             self.preview_worker.cancel.set()
         self.transport_timer.stop(); self.transport_rate=0.0; self.transport_rate_pending=None
         self.player.pause(); self.player.setPlaybackRate(1.0); self.mode='timeline'; self.pending_seek=None
+        self.source_clip_uid=None; self.source_in=None; self.source_out=None
         if self.preview_path and Path(self.preview_path).is_file():
             self.preview_status.setText('Vorschau wird im Hintergrund aktualisiert …')
         else:
@@ -1830,6 +1938,7 @@ class Editor(QMainWindow):
             self.preview_status.setText('Vorschau wird nach kurzer Pause im Hintergrund berechnet …')
         self.setWindowTitle(f'Framecut {APP_VERSION} · '+(Path(self.project_path).stem if self.project_path else 'Neues Projekt')+' *')
         self.autosave_label.setText('Änderungen · Autosave folgt …'); self.autosave_timer.start()
+        self.update_source_monitor_controls()
         if hasattr(self,'live_preview_box') and self.live_preview_box.isChecked() and self.clips:
             self.live_preview_timer.start()
         self.refresh()
@@ -2062,10 +2171,18 @@ class Editor(QMainWindow):
                       self.chroma_key_blend,self.mask_type,self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather): field.setEnabled(is_video and not is_adjustment)
         self.opacity.setEnabled(is_video); self.blur.setEnabled(is_video); self.sharpen.setEnabled(is_video)
         self.stabilization.setEnabled(is_video and not is_adjustment)
+        background_source = is_video and not is_adjustment and c.source_type in ('video','image')
+        tracking_source = is_video and not is_adjustment and c.source_type == 'video'
+        self.background_remove_button.setEnabled(background_source)
+        self.background_clear_button.setEnabled(background_source and bool(c.background_removed_path))
+        self.background_removal_enabled.setEnabled(background_source and bool(c.background_removed_path))
+        self.track_motion_button.setEnabled(tracking_source)
+        self.clear_tracking_button.setEnabled(tracking_source and bool(c.tracking_keyframes))
+        self.object_removal_enabled.setEnabled(is_video and not is_adjustment)
         for field in (self.keyframe_time,self.keyframe_curve,self.keyframe_list,self.keyframe_set_button,self.keyframe_remove_button): field.setEnabled(is_video and not is_adjustment)
         for field in (self.volume_keyframe_time,self.volume_keyframe_curve,self.volume_keyframe_list,self.volume_keyframe_set_button,self.volume_keyframe_remove_button): field.setEnabled(is_audioable)
         for field in (self.audio_noise_reduction,self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high,self.audio_compressor_enabled,
-                      self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_channel_mode,self.audio_pan): field.setEnabled(is_audioable)
+                      self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_voice_isolation,self.audio_channel_mode,self.audio_pan): field.setEnabled(is_audioable)
         for field in (self.speed_ramp_time,self.speed_ramp_value,self.speed_ramp_list,self.speed_ramp_set_button,self.speed_ramp_remove_button): field.setEnabled(is_video and not is_adjustment)
         self.transition_type.setEnabled(is_transitionable); self.transition_duration.setEnabled(is_transitionable)
         self.text_value.setText(c.text if is_text else '')
@@ -2093,11 +2210,21 @@ class Editor(QMainWindow):
         effect_index=self.effect_preset.findData(c.effect_preset if is_video else 'clean')
         self.effect_preset.setCurrentIndex(effect_index if effect_index >= 0 else 0)
         self.stabilization.setValue(c.stabilization*100 if is_video else 0)
+        self.background_removal_enabled.setChecked(c.background_removal_enabled if is_video else False)
+        self.background_remove_status.setText(
+            'Freistellung aktiv · transparente lokale Datei wird verwendet.'
+            if c.background_removal_enabled and c.background_removed_path
+            else 'Freistellung erzeugt noch keine lokale Datei.')
+        self.tracking_status.setText(
+            f'{len(c.tracking_keyframes)} Tracking-Punkte vorhanden.' if c.tracking_keyframes
+            else 'Kein Tracking vorhanden.')
+        self.object_removal_enabled.setChecked(c.object_removal_enabled if is_video else False)
         self.audio_noise_reduction.setValue(c.audio_noise_reduction if is_audioable else 0)
         self.audio_eq_low.setValue(c.audio_eq_low if is_audioable else 0); self.audio_eq_mid.setValue(c.audio_eq_mid if is_audioable else 0); self.audio_eq_high.setValue(c.audio_eq_high if is_audioable else 0)
         self.audio_compressor_enabled.setChecked(c.audio_compressor_enabled if is_audioable else False)
         self.audio_compressor_threshold.setValue(c.audio_compressor_threshold if is_audioable else -18); self.audio_compressor_ratio.setValue(c.audio_compressor_ratio if is_audioable else 4)
         self.audio_ducking.setValue(c.audio_ducking*100 if is_audioable else 0)
+        self.audio_voice_isolation.setValue(c.audio_voice_isolation*100 if is_audioable else 0)
         channel_index=self.audio_channel_mode.findData(c.audio_channel_mode if is_audioable else 'stereo')
         self.audio_channel_mode.setCurrentIndex(channel_index if channel_index >= 0 else 0); self.audio_pan.setValue(c.audio_pan*100 if is_audioable else 0)
         self.freeze_enabled.setChecked(c.freeze_frame if is_video else False); self.freeze_duration.setValue(c.freeze_duration if is_video else 0)
@@ -2142,6 +2269,7 @@ class Editor(QMainWindow):
     def select_clip(self,uid):
         if uid!=self.current and self.mode=='source':
             self.player.pause();self.pending_seek=None;self.player.setSource(QUrl());self.mode='timeline'
+            self.source_clip_uid=None;self.source_in=None;self.source_out=None
             self.video_stack.setCurrentIndex(0);self.placeholder.setText('Clip ausgewählt · „Clip ansehen“ startet die Quellvorschau.')
         self.set_selection([uid], uid, expand_groups=True)
 
@@ -2249,6 +2377,10 @@ class Editor(QMainWindow):
                              flip_vertical=self.flip_vertical.isChecked(),brightness=self.brightness.value(),
                              contrast=self.contrast.value(),saturation=self.saturation.value(),opacity=self.opacity.value()/100,
                              blur=self.blur.value(),sharpen=self.sharpen.value(),stabilization=self.stabilization.value()/100,
+                             background_removal_enabled=self.background_removal_enabled.isChecked(),
+                             background_removed_path=c.background_removed_path,
+                             tracking_keyframes=[dict(point) for point in c.tracking_keyframes],
+                             object_removal_enabled=self.object_removal_enabled.isChecked(),
                              effect_preset=c.effect_preset,
                              freeze_frame=self.freeze_enabled.isChecked(),
                              freeze_duration=self.freeze_duration.value() if self.freeze_enabled.isChecked() else 0.0,
@@ -2271,6 +2403,9 @@ class Editor(QMainWindow):
                     values['keyframes']=retime_keyframes(c,values['start'],values['end'],values['speed'])
                 if c.speed_keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7):
                     values['speed_keyframes']=retime_speed_keyframes(c,values['start'],values['end'])
+                if c.tracking_keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
+                                             or abs(values['speed']-c.speed)>1e-7):
+                    values['tracking_keyframes']=retime_tracking_keyframes(c,values['start'],values['end'],values['speed'])
             if c.kind in ('video','audio') and c.volume_keyframes and (
                     abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
                     or abs(values['speed']-c.speed)>1e-7):
@@ -2281,6 +2416,7 @@ class Editor(QMainWindow):
                               audio_compressor_enabled=self.audio_compressor_enabled.isChecked(),
                               audio_compressor_threshold=self.audio_compressor_threshold.value(),audio_compressor_ratio=self.audio_compressor_ratio.value(),
                               audio_ducking=self.audio_ducking.value()/100,
+                              audio_voice_isolation=self.audio_voice_isolation.value()/100,
                               audio_channel_mode=self.audio_channel_mode.currentData(),audio_pan=self.audio_pan.value()/100)
                 transition_type='none' if c.source_type=='adjustment' else self.transition_type.currentData()
                 values.update(transition_type=transition_type,
@@ -2300,6 +2436,7 @@ class Editor(QMainWindow):
                       crop_right=0.0,crop_bottom=0.0,rotation=0.0,flip_horizontal=False,flip_vertical=False,
                       keyframes=[],speed_keyframes=[],brightness=0.0,contrast=1.0,saturation=1.0,
                       filter_preset='none',lut_path='',opacity=1.0,blur=0.0,sharpen=0.0,stabilization=0.0,effect_preset='clean',
+                      background_removal_enabled=False,background_removed_path='',tracking_keyframes=[],object_removal_enabled=False,
                       freeze_frame=False,freeze_duration=0.0,reverse=False,chroma_key_enabled=False,
                       chroma_key_color='#00ff00',chroma_key_similarity=.1,chroma_key_blend=.1,
                       mask_type='none',mask_x=0.0,mask_y=0.0,mask_width=1.0,mask_height=1.0,mask_feather=0.0)
@@ -2369,6 +2506,178 @@ class Editor(QMainWindow):
             validate_timeline(proposed,self.tracks)
             self.checkpoint(); self.clips=proposed; self.selection=new_selection; self.current=new_selection[-1]; self.changed()
         except Exception as exc:self.error(exc)
+
+    def _single_trim_clip(self):
+        """Return the one selected source clip used by professional trim tools."""
+        if self.worker:
+            return None
+        selected = self.selected_clips()
+        if len(selected) != 1:
+            self.statusBar().showMessage('Wähle genau einen Video- oder Audioclip für diesen Trim-Schnitt.', 3500)
+            return None
+        clip = selected[0]
+        if clip.kind not in ('video', 'audio') or clip.source_type not in ('video', 'audio'):
+            self.statusBar().showMessage('Dieser Trim-Schnitt ist nur für Video- und Audiomedien verfügbar.', 3500)
+            return None
+        if not self.require_unlocked(clip):
+            return None
+        return clip
+
+    def _frame_step(self, clip):
+        """Return one source frame in timeline seconds for trim nudges."""
+        try:
+            fps = float(clip.source_fps or 24.0)
+        except (TypeError, ValueError):
+            fps = 24.0
+        return max(MIN_CLIP, 1.0 / max(1.0, fps))
+
+    def _commit_trim_replacements(self, replacements, message, selection=None, markers=None):
+        """Validate and commit a trim edit as one undoable transaction."""
+        proposed = [replacements.get(clip.uid, clip) for clip in self.clips]
+        validate_timeline(proposed, self.tracks)
+        self.checkpoint()
+        self.clips = proposed
+        if markers is not None:
+            self.markers = normalize_markers(markers, length(proposed))
+        chosen = selection or list(replacements)
+        self.selection = [uid for uid in chosen if any(clip.uid == uid for clip in proposed)]
+        self.current = self.selection[-1] if self.selection else None
+        self.changed()
+        self.statusBar().showMessage(message, 3500)
+
+    def _ripple_trim(self, edge):
+        clip = self._single_trim_clip()
+        if clip is None:
+            return
+        if not clip.position + MIN_CLIP <= self.playhead <= clip.finish - MIN_CLIP:
+            return self.statusBar().showMessage('Setze den Abspielkopf innerhalb des ausgewählten Clips.', 3500)
+        old_finish = clip.finish
+        if edge == 'in':
+            delta = self.playhead - clip.position
+            trimmed = edited_clip(clip, 'left', delta)
+            # Ripple-In removes the leading source range but keeps the clip at
+            # the same timeline position, so later clips can close the gap.
+            candidate = replace(trimmed, position=clip.position)
+            label_text = 'Ripple-In'
+        else:
+            delta = self.playhead - clip.finish
+            candidate = edited_clip(clip, 'right', delta)
+            label_text = 'Ripple-Out'
+        removed = clip.length - candidate.length
+        if removed < MIN_CLIP - 1e-7:
+            return self.statusBar().showMessage('Der Trim-Bereich ist zu klein.', 3000)
+        replacements = {clip.uid: candidate}
+        for other in self.clips:
+            if other.uid == clip.uid:
+                continue
+            if other.track == clip.track and other.position >= old_finish - 1e-7:
+                if self.track_locked(other.track):
+                    return self.statusBar().showMessage('Eine betroffene Spur ist gesperrt.', 3500)
+                replacements[other.uid] = replace(other, position=max(0.0, other.position - removed))
+        markers = []
+        for marker in self.markers:
+            value = dict(marker)
+            if float(value.get('time', 0.0)) >= old_finish - 1e-7:
+                value['time'] = max(0.0, float(value['time']) - removed)
+            markers.append(value)
+        try:
+            self._commit_trim_replacements(
+                replacements, f'{label_text} ausgeführt · {removed:.3f} s entfernt',
+                selection=[clip.uid], markers=markers)
+        except Exception as exc:
+            self.error(exc)
+
+    def ripple_trim_in(self):
+        self._ripple_trim('in')
+
+    def ripple_trim_out(self):
+        self._ripple_trim('out')
+
+    def _adjacent_pair_for_roll(self, clip):
+        same = sorted((value for value in self.clips
+                       if value.uid != clip.uid and value.track == clip.track
+                       and value.kind == clip.kind), key=lambda value: value.position)
+        previous = max((value for value in same if value.finish <= clip.position + 1e-6),
+                       key=lambda value: value.finish, default=None)
+        following = min((value for value in same if value.position >= clip.finish - 1e-6),
+                         key=lambda value: value.position, default=None)
+        pairs = []
+        if previous is not None and abs(previous.finish - clip.position) <= 1e-5:
+            pairs.append((previous, clip))
+        if following is not None and abs(clip.finish - following.position) <= 1e-5:
+            pairs.append((clip, following))
+        valid = [pair for pair in pairs
+                 if pair[0].position + MIN_CLIP <= self.playhead <= pair[1].finish - MIN_CLIP]
+        return min(valid, key=lambda pair: abs(pair[0].finish - self.playhead), default=None)
+
+    def roll_to_playhead(self):
+        clip = self._single_trim_clip()
+        if clip is None:
+            return
+        pair = self._adjacent_pair_for_roll(clip)
+        if pair is None:
+            return self.statusBar().showMessage('Setze den Abspielkopf zwischen zwei angrenzende Clips.', 3500)
+        left, right = pair
+        if self.track_locked(left.track) or self.track_locked(right.track):
+            return self.statusBar().showMessage('Eine betroffene Spur ist gesperrt.', 3500)
+        try:
+            first, second = roll_edit(left, right, self.playhead)
+            self._commit_trim_replacements(
+                {left.uid: first, right.uid: second},
+                f'Roll-Schnitt auf {self.playhead:.3f} s gesetzt',
+                selection=[first.uid, second.uid])
+        except Exception as exc:
+            self.error(exc)
+
+    def _adjacent_triplet(self, clip):
+        same = sorted((value for value in self.clips
+                       if value.uid != clip.uid and value.track == clip.track
+                       and value.kind == clip.kind), key=lambda value: value.position)
+        previous = max((value for value in same if value.finish <= clip.position + 1e-6),
+                       key=lambda value: value.finish, default=None)
+        following = min((value for value in same if value.position >= clip.finish - 1e-6),
+                         key=lambda value: value.position, default=None)
+        if (previous is None or following is None
+                or abs(previous.finish - clip.position) > 1e-5
+                or abs(clip.finish - following.position) > 1e-5):
+            return None
+        return previous, clip, following
+
+    def slide_selected(self, direction):
+        clip = self._single_trim_clip()
+        if clip is None:
+            return
+        triplet = self._adjacent_triplet(clip)
+        if triplet is None:
+            return self.statusBar().showMessage('Slide braucht einen Clip mit direkten Nachbarn links und rechts.', 3500)
+        if self.track_locked(clip.track):
+            return self.statusBar().showMessage('Die betroffene Spur ist gesperrt.', 3500)
+        previous, middle, following = triplet
+        delta = self._frame_step(clip) * (1 if direction >= 0 else -1)
+        try:
+            left, moved, right = slide_edit(previous, middle, following, delta)
+            self._commit_trim_replacements(
+                {left.uid: left, moved.uid: moved, right.uid: right},
+                f'Slide-Schnitt {"rechts" if delta > 0 else "links"} · {abs(delta):.3f} s',
+                selection=[moved.uid])
+        except Exception as exc:
+            self.error(exc)
+
+    def slip_selected(self, direction):
+        clip = self._single_trim_clip()
+        if clip is None:
+            return
+        delta = self._frame_step(clip) * (1 if direction >= 0 else -1)
+        try:
+            candidate = slip_clip(clip, delta)
+            if abs(candidate.start - clip.start) <= 1e-7:
+                return self.statusBar().showMessage('Der Quellbereich kann nicht weiter in diese Richtung verschoben werden.', 3000)
+            self._commit_trim_replacements(
+                {clip.uid: candidate},
+                f'Slip-Schnitt {"rechts" if delta > 0 else "links"} · {abs(candidate.start-clip.start):.3f} s',
+                selection=[candidate.uid])
+        except Exception as exc:
+            self.error(exc)
 
     def remove(self):
         selected=self.selected_clips()
@@ -2457,6 +2766,123 @@ class Editor(QMainWindow):
             return str(target)
         self.start_job('Audiospur wird aus dem Video extrahiert …',operation,
                        lambda result:self.extracted_audio_done(result,clip_snapshot,tracks_snapshot))
+
+    def start_background_removal(self):
+        """Generate a local transparent derivative for the selected clip."""
+        c=self.current_clip()
+        if not c or c.kind!='video' or c.source_type not in ('video','image'):
+            return self.error('Wähle einen Video- oder Bildclip für die Hintergrundfreistellung.')
+        if self.worker or not self.require_unlocked(c):
+            return
+        source=Path(c.path)
+        target_dir=self.state_dir/'ai-media'; target_dir.mkdir(parents=True,exist_ok=True)
+        suffix='.png' if c.source_type=='image' else '.mov'
+        target=target_dir/(source.stem+'-'+c.uid[:10]+'-background'+suffix)
+        uid=c.uid
+        def operation(progress,cancel):
+            try:
+                return remove_background_media(source,target,progress,cancel)
+            except AIToolError:
+                if cancel.is_set():
+                    raise ExportCancelled()
+                raise
+        self.start_job('Lokale KI entfernt den Hintergrund …',operation,
+                       lambda result:self.background_removal_done(result,uid))
+
+    def background_removal_done(self,result,uid):
+        if not result['ok']:
+            return self.job_error(result)
+        c=next((value for value in self.clips if value.uid==uid),None)
+        if not c:
+            return self.statusBar().showMessage('Clip wurde während der Verarbeitung entfernt.',5000)
+        try:
+            candidate=replace(c,background_removal_enabled=True,background_removed_path=str(result['value']))
+            proposed=[candidate if value.uid==uid else value for value in self.clips]
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
+            self.statusBar().showMessage('Hintergrund entfernt · transparente lokale Datei ist aktiv.',6000)
+        except Exception as exc:
+            self.error(exc)
+
+    def clear_background_removal(self):
+        c=self.current_clip()
+        if not c or c.kind!='video' or not c.background_removed_path:
+            return
+        if self.worker or not self.require_unlocked(c):
+            return
+        candidate=replace(c,background_removal_enabled=False,background_removed_path='')
+        self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
+
+    def start_motion_tracking(self):
+        """Track the inspector rectangle through one local video clip."""
+        c=self.current_clip()
+        if not c or c.kind!='video' or c.source_type!='video':
+            return self.error('Wähle einen normalen Videoclip für Motion-Tracking.')
+        if self.worker or not self.require_unlocked(c):
+            return
+        region=(self.mask_x.value()/100,self.mask_y.value()/100,
+                self.mask_width.value()/100,self.mask_height.value()/100)
+        if region[0]+region[2] > 1.000001 or region[1]+region[3] > 1.000001:
+            return self.error('Der Trackingbereich muss vollständig im Bild liegen.')
+        uid=c.uid
+        def operation(progress,cancel):
+            try:
+                return track_motion(c.path,c.start,c.end,region,progress,cancel)
+            except AIToolError:
+                if cancel.is_set():
+                    raise ExportCancelled()
+                raise
+        self.start_job('Lokales Motion-Tracking wird berechnet …',operation,
+                       lambda result:self.motion_tracking_done(result,uid))
+
+    def motion_tracking_done(self,result,uid):
+        if not result['ok']:
+            return self.job_error(result)
+        c=next((value for value in self.clips if value.uid==uid),None)
+        if not c:
+            return self.statusBar().showMessage('Clip wurde während des Trackings entfernt.',5000)
+        # Tracking operates on source seconds; render filters see clip-local
+        # seconds after speed processing.  Fixed-speed clips therefore map
+        # source time by 1/speed.  Speed-ramp clips use the base speed as a
+        # stable approximation and remain fully editable afterwards.
+        divisor=max(.25,float(c.speed))
+        points=[]
+        for point in result['value']:
+            value=dict(point); value['time']=round(min(c.length,max(0.0,float(point['time'])/divisor)),6)
+            points.append(value)
+        points.sort(key=lambda value:float(value['time']))
+        unique=[]
+        for point in points:
+            if unique and abs(float(unique[-1]['time'])-float(point['time'])) <= 1e-7:
+                unique[-1]=point
+            else:
+                unique.append(point)
+        try:
+            candidate=replace(c,tracking_keyframes=unique)
+            proposed=[candidate if value.uid==uid else value for value in self.clips]
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
+            self.statusBar().showMessage(f'Motion-Tracking fertig · {len(unique)} Punkte gespeichert.',6000)
+        except Exception as exc:
+            self.error(exc)
+
+    def clear_motion_tracking(self):
+        c=self.current_clip()
+        if not c or c.kind!='video' or not c.tracking_keyframes:
+            return
+        if self.worker or not self.require_unlocked(c):
+            return
+        candidate=replace(c,tracking_keyframes=[])
+        self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
+
+    def set_object_removal_enabled(self, enabled=True):
+        c=self.current_clip()
+        if not c or c.kind!='video' or c.source_type=='adjustment' or self.worker:
+            return
+        if not self.require_unlocked(c):
+            return
+        self.object_removal_enabled.setChecked(bool(enabled))
+        self.apply_properties()
 
     # Compatibility helper for the old in-memory action used by older projects/tests.
     # The visible button intentionally uses extract_audio(), which creates a real WAV.
@@ -2781,7 +3207,7 @@ class Editor(QMainWindow):
             self.preview_play_requested=False
             self.render_preview()
             return
-        self.mode='timeline'; self.audio.setVolume(1); self.transport_rate=rate
+        self.mode='timeline'; self.audio.setVolume(1); self.transport_rate=rate; self.update_source_monitor_controls()
         if rate < 0:
             if self.playhead <= .01:
                 self.playhead=length(self.clips)
@@ -2865,13 +3291,141 @@ class Editor(QMainWindow):
         width=self.scroll.viewport().width()-self.timeline.LEFT-35
         self.zoom_slider.setValue(max(2,min(200,int(width/max(5,length(self.clips))))))
 
+    @staticmethod
+    def _source_clock(seconds):
+        seconds=max(0.0,float(seconds))
+        return f'{int(seconds)//60:02}:{seconds%60:05.2f}'
+
+    def _source_media_clip(self):
+        """Return the active video/audio source shown in the source monitor."""
+        clip=self.current_clip()
+        if (self.mode!='source' or clip is None or clip.kind not in ('video','audio')
+                or clip.source_type not in ('video','audio')):
+            return None
+        return clip
+
+    def _activate_source_clip(self, clip):
+        """Start a fresh transient In/Out session for a newly selected source."""
+        if self.source_clip_uid!=clip.uid:
+            self.source_clip_uid=clip.uid; self.source_in=None; self.source_out=None
+
+    def _source_bounds(self, clip):
+        """Return the effective source In/Out, clamped to the current clip."""
+        start=clip.start if self.source_clip_uid!=clip.uid or self.source_in is None else self.source_in
+        end=clip.end if self.source_clip_uid!=clip.uid or self.source_out is None else self.source_out
+        start=max(clip.start,min(clip.end,start)); end=max(clip.start,min(clip.end,end))
+        if end-start<MIN_CLIP:
+            return clip.start,clip.end
+        return start,end
+
+    def _source_position(self, clip):
+        """Return the current source time, using the player when available."""
+        fallback=clip.start+max(0.0,min(clip.length,max(0.0,self.playhead-clip.position)))
+        try:
+            url=QUrl.fromLocalFile(str(clip.path))
+            player_position=self.player.position()/1000.0
+            if self.player.source()==url and clip.start-.1<=player_position<=clip.end+.1:
+                return max(clip.start,min(clip.end,player_position))
+        except (AttributeError,TypeError,ValueError):
+            pass
+        return max(clip.start,min(clip.end,fallback))
+
+    def update_source_monitor_controls(self):
+        """Refresh source-monitor labels and action availability."""
+        if not hasattr(self,'source_in_button'):
+            return
+        clip=self.current_clip()
+        active=self._source_media_clip() is not None
+        for widget in (self.source_in_button,self.source_out_button,self.source_clear_button,
+                       self.source_insert_button,self.source_overwrite_button):
+            widget.setEnabled(active)
+        if active:
+            source_in,source_out=self._source_bounds(clip)
+            marks=[]
+            if self.source_in is not None: marks.append(f'I {self._source_clock(source_in)}')
+            if self.source_out is not None: marks.append(f'O {self._source_clock(source_out)}')
+            text='Quelle · '+(' · '.join(marks) if marks else 'gesamter Clip')
+            self.source_range_label.setText(text)
+        elif clip is not None and clip.kind in ('video','audio') and clip.source_type in ('video','audio'):
+            self.source_range_label.setText('Quelle: „Clip ansehen“ für In/Out')
+        elif clip is not None and clip.source_type in ('image','image_sequence'):
+            self.source_range_label.setText('Quelle: Standbild · keine In/Out-Marken')
+        else:
+            self.source_range_label.setText('Quelle: kein Medienclip ausgewählt')
+
+    def set_source_in(self):
+        clip=self._source_media_clip()
+        if clip is None:
+            return self.statusBar().showMessage('Öffne zuerst einen Video- oder Audioclip mit „Clip ansehen“.',3500)
+        source_time=self._source_position(clip); _,source_out=self._source_bounds(clip)
+        if source_time>=source_out-MIN_CLIP:
+            return self.statusBar().showMessage('Der Quell-In muss vor dem Quell-Out liegen.',3000)
+        self.source_in=round(source_time,6); self.update_source_monitor_controls()
+        self.statusBar().showMessage(f'Quell-In bei {self._source_clock(source_time)} gesetzt.',2500)
+
+    def set_source_out(self):
+        clip=self._source_media_clip()
+        if clip is None:
+            return self.statusBar().showMessage('Öffne zuerst einen Video- oder Audioclip mit „Clip ansehen“.',3500)
+        source_time=self._source_position(clip); source_in,_=self._source_bounds(clip)
+        if source_time<=source_in+MIN_CLIP:
+            return self.statusBar().showMessage('Der Quell-Out muss nach dem Quell-In liegen.',3000)
+        self.source_out=round(source_time,6); self.update_source_monitor_controls()
+        self.statusBar().showMessage(f'Quell-Out bei {self._source_clock(source_time)} gesetzt.',2500)
+
+    def clear_source_marks(self):
+        if self._source_media_clip() is None:
+            return self.statusBar().showMessage('Öffne zuerst einen Video- oder Audioclip mit „Clip ansehen“.',3500)
+        self.source_in=None; self.source_out=None; self.update_source_monitor_controls()
+        self.statusBar().showMessage('Quell-In/Out zurückgesetzt · gesamter Clip aktiv.',2500)
+
+    def _source_candidate(self):
+        """Build a clean timeline candidate from the marked source range."""
+        clip=self._source_media_clip()
+        if clip is None:
+            self.statusBar().showMessage('Öffne zuerst einen Video- oder Audioclip mit „Clip ansehen“.',3500)
+            return None
+        source_in,source_out=self._source_bounds(clip)
+        if source_out-source_in<MIN_CLIP:
+            self.statusBar().showMessage('Der Quellbereich ist zu kurz.',3000)
+            return None
+        if self.track_locked(clip.track):
+            self.statusBar().showMessage('Die Zielspur ist gesperrt.',3000)
+            return None
+        return replace(clip,uid=uuid.uuid4().hex,position=max(0.0,self.playhead),
+                       start=source_in,end=source_out,group_id='',
+                       transition_type='none',transition_duration=0.0,
+                       fade_in=0.0,fade_out=0.0,freeze_frame=False,freeze_duration=0.0,
+                       keyframes=[],volume_keyframes=[],speed_keyframes=[],
+                       source_paths=list(clip.source_paths))
+
+    def insert_source_range(self):
+        candidate=self._source_candidate()
+        if candidate is None:return
+        try:
+            self._insert_candidates_ripple([candidate])
+        except Exception as exc:
+            self.error(exc)
+
+    def overwrite_source_range(self):
+        candidate=self._source_candidate()
+        if candidate is None:return
+        try:
+            self._overwrite_candidates([candidate])
+        except Exception as exc:
+            self.error(exc)
+
     def set_playhead(self,time):
         self.playhead=max(0,min(length(self.clips),float(time))); self.timeline.set_playhead(self.playhead); self.update_time()
         if self.mode=='timeline' and self.preview_is_current():
             self.player.setPosition(int(min(self.playhead,length(self.clips))*1000))
         elif self.mode=='source' and self.current_clip():
             c=self.current_clip()
-            if c.position<=time<=c.finish:self.player.setPosition(int((c.start+time-c.position)*1000))
+            if c.position<=time<=c.finish:
+                source_time=c.start+time-c.position
+                source_in,source_out=self._source_bounds(c)
+                self.player.setPosition(int(max(source_in,min(source_out,source_time))*1000))
+        self.update_source_monitor_controls()
 
     def seek_slider(self,value):
         self.set_playhead(value/10000*length(self.clips))
@@ -2896,8 +3450,11 @@ class Editor(QMainWindow):
             c=self.current_clip()
             if not c:return
             local=max(0,min(c.length,ms/1000-c.start)); self.playhead=c.position+local
-            if ms/1000>=c.end-.015 and self.player.playbackState()==QMediaPlayer.PlayingState:self.player.pause()
+            _,source_out=self._source_bounds(c)
+            if ms/1000>=source_out-.015 and self.player.playbackState()==QMediaPlayer.PlayingState:
+                self.player.setPosition(round(source_out*1000)); self.player.pause()
         self.timeline.set_playhead(self.playhead); self.update_time()
+        self.update_source_monitor_controls()
 
     def media_ready(self,status):
         if status in (QMediaPlayer.LoadedMedia,QMediaPlayer.BufferedMedia) and self.pending_seek:
@@ -2916,20 +3473,24 @@ class Editor(QMainWindow):
 
     def source_preview(self):
         c=self.current_clip()
-        if not c or c.kind=='text' or self.worker:return
+        if not c or c.kind=='text' or c.source_type=='adjustment' or self.worker:return
         self.transport_stop()
+        self._activate_source_clip(c)
         if c.source_type in ('image','image_sequence'):
             image=QImage(c.source_paths[0] if c.source_paths else c.path)
             if image.isNull():
                 return self.error('Das Bild konnte nicht angezeigt werden.')
             self.mode='source'; self.video_stack.setCurrentIndex(1); self.video.frame=image; self.video.update()
             self.preview_status.setText('BILDVORSCHAU · Timeline-Vorschau zeigt die vollständige Komposition')
+            self.update_source_monitor_controls()
             return
         if self.preview_worker:
             self.cancel_preview(wait=True); self.preview_queued=False
         self.mode='source';self.preview_status.setText('CLIPVORSCHAU · nur die ausgewählte Quelle, nicht der Mix')
         self.audio.setVolume(c.volume); self.player.setPlaybackRate(c.speed)
-        source_time=c.start+max(0,min(c.length-.01,self.playhead-c.position))
+        source_in,source_out=self._source_bounds(c)
+        source_time=max(source_in,min(source_out-.01,self._source_position(c)))
+        self.update_source_monitor_controls()
         self.load_player(c.path,source_time,True,c.kind=='video')
 
     def toggle_play(self):
@@ -2950,7 +3511,7 @@ class Editor(QMainWindow):
                 self.preview_status.setText('Vorschau fertigstellen · Wiedergabe startet gleich …')
             return
         if self.preview_is_current():
-            self.mode='timeline';self.player.setPlaybackRate(1.0);self.audio.setVolume(1)
+            self.mode='timeline';self.player.setPlaybackRate(1.0);self.audio.setVolume(1);self.update_source_monitor_controls()
             self.preview_status.setText('TIMELINE · alle Video- und Audiospuren · Vorschau 480p / Export in gewählter Auflösung')
             if self.playhead>=length(self.clips)-.02:self.playhead=0
             self.load_player(self.preview_path,self.playhead,True);return
@@ -3029,7 +3590,7 @@ class Editor(QMainWindow):
                 self.live_preview_timer.start()
             return
         old=self.preview_path; self.preview_path=path; self.preview_revision=rev; self.preview_signature=signature
-        self.mode='timeline'; self.audio.setVolume(1)
+        self.mode='timeline'; self.audio.setVolume(1); self.update_source_monitor_controls()
         should_play=self.preview_play_requested
         pending_rate=self.transport_rate_pending
         self.transport_rate_pending=None
@@ -3245,7 +3806,9 @@ class Editor(QMainWindow):
         if not path:return
         if not path.lower().endswith(extension):path+=extension
         target=Path(path).resolve()
-        source_files=[path for clip in self.clips+self.assets for path in ([clip.path]+list(clip.source_paths))]
+        source_files=[path for clip in self.clips+self.assets
+                      for path in ([clip.path]+list(clip.source_paths)
+                                   +([clip.background_removed_path] if clip.background_removed_path else []))]
         if any(Path(path).resolve()==target for path in source_files if path):return self.error('Der Export darf keine Quelldatei überschreiben.')
         if target.exists() and QMessageBox.question(self,'Datei ersetzen?',f'{target}\nüberschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:return
         clips=[replace(c,source_paths=list(c.source_paths)) for c in self.clips]
@@ -3421,6 +3984,7 @@ class Editor(QMainWindow):
         self.missing_media=list(data.get('missing_media',[]));self.proxy_enabled=False;self.proxy_map={};self.proxy_directory=None
         self.proxy_box.blockSignals(True);self.proxy_box.setChecked(False);self.proxy_box.blockSignals(False)
         self.current=self.clips[0].uid if self.clips else None;self.selection=[self.current] if self.current else [];self.playhead=0
+        self.source_clip_uid=None;self.source_in=None;self.source_out=None
         self.history.clear();self.future.clear();self.revision+=1;self.preview_revision=-1;self.preview_signature=None;self.preview_path=None
         self.preset.blockSignals(True);self.preset.setCurrentText(data['preset'] if data['preset'] in PRESETS else next(iter(PRESETS)));self.preset.blockSignals(False)
         self.mode='timeline';self.dirty=False;self.prepare_visuals(self.assets);self.refresh_media();self.refresh()
@@ -3495,7 +4059,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-        QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.11-Fenster.');return 1
+                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.17-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

@@ -29,7 +29,7 @@ printf '%s\n' \
     ' Native multitrack video editing with FFmpeg and PySide6.' \
     > "$DEB_ROOT/DEBIAN/control"
 
-for file in app.py core.py preview.py style.py timeline.py transcription.py requirements.txt start.sh update.py update_system.py VERSION LICENSE README.md START_HIER.txt; do
+for file in app.py ai_tools.py core.py preview.py style.py timeline.py transcription.py requirements.txt start.sh update.py update_system.py VERSION LICENSE README.md START_HIER.txt; do
     cp -a -- "$SCRIPT_DIR/$file" "$APP_ROOT/$file"
 done
 cp -a -- "$SCRIPT_DIR/framecut.svg" "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps/framecut.svg"

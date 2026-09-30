@@ -1,4 +1,4 @@
-"""Framecut 3.5: effects, adjustment layers and animated transitions."""
+"""Framecut core: timeline, media, effects and professional trim operations."""
 from dataclasses import dataclass, asdict, field, replace
 from pathlib import Path
 import json
@@ -329,6 +329,12 @@ class Clip:
     blur: float = 0.0
     sharpen: float = 0.0
     stabilization: float = 0.0
+    # Optional local AI/video-analysis derivatives.  The original media path
+    # remains authoritative; these fields only describe generated helpers.
+    background_removal_enabled: bool = False
+    background_removed_path: str = ""
+    tracking_keyframes: list = field(default_factory=list)
+    object_removal_enabled: bool = False
     effect_preset: str = "clean"
     chroma_key_enabled: bool = False
     chroma_key_color: str = "#00ff00"
@@ -352,6 +358,7 @@ class Clip:
     audio_compressor_threshold: float = -18.0
     audio_compressor_ratio: float = 4.0
     audio_ducking: float = 0.0
+    audio_voice_isolation: float = 0.0
     audio_channel_mode: str = "stereo"
     audio_pan: float = 0.0
     # Editing workflow metadata. These fields were added after the first
@@ -382,7 +389,7 @@ class Clip:
                     self.mask_height, self.mask_feather, self.audio_noise_reduction,
                     self.audio_eq_low, self.audio_eq_mid, self.audio_eq_high,
                     self.audio_compressor_threshold, self.audio_compressor_ratio,
-                    self.audio_ducking, self.audio_pan)):
+                    self.audio_ducking, self.audio_voice_isolation, self.audio_pan)):
             raise ValueError("Ungültige Zahl im Projekt.")
         if not (0 <= self.start < self.end <= self.duration + 0.02):
             raise ValueError("Start und Ende müssen innerhalb der Quelldatei liegen.")
@@ -439,6 +446,8 @@ class Clip:
                 raise ValueError("Ungültige Kompressoreinstellung.")
             if not 0 <= self.audio_ducking <= 1:
                 raise ValueError("Audio-Ducking muss zwischen 0 und 100 % liegen.")
+            if not 0 <= self.audio_voice_isolation <= 1:
+                raise ValueError("Sprachisolierung muss zwischen 0 und 100 % liegen.")
             if self.audio_channel_mode not in AUDIO_CHANNEL_MODES or not -1 <= self.audio_pan <= 1:
                 raise ValueError("Ungültige Kanalsteuerung.")
         previous_volume_time = -1.0
@@ -476,6 +485,37 @@ class Clip:
             raise ValueError("Eine Bildsequenz muss auf einer Videospur liegen.")
         if self.source_type == "adjustment" and self.kind != "video":
             raise ValueError("Eine Adjustment-Layer muss auf einer Videospur liegen.")
+        if not isinstance(self.background_removed_path, str):
+            raise ValueError("Ungültiger Pfad der KI-Hintergrundmaske.")
+        if type(self.background_removal_enabled) is not bool or type(self.object_removal_enabled) is not bool:
+            raise ValueError("Ungültiger KI-Effektstatus.")
+        if self.background_removal_enabled and (self.kind != "video" or self.source_type not in ("video", "image")):
+            raise ValueError("KI-Hintergrundentfernung ist nur für Video- und Bildclips erlaubt.")
+        if self.object_removal_enabled and self.kind != "video":
+            raise ValueError("Objektentfernung ist nur für Videoclips erlaubt.")
+        if not isinstance(self.tracking_keyframes, list):
+            raise ValueError("Ungültige Motion-Tracking-Daten.")
+        if self.kind != "video" and self.tracking_keyframes:
+            raise ValueError("Motion-Tracking ist nur für Videoclips erlaubt.")
+        previous_tracking_time = -1.0
+        for point in self.tracking_keyframes:
+            if not isinstance(point, dict):
+                raise ValueError("Ungültiger Motion-Tracking-Punkt.")
+            try:
+                values = (point["time"], point["x"], point["y"], point["width"], point["height"])
+            except KeyError as exc:
+                raise ValueError("Motion-Tracking-Punkt enthält unvollständige Daten.") from exc
+            if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                       and math.isfinite(float(value)) for value in values):
+                raise ValueError("Ungültige Motion-Tracking-Zahl.")
+            time, x, y, width, height = map(float, values)
+            if time < -1e-7 or time > self.length + 1e-7 or time <= previous_tracking_time + 1e-7:
+                raise ValueError("Motion-Tracking-Zeit muss sortiert im Clip liegen.")
+            if not 0 <= x <= 1 or not 0 <= y <= 1 or not 0 < width <= 1 or not 0 < height <= 1:
+                raise ValueError("Motion-Tracking-Bereich liegt außerhalb des Bildes.")
+            if x + width > 1.000001 or y + height > 1.000001:
+                raise ValueError("Motion-Tracking-Bereich liegt außerhalb des Bildes.")
+            previous_tracking_time = time
         if self.kind == "text":
             if not isinstance(self.text, str) or not self.text.strip():
                 raise ValueError("Textclip darf nicht leer sein.")
@@ -940,11 +980,13 @@ def split_clip(clip, timeline_time):
                     freeze_frame=False,freeze_duration=0.0,
                     keyframes=retime_keyframes(clip,clip.start,split_source_time,clip.speed),
                     volume_keyframes=retime_volume_keyframes(clip,clip.start,split_source_time,clip.speed),
-                    speed_keyframes=retime_speed_keyframes(clip,clip.start,split_source_time))
+                    speed_keyframes=retime_speed_keyframes(clip,clip.start,split_source_time),
+                    tracking_keyframes=retime_tracking_keyframes(clip,clip.start,split_source_time,clip.speed))
     second = replace(clip, start=split_source_time, position=timeline_time, uid=uuid.uuid4().hex,
                      keyframes=retime_keyframes(clip,split_source_time,clip.end,clip.speed),
                      volume_keyframes=retime_volume_keyframes(clip,split_source_time,clip.end,clip.speed),
-                     speed_keyframes=retime_speed_keyframes(clip,split_source_time,clip.end))
+                     speed_keyframes=retime_speed_keyframes(clip,split_source_time,clip.end),
+                     tracking_keyframes=retime_tracking_keyframes(clip,split_source_time,clip.end,clip.speed))
     return first, second
 
 
@@ -1147,6 +1189,16 @@ def audio_effect_filters(clip):
     filters = []
     if clip.audio_noise_reduction > 1e-7:
         filters.append(f"afftdn=nr={clip.audio_noise_reduction:.6f}:nf=-50")
+    if clip.audio_voice_isolation > 1e-7:
+        # FFmpeg's dialogue enhancer is local and ships with the supported
+        # Linux builds.  It suppresses ambience while preserving the centre
+        # voice without requiring a cloud service or a proprietary model.
+        strength = float(clip.audio_voice_isolation)
+        original = max(0.0, 1.0 - .7 * strength)
+        enhance = 1.0 + 2.0 * strength
+        voice = 2.0 + 8.0 * strength
+        filters.append(f"dialoguenhance=original={original:.6f}:enhance={enhance:.6f}:voice={voice:.6f}")
+        filters.append(f"speechnorm=peak=.95:compression={1.0 + 3.0 * strength:.6f}:threshold=.02")
     bands = ((120, clip.audio_eq_low), (1000, clip.audio_eq_mid), (8000, clip.audio_eq_high))
     for frequency, gain in bands:
         if abs(gain) > 1e-7:
@@ -1323,6 +1375,29 @@ def preset_filters(clip):
     return list(presets.get(clip.filter_preset, []))
 
 
+def tracking_expression(clip, field, time_expression="t"):
+    """Interpolate a tracked rectangle field in local clip seconds."""
+    defaults = {'x': clip.mask_x, 'y': clip.mask_y,
+                'width': clip.mask_width, 'height': clip.mask_height}
+    if field not in defaults:
+        raise ValueError("Unbekanntes Tracking-Feld.")
+    frames = clip.tracking_keyframes if clip.kind == 'video' else []
+    if not frames:
+        return f'{float(defaults[field]):.6f}'
+    def number(value):
+        return f'{float(value):.6f}'
+    expression = number(frames[-1][field])
+    for left, right in reversed(list(zip(frames, frames[1:]))):
+        left_time, right_time = float(left['time']), float(right['time'])
+        ratio = f'(({time_expression}-{number(left_time)})/{number(max(1e-9, right_time-left_time))})'
+        interpolated = f'({number(left[field])}+({number(right[field])}-{number(left[field])})*{ratio})'
+        expression = f'if(lt({time_expression},{number(right_time)}),{interpolated},{expression})'
+    first_time = float(frames[0]['time'])
+    if first_time > 1e-7:
+        expression = f'if(lt({time_expression},{number(first_time)}),{number(defaults[field])},{expression})'
+    return expression
+
+
 def mask_filter(clip):
     """Create a soft rectangle/ellipse alpha mask after the frame is scaled."""
     if clip.mask_type == 'none':
@@ -1330,16 +1405,24 @@ def mask_filter(clip):
     feather = max(0.0001, float(clip.mask_feather))
     if clip.mask_type == 'rectangle':
         # geq exposes the current frame dimensions as W/H (not iw/ih).
-        left, top = f'W*{clip.mask_x:.6f}', f'H*{clip.mask_y:.6f}'
-        right, bottom = f'W*{clip.mask_x+clip.mask_width:.6f}', f'H*{clip.mask_y+clip.mask_height:.6f}'
+        x_expression = tracking_expression(clip, 'x', 'T')
+        y_expression = tracking_expression(clip, 'y', 'T')
+        width_expression = tracking_expression(clip, 'width', 'T')
+        height_expression = tracking_expression(clip, 'height', 'T')
+        left, top = f'W*({x_expression})', f'H*({y_expression})'
+        right, bottom = f'W*(({x_expression})+({width_expression}))', f'H*(({y_expression})+({height_expression}))'
         edge = f'min(min(X-({left}),({right})-X),min(Y-({top}),({bottom})-Y))'
         feather_px = f'min(W,H)*{feather:.6f}'
         alpha = f'if(lt({edge},0),0,if(lt({edge},{feather_px}),{edge}/{feather_px},1))'
     else:
-        center_x = f'W*{clip.mask_x+clip.mask_width/2:.6f}'
-        center_y = f'H*{clip.mask_y+clip.mask_height/2:.6f}'
-        radius_x = f'W*{clip.mask_width/2:.6f}'
-        radius_y = f'H*{clip.mask_height/2:.6f}'
+        x_expression = tracking_expression(clip, 'x', 'T')
+        y_expression = tracking_expression(clip, 'y', 'T')
+        width_expression = tracking_expression(clip, 'width', 'T')
+        height_expression = tracking_expression(clip, 'height', 'T')
+        center_x = f'W*((({x_expression})+({width_expression})/2))'
+        center_y = f'H*((({y_expression})+({height_expression})/2))'
+        radius_x = f'W*(({width_expression})/2)'
+        radius_y = f'H*(({height_expression})/2)'
         distance = f'hypot((X-({center_x}))/({radius_x}),(Y-({center_y}))/({radius_y}))'
         alpha = f'if(gt({distance},1),0,if(gt({distance},1-{feather:.6f}),(1-{distance})/{feather:.6f},1))'
     return f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({alpha})'"
@@ -1395,6 +1478,27 @@ def retime_volume_keyframes(clip, start, end, speed):
     return result
 
 
+def retime_tracking_keyframes(clip, start, end, speed):
+    """Keep tracked rectangles aligned after trim, split or speed changes."""
+    if clip.kind != "video" or not clip.tracking_keyframes:
+        return []
+    source_per_local = max(0.25, float(clip.speed))
+    new_source_per_local = max(0.25, float(speed))
+    new_length = max(0.0, (float(end)-float(start))/new_source_per_local)
+    result = []
+    for point in clip.tracking_keyframes:
+        source_time = float(clip.start) + float(point["time"]) * source_per_local
+        if source_time < float(start)-1e-7 or source_time > float(end)+1e-7:
+            continue
+        item = dict(point)
+        item["time"] = round(max(0.0, min(new_length, (source_time-float(start))/new_source_per_local)), 6)
+        if result and abs(result[-1]["time"]-item["time"]) <= 1e-6:
+            result[-1] = item
+        else:
+            result.append(item)
+    return result
+
+
 def edited_clip(original, mode, delta, track=None):
     """Pure, clamped geometry; collision validation is performed on commit."""
     if mode == "move":
@@ -1405,15 +1509,67 @@ def edited_clip(original, mode, delta, track=None):
         return replace(original, start=start, position=original.position+delta,
                        keyframes=retime_keyframes(original,start,original.end,original.speed),
                        volume_keyframes=retime_volume_keyframes(original,start,original.end,original.speed),
-                       speed_keyframes=retime_speed_keyframes(original,start,original.end))
+                       speed_keyframes=retime_speed_keyframes(original,start,original.end),
+                       tracking_keyframes=retime_tracking_keyframes(original,start,original.end,original.speed))
     if mode == "right":
         delta = max(MIN_CLIP-original.length, min(delta, (original.duration-original.end)/original.speed))
         end = original.end+delta*original.speed
         return replace(original, end=end,
                        keyframes=retime_keyframes(original,original.start,end,original.speed),
                        volume_keyframes=retime_volume_keyframes(original,original.start,end,original.speed),
-                       speed_keyframes=retime_speed_keyframes(original,original.start,end))
+                       speed_keyframes=retime_speed_keyframes(original,original.start,end),
+                       tracking_keyframes=retime_tracking_keyframes(original,original.start,end,original.speed))
     raise ValueError("Unbekannte Schnittoperation.")
+
+
+def slip_clip(original, delta):
+    """Shift a clip's source window while keeping its timeline geometry."""
+    if original.kind not in ("video", "audio") or original.source_type not in ("video", "audio"):
+        raise ValueError("Slip-Schnitt ist nur für Video- und Audiomedien verfügbar.")
+    if original.freeze_frame:
+        raise ValueError("Ein Clip mit Freeze-Frame kann nicht geslippt werden.")
+    span = float(original.end) - float(original.start)
+    if span < MIN_CLIP - 1e-7:
+        raise ValueError("Der Clip ist zu kurz für einen Slip-Schnitt.")
+    maximum = max(0.0, float(original.duration) - span)
+    start = max(0.0, min(maximum, float(original.start) + float(delta) * float(original.speed)))
+    end = start + span
+    # A slip changes the source image underneath the clip; previously
+    # analysed positions are no longer trustworthy for the new material.
+    return replace(original, start=start, end=end, tracking_keyframes=[])
+
+
+def roll_edit(left, right, cut_time):
+    """Move the cut between two adjacent clips without changing duration."""
+    if left.uid == right.uid or left.track != right.track or left.kind != right.kind:
+        raise ValueError("Ein Roll-Schnitt braucht zwei Medienclips derselben Spur.")
+    if abs(left.finish - right.position) > 1e-5:
+        raise ValueError("Ein Roll-Schnitt braucht direkt angrenzende Clips.")
+    delta = float(cut_time) - float(left.finish)
+    first = edited_clip(left, "right", delta)
+    second = edited_clip(right, "left", delta)
+    if abs(first.finish - second.position) > 1e-5:
+        raise ValueError("Der Roll-Schnitt überschreitet den verfügbaren Quellbereich.")
+    return first, second
+
+
+def slide_edit(previous, clip, following, delta):
+    """Move a clip while trimming its directly adjacent neighbours."""
+    if len({previous.uid, clip.uid, following.uid}) != 3:
+        raise ValueError("Ein Slide-Schnitt braucht drei verschiedene Clips.")
+    if not (previous.track == clip.track == following.track):
+        raise ValueError("Ein Slide-Schnitt braucht Clips derselben Spur.")
+    if not (previous.kind == clip.kind == following.kind):
+        raise ValueError("Ein Slide-Schnitt braucht Clips desselben Typs.")
+    if abs(previous.finish - clip.position) > 1e-5 or abs(clip.finish - following.position) > 1e-5:
+        raise ValueError("Ein Slide-Schnitt braucht zwei direkte Nachbarn.")
+    delta = float(delta)
+    left = edited_clip(previous, "right", delta)
+    middle = replace(clip, position=clip.position + delta)
+    right = edited_clip(following, "left", delta)
+    if abs(left.finish - middle.position) > 1e-5 or abs(middle.finish - right.position) > 1e-5:
+        raise ValueError("Der Slide-Schnitt überschreitet den verfügbaren Quellbereich.")
+    return left, middle, right
 
 
 def atomic_json(path, data):
@@ -1439,7 +1595,9 @@ def save_project(path, clips, preset, tracks, assets=(), origin=None, track_stat
     markers = normalize_markers(markers, length(clips))
     mixer = normalize_master_mixer(mixer)
     source_files = [path for clip in list(clips)+list(assets)
-                    for path in ([clip.path] + list(clip.source_paths) + ([clip.lut_path] if clip.lut_path else []))]
+                    for path in ([clip.path] + list(clip.source_paths)
+                                 + ([clip.lut_path] if clip.lut_path else [])
+                                 + ([clip.background_removed_path] if clip.background_removed_path else []))]
     if any(Path(path).resolve() == target for path in source_files if path):
         raise ValueError("Projekt darf keine Quelldatei überschreiben.")
     def encode(clip):
@@ -1450,6 +1608,8 @@ def save_project(path, clips, preset, tracks, assets=(), origin=None, track_stat
             item["source_paths"] = [os.path.relpath(path, target.parent) for path in clip.source_paths]
         if clip.lut_path:
             item["lut_path"] = os.path.relpath(clip.lut_path, target.parent)
+        if clip.background_removed_path:
+            item["background_removed_path"] = os.path.relpath(clip.background_removed_path, target.parent)
         return item
     # Marker metadata is optional, so keep the established v2 container
     # version. Older Framecut releases can still open the project and simply
@@ -1484,6 +1644,8 @@ def load_project(path, allow_missing=False):
             values["source_paths"] = [str((p.parent / source).resolve()) for source in values.get("source_paths", [])]
         if values.get("lut_path"):
             values["lut_path"] = str((p.parent / values["lut_path"]).resolve())
+        if values.get("background_removed_path"):
+            values["background_removed_path"] = str((p.parent / values["background_removed_path"]).resolve())
         if values.get("kind") == "text" or values.get("source_type") == "adjustment":
             values["path"] = ""
             # Text clips created by pre-1.3 builds used their initial visible
@@ -1541,6 +1703,8 @@ def _clip_media_paths(clip):
         values.extend(clip.source_paths)
     if clip.lut_path:
         values.append(clip.lut_path)
+    if clip.background_removed_path:
+        values.append(clip.background_removed_path)
     result = []
     seen = set()
     for value in values:
@@ -1585,7 +1749,8 @@ def relink_project_media(clips, assets, replacements):
         return replace(clip,
                        path=mapped(clip.path),
                        source_paths=[mapped(path) for path in clip.source_paths],
-                       lut_path=mapped(clip.lut_path))
+                       lut_path=mapped(clip.lut_path),
+                       background_removed_path=mapped(clip.background_removed_path))
 
     return [relink(clip) for clip in clips], [relink(asset) for asset in assets]
 
@@ -1933,7 +2098,9 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
         raise ExportCancelled()
     target = Path(target).resolve()
     source_files = [path for clip in clips
-                    for path in ([clip.path] + list(clip.source_paths) + ([clip.lut_path] if clip.lut_path else []))]
+                    for path in ([clip.path] + list(clip.source_paths)
+                                 + ([clip.lut_path] if clip.lut_path else [])
+                                 + ([clip.background_removed_path] if clip.background_removed_path else []))]
     if any(Path(path).resolve() == target for path in source_files if path):
         raise ValueError("Export darf keine Quelldatei überschreiben.")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1966,10 +2133,17 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
             infos.append((True, False))
             continue
         source_length = c.end-c.start
+        source_path = c.path
+        if c.background_removal_enabled:
+            if c.source_type == "image_sequence":
+                raise ValueError("KI-Hintergrundentfernung ist für Bildsequenzen noch nicht verfügbar.")
+            source_path = c.background_removed_path
+            if not source_path or not Path(source_path).is_file():
+                raise ValueError("Die KI-Hintergrunddatei fehlt. Starte die Hintergrundentfernung erneut.")
         if c.kind == "video" and c.source_type == "image":
             video, audio = True, False
             infos.append((video, audio))
-            args += ["-loop", "1", "-framerate", f"{fps:.6f}", "-t", f"{source_length:.6f}", "-i", c.path]
+            args += ["-loop", "1", "-framerate", f"{fps:.6f}", "-t", f"{source_length:.6f}", "-i", source_path]
             input_index[i] = media_index
             media_index += 1
             continue
@@ -1993,13 +2167,13 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
             input_index[i] = media_index
             media_index += 1
             continue
-        _, video, audio = probe(c.path)
+        _, video, audio = probe(source_path)
         if c.kind == "video" and not video:
-            raise ValueError("Videoquelle enthält kein Video: " + c.path)
+            raise ValueError("Videoquelle enthält kein Video: " + source_path)
         if c.kind == "audio" and not audio:
-            raise ValueError("Audioquelle enthält keinen Ton: " + c.path)
+            raise ValueError("Audioquelle enthält keinen Ton: " + source_path)
         infos.append((video, audio))
-        args += ["-threads", "1", "-ss", f"{c.start:.6f}", "-t", f"{source_length:.6f}", "-i", c.path]
+        args += ["-threads", "1", "-ss", f"{c.start:.6f}", "-t", f"{source_length:.6f}", "-i", source_path]
         input_index[i] = media_index
         media_index += 1
     last = "base"
@@ -2060,8 +2234,31 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
         if c.lut_path:
             video_filters.append(f"lut3d=file='{_filter_escape(c.lut_path)}'")
         scale_expression = keyframe_expression(c, "scale") if animated else f"{c.video_scale:.6f}"
-        video_filters += [f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                          "setsar=1",f"fps={fps}"]
+        video_filters.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2")
+        if c.object_removal_enabled:
+            # delogo accepts pixel coordinates, not normalized expressions on
+            # all supported FFmpeg versions.  Apply stepped, timeline-enabled
+            # fills after the fixed output scale; a tracked rectangle therefore
+            # follows the object without relying on a cloud API.
+            video_filters.append(f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
+            points = c.tracking_keyframes or [{
+                'time': 0.0, 'x': c.mask_x, 'y': c.mask_y,
+                'width': c.mask_width, 'height': c.mask_height,
+            }]
+            for point_index, point in enumerate(points):
+                start_time = max(0.0, float(point['time']))
+                if point_index + 1 < len(points):
+                    end_time = max(start_time + 1e-6, float(points[point_index + 1]['time']))
+                    enable = f"between(t,{start_time:.6f},{end_time:.6f})"
+                else:
+                    enable = f"gte(t,{start_time:.6f})"
+                x_pixel = max(0, min(width - 2, round(float(point['x']) * width)))
+                y_pixel = max(0, min(height - 2, round(float(point['y']) * height)))
+                w_pixel = max(2, min(width - x_pixel, round(float(point['width']) * width)))
+                h_pixel = max(2, min(height - y_pixel, round(float(point['height']) * height)))
+                video_filters.append(
+                    f"delogo=x={x_pixel}:y={y_pixel}:w={w_pixel}:h={h_pixel}:show=0:enable='{enable}'")
+        video_filters += ["setsar=1",f"fps={fps}"]
 
         # gblur exposes a fixed sigma. Animated blur therefore becomes a
         # short chain of timeline-enabled blur filters. This avoids a costly

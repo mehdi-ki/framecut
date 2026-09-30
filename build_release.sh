@@ -44,7 +44,7 @@ if [[ -n "${FRAMECUT_RELEASE_BASE_URL:-}" ]]; then
     appimage_file="$APPIMAGE_OUTPUT"
     {
         printf '{\n  "product": "Framecut",\n  "version": "%s",\n' "$APP_VERSION"
-        printf '  "release_notes": ["Framecut 3.11: lokale automatische Untertitel mit Whisper, editierbare Untertitelspuren und bestehender SRT/VTT-Roundtrip."],\n'
+        printf '  "release_notes": ["Framecut 3.17: KI-Hintergrundfreistellung, lokales Motion-Tracking, Objektentfernung und Sprachisolierung; alle Werkzeuge arbeiten lokal mit FFmpeg/OpenCV/rembg."],\n'
         printf '  "artifacts": {\n'
         if [[ -f "$appimage_file" ]]; then
             printf '    "appimage": {"filename": "%s", "url": "%s/%s", "sha256": "%s"},\n' \

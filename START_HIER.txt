@@ -1,4 +1,4 @@
-FRAMECUT 3.11 — START
+FRAMECUT 3.17 — START
 
 1. Das ZIP vollständig in einen NEUEN Ordner entpacken.
 2. Den Ordner mit dieser Datei und start.sh öffnen.
@@ -15,6 +15,9 @@ Musikspuren, Originalton auslagern, Autosave und Wiederherstellung sowie Projekt
 NEU IN 3.9: Rechtsklick-Kontextmenü in der Timeline repariert.
 NEU IN 3.10: Aufgeräumte Timeline-Werkzeugleiste mit klaren Gruppen, Menüs, eindeutigen Symbolen und einer ruhigen zweiten Zeile für Spuren und Zoom.
 NEU IN 3.11: Automatische Untertitel per lokaler Whisper-Spracherkennung. Quelle, Sprache und Modell wählen; die Ergebnisse werden als editierbare Untertitelclips angelegt und bleiben mit SRT/VTT-Import und -Export kompatibel.
+NEU IN 3.12: Professionelle Trim-Werkzeuge mit Ripple-In/Out, Roll-, Slide- und Slip-Schnitt. Q/W schneiden zum Abspielkopf, R verschiebt eine Schnittkante, Alt-Pfeile führen Slide und Umschalt+Alt-Pfeile Slip frameweise aus.
+NEU IN 3.13: Source-Monitor für Video- und Audioquellen. „Clip ansehen“ zeigt eine Quelle separat; I/O setzt temporäre Quell-In/Out-Punkte, Insert fügt den markierten Bereich ein und Overwrite überschreibt ihn am Abspielkopf.
+NEU IN 3.17: Lokale KI-Werkzeuge für Hintergrundfreistellung, Motion-Tracking, Objektentfernung und Sprachisolierung. Die Videoanalyse läuft mit OpenCV/rembg lokal; FFmpeg rendert die transparenten und bereinigten Ableitungen ohne Cloud-Upload.
 
 VORSCHAU: ▶ Timeline berechnet den Mix nach kurzer Bearbeitungspause im Hintergrund. Der letzte gültige Frame bleibt sichtbar.
 Clip ansehen zeigt sofort die einzelne Quelle.

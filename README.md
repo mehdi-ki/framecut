@@ -1,4 +1,4 @@
-# Framecut 3.11 — Linux-Auslieferung, Updates, Effekte und professionelle Timeline
+# Framecut 3.17 — Lokale KI-Werkzeuge, Linux-Auslieferung und professionelle Timeline
 
 Native Linux-Videoschnitt-App mit einer CapCut-ähnlichen Anordnung. Eigener Code,
 keine CapCut-Kopie. Python/PySide6 mit lokalem FFmpeg-Export und optionaler lokaler
@@ -8,7 +8,7 @@ Whisper-Spracherkennung für automatische Untertitel.
 
 1. Framecut 0.1 schließen und die bisherigen Projekte speichern.
 2. Dieses ZIP in einen **neuen Ordner** entpacken. Version 0.1 als Rückfall behalten.
-3. Den Ordner `Framecut-3.11` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
+3. Den Ordner `Framecut-3.17` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
 4. Rechtsklick auf eine freie Stelle → „Im Terminal öffnen“.
 5. Ausführen:
 
@@ -17,14 +17,14 @@ Whisper-Spracherkennung für automatische Untertitel.
    ```
 
 Für eine Desktop-Installation kannst du stattdessen `bash install.sh` ausführen.
-Der Installer legt Framecut unter `~/.local/share/framecut/3.11` ab und erstellt
+Der Installer legt Framecut unter `~/.local/share/framecut/3.17` ab und erstellt
 den Starter `~/.local/bin/framecut` sowie einen Eintrag im Anwendungsmenü.
 
-## Linux-Auslieferung 3.11
+## Linux-Auslieferung 3.17
 
 Das Quellpaket enthält jetzt drei reproduzierbare Auslieferungswege:
 
-- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.11_amd64.deb`. Installation mit `sudo apt install ./framecut_3.11_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.11/.venv` an; FFmpeg und Python bleiben systemweit.
+- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.17_amd64.deb`. Installation mit `sudo apt install ./framecut_3.17_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.17/.venv` an; FFmpeg und Python bleiben systemweit.
 - **AppImage:** `bash build_appimage.sh` erzeugt aus der vorbereiteten `Framecut.AppDir` ein echtes Type-2-AppImage, sobald das offizielle `appimagetool` über `PATH` oder `APPIMAGETOOL=/pfad/appimagetool` verfügbar ist. Der Builder bricht ohne dieses Werkzeug bewusst ab und erzeugt keine Datei, die nur fälschlich `.AppImage` heißt.
 - **Komplettes Release:** `bash build_release.sh` erstellt das Linux-ZIP, das `.deb`, Prüfsummen und – falls `appimagetool` vorhanden ist – das AppImage. Ohne Tool bleibt eine kurze Build-Hinweisdatei neben den übrigen Artefakten.
 
@@ -77,7 +77,7 @@ sudo apt update && sudo apt install python3-venv ffmpeg libxcb-cursor0
 ```
 
 Der Starter erstellt eine lokale `.venv` und installiert beim ersten Start
-PySide6 6.8.3 und faster-whisper. Dafür sind Internet und einige hundert MB Platz
+PySide6 6.8.3, faster-whisper, OpenCV und rembg/onnxruntime. Dafür sind Internet und einige hundert MB Platz
 nötig; beim ersten automatischen Untertitel-Lauf wird zusätzlich das gewählte
 Whisper-Modell geladen. pip kann
 bereits heruntergeladene Pakete aus seinem Cache verwenden. Nicht mit sudo starten.
@@ -129,6 +129,9 @@ Danach arbeitet die App lokal und lädt deine Videos nicht hoch.
 - **Design & Workflow 3.8**: Cinema-Vollbildvorschau mit Esc/F11 und eine durchsuchbare Befehls-Palette mit den wichtigsten Schnitt-, Projekt- und Exportaktionen über Strg+K.
 - **Timeline UX 3.9**: Rechtsklick-Kontextmenüs werden über Qt zuverlässig weitergereicht.
 - **Timeline Design 3.10**: Die Werkzeugleiste über der Timeline ist in Verlauf, Bearbeiten, Einfügen, Marker, Add, Export, Mehr und Ausrichten gruppiert. Seltene Aktionen öffnen sich über Menüs; die sichtbare Leiste enthält nur eindeutige Symbole und behält Tooltips sowie Tastenkürzel.
+- **Professionelle Trim-Werkzeuge 3.12**: Ripple-In (**Q**) und Ripple-Out (**W**) schneiden bis zum Abspielkopf und schließen die betroffene Spur. Der Roll-Schnitt (**R**) verschiebt eine direkte Schnittkante, ohne die Gesamtdauer zu ändern. Slide verschiebt einen Clip frameweise zwischen direkten Nachbarn; Slip verschiebt frameweise nur das Quellfenster. Alle Modi sind auch über das Trim-Menü, den Rechtsklick auf Clips und **Strg+K** verfügbar und lassen sich mit Undo/Redo zurücknehmen.
+- **Source-Monitor 3.13**: **Clip ansehen** öffnet die ausgewählte Video- oder Audioquelle unabhängig vom Timeline-Mix. Mit **I** und **O** setzt du Quell-In und Quell-Out; der markierte Bereich lässt sich direkt als **Insert** einfügen oder als **Overwrite** verwenden. Die Marken sind temporär, werden beim Clipwechsel zurückgesetzt und alle Schnitte bleiben vollständig undo-/redo-fähig.
+- **Lokale KI-Werkzeuge 3.17**: **Hintergrund entfernen** erzeugt mit rembg/ONNX eine transparente lokale Video- oder Bildableitung, **Motion-Tracking** verfolgt den Rechteckbereich per OpenCV und **Objekt entfernen** füllt das getrackte Gebiet lokal per FFmpeg. **Sprachisolierung** hebt Dialoge mit FFmpeg hervor und reduziert Hintergrundgeräusche. Kein Video muss dafür einen Cloud-Dienst verlassen; die optionalen Zusatzpakete werden beim Start automatisch nachinstalliert.
 - **Videoeffekte** stehen pro Videoclip zur Verfügung: Deckkraft für Overlays/Picture-in-Picture, Unschärfe, Schärfe, Stabilisierung, Greenscreen-Keying und weiche Rechteck-/Ellipsenmasken. Deckkraft und Unschärfe lassen sich zusätzlich per Keyframe animieren.
 - **Speed-Ramping, Freeze-Frame und Reverse**: Mehrere lokale Geschwindigkeitspunkte werden interpoliert; ein Freeze-Frame hält das letzte Bild für eine einstellbare Dauer und Reverse dreht Bild und Originalton um.
 - **Übergänge**: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Dip to Black, Fade to White, Blur In, Pixelize, Circle Open/Close und Radial können zwischen direkt angrenzenden Video- oder Audioclips derselben Spur gewählt werden. Bild und Ton werden passend zur eingestellten Dauer behandelt.
@@ -342,6 +345,8 @@ Mit **Marker +** setzt du am aktuellen Abspielkopf einen benannten Marker; **Kap
 
 **Insert** fügt die kopierten Clips am Abspielkopf ein und verschiebt spätere Clips auf den betroffenen Spuren nach rechts. **Overwrite** legt die kopierten Clips am Abspielkopf ab und trimmt oder entfernt nur den überdeckten Bereich; die restliche Timeline bleibt an ihrer Position. Beide Modi prüfen gesperrte Spuren und lassen sich mit Undo/Redo zurücknehmen.
 
+**Ripple-In** (**Q**) entfernt den Quellbereich vom Clipanfang bis zum Abspielkopf und zieht spätere Clips derselben Spur nach links. **Ripple-Out** (**W**) entfernt den Bereich vom Abspielkopf bis zum Clipende und schließt die Spur ebenfalls. Der **Roll-Schnitt** (**R**) setzt die Kante zwischen zwei direkt angrenzenden Clips auf die Position des Abspielkopfs und erhält die Gesamtdauer des Paars. **Slide** verschiebt den ausgewählten Clip mit **Alt + Pfeil**; die direkten Nachbarn werden an den neuen Kanten mitgetrimmt. **Slip** verschiebt mit **Umschalt + Alt + Pfeil** nur den Quellbereich, während Position und Länge des Clips unverändert bleiben. Nicht ausreichender Quellbereich, gesperrte Spuren und ungültige Nachbarschaften werden abgefangen.
+
 ## Spurstatus
 
 Klicke links im Spurkopf auf **M**, um eine Video- oder Audiospur stummzuschalten.
@@ -454,7 +459,10 @@ Das Exportvideo verwendet die oben ausgewählte Auflösung, nicht die Vorschau.
 
 **Clip ansehen** spielt die ausgewählte Quelle sofort ab, inklusive ihrer
 Schnittgrenzen und Lautstärke. Dieser Modus zeigt **nicht** den gesamten Mix.
-Zum Wechsel zurück die Wiedergabe pausieren und **▶ Timeline** drücken.
+Die Source-Leiste zeigt die temporären In/Out-Marken. Mit **Insert** wird der
+markierte Bereich am aktuellen Abspielkopf eingesetzt und spätere Clips werden
+verschoben; **Overwrite** ersetzt nur den überdeckten Bereich. Zum Wechsel zurück
+die Wiedergabe pausieren und **▶ Timeline** drücken.
 
 ## Autosave und Projekte
 
@@ -510,6 +518,10 @@ Eine nicht lesbare Wiederherstellungsdatei wird vor weiteren Änderungen gesiche
 | Strg + G | Auswahl gruppieren |
 | Strg + Umschalt + G | Gruppe lösen |
 | Strg + Umschalt + Entf | Ripple löschen |
+| Q / W | Ripple-In / Ripple-Out zum Abspielkopf |
+| R | Roll-Schnitt zum Abspielkopf |
+| Alt + Pfeile | Slide-Schnitt frameweise links / rechts |
+| Umschalt + Alt + Pfeile | Slip-Schnitt frameweise links / rechts |
 | Strg + Z | Rückgängig |
 | Strg + Umschalt + Z | Wiederholen |
 | Entf / Rücktaste | Clip entfernen |
@@ -524,14 +536,13 @@ Eine nicht lesbare Wiederherstellungsdatei wird vor weiteren Änderungen gesiche
 ## Grenzen dieser Version
 
 - Übergänge sind bewusst native FFmpeg-Kompositionen; externe Übergangspakete und proprietäre Effektbibliotheken werden nicht benötigt.
-- Keine KI-Funktionen.
+- Automatische Untertitel laufen lokal über faster-whisper; das Modell wird nur beim ersten Einsatz geladen.
 - Keine Mehrspur-Ripple-Bearbeitung über unterschiedliche Spurtypen hinweg, wenn die Zielspuren gesperrt sind.
 - Der Export hängt bei Hardwareprofilen von den installierten FFmpeg-Encodern
   und Linux-Treibern ab; **Auto** verwendet bei fehlender Hardware CPU-Encoding.
 - Viele gleichzeitige Quellen, hohe Bitraten, 60/120 FPS, AV1 oder HDR können
   CPU, Speicher und Renderzeit deutlich stärker beanspruchen.
-- Schnittzeiten sind sekundengenau eingegeben; die gewählte Export-FPS bestimmt
-  das Ausgaberaster. Dieser Prototyp ersetzt noch keinen bildgenauen Profi-Schnittplatz.
+- Die numerischen Inspector-Felder arbeiten weiterhin sekundengenau; die professionellen Trim-Modi verschieben Quellen und Schnittkanten zusätzlich frameweise anhand der Clip-Bildrate.
 - Vorschau-, Poster- und Wellenform-Cache werden automatisch begrenzt; Projektmedien
   werden nicht kopiert. Ein harter Prozessabbruch kann einzelne Cachedateien hinterlassen,
   die beim nächsten Start nach dem Größenlimit bereinigt werden.

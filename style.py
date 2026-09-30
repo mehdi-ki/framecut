@@ -165,7 +165,11 @@ QPushButton#iconButton:hover {
     border-color: #37424f;
 }
 
-QFrame#timelineToolGroup,
+QFrame#timelineToolGroup {
+    background: transparent;
+    border: none;
+}
+
 QFrame#timelineControlGroup {
     background: #1a1e25;
     border: 1px solid #2b333e;
@@ -190,7 +194,9 @@ QFrame#timelineSeparator {
 QToolButton#timelineToolButton,
 QToolButton#timelineToolToggle,
 QToolButton#timelineMenuButton,
-QToolButton#timelineToolDanger {
+QToolButton#timelineToolDanger,
+QToolButton#sourceToolButton,
+QToolButton#sourceToolDanger {
     color: #b8c2cf;
     background: transparent;
     border: 1px solid transparent;
@@ -204,17 +210,20 @@ QToolButton#timelineToolDanger {
 
 QToolButton#timelineToolButton:hover,
 QToolButton#timelineToolToggle:hover,
-QToolButton#timelineMenuButton:hover {
+QToolButton#timelineMenuButton:hover,
+QToolButton#sourceToolButton:hover {
     color: #effffb;
     background: #27333a;
     border-color: #3d5960;
 }
 
-QToolButton#timelineToolDanger {
+QToolButton#timelineToolDanger,
+QToolButton#sourceToolDanger {
     color: #de9aa4;
 }
 
-QToolButton#timelineToolDanger:hover {
+QToolButton#timelineToolDanger:hover,
+QToolButton#sourceToolDanger:hover {
     color: #ffd9dd;
     background: #40272d;
     border-color: #8b4c58;
@@ -222,7 +231,9 @@ QToolButton#timelineToolDanger:hover {
 
 QToolButton#timelineToolButton:pressed,
 QToolButton#timelineToolToggle:pressed,
-QToolButton#timelineMenuButton:pressed {
+QToolButton#timelineMenuButton:pressed,
+QToolButton#sourceToolButton:pressed,
+QToolButton#sourceToolDanger:pressed {
     background: #151a20;
 }
 
@@ -235,7 +246,9 @@ QToolButton#timelineToolToggle:checked {
 QToolButton#timelineToolButton:disabled,
 QToolButton#timelineToolToggle:disabled,
 QToolButton#timelineMenuButton:disabled,
-QToolButton#timelineToolDanger:disabled {
+QToolButton#timelineToolDanger:disabled,
+QToolButton#sourceToolButton:disabled,
+QToolButton#sourceToolDanger:disabled {
     color: #5f6875;
     background: transparent;
 }

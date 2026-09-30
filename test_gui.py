@@ -236,6 +236,11 @@ class GuiTest(unittest.TestCase):
             self.assertTrue(w.snap_box.isCheckable())
             self.assertEqual(w.snap_box.toolTip(),'Einrasten ein/aus')
             self.assertEqual(w.subtitle_export_button.toolTip(),'Untertitel exportieren')
+            self.assertIsInstance(w.source_in_button,QToolButton)
+            self.assertIsInstance(w.source_insert_button,QToolButton)
+            self.assertEqual(w.source_in_button.text(),'I')
+            self.assertEqual(w.source_insert_button.text(),'↳')
+            self.assertEqual(w.work_out_button.text(),'O')
             # The v3.10 toolbar deliberately exposes fewer primary buttons;
             # secondary actions are grouped behind labelled popup buttons.
             self.assertGreaterEqual(len(w.findChildren(QToolButton)),14)
@@ -246,6 +251,10 @@ class GuiTest(unittest.TestCase):
             timeline.context_requested.connect(lambda uid,pos: received.append((uid,pos)))
             point=QPoint(timeline.LEFT+20,timeline.TOP+20)
             QTest.mouseClick(timeline,Qt.RightButton,Qt.NoModifier,point)
+            self.assertEqual(len(received),1)
+            # A few Qt/Linux combinations also send a follow-up context event
+            # for the same gesture. It must not open a second menu.
+            timeline._request_context_menu(point,timeline.mapToGlobal(point))
             self.assertEqual(len(received),1)
             timeline.close()
             w.dirty=False;w.close();QTest.qWait(50)

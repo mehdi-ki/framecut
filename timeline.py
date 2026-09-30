@@ -1,6 +1,7 @@
 """Painted multitrack timeline with transactional drag/trim and snapping."""
 from dataclasses import replace
 from pathlib import Path
+from time import monotonic
 from PySide6.QtCore import Qt, Signal, QRectF, QMimeData, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QDrag, QImage, QPolygonF
 from PySide6.QtWidgets import QWidget, QListWidget
@@ -78,6 +79,12 @@ class Timeline(QWidget):
         self.marquee_append = False
         self.ghost = None
         self.snapline = None
+        # Some Linux/Qt combinations deliver both the mouse right-click path
+        # and a follow-up context-menu event. Keep one native gesture from
+        # opening the editor menu twice while still allowing a new click
+        # immediately after a different gesture.
+        self._last_context_signature = None
+        self._last_context_time = -1.0
         self.thumbnails = {}
         self.waveforms = {}
         # Scaling poster frames and waveform images during every paint event
@@ -606,6 +613,13 @@ class Timeline(QWidget):
 
     def _request_context_menu(self, point, global_pos=None):
         """Forward a right-click to the editor's contextual action menus."""
+        signature = (int(point.x()), int(point.y()))
+        now = monotonic()
+        if (signature == self._last_context_signature
+                and now-self._last_context_time < 0.35):
+            return
+        self._last_context_signature = signature
+        self._last_context_time = now
         if global_pos is None:
             global_pos = self.mapToGlobal(point)
         if point.x() < self.LEFT and point.y() >= self.TOP:

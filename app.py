@@ -1,4 +1,4 @@
-"""Framecut 3.20.0 — native Linux multitrack editor."""
+"""Framecut 3.20.1 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -37,9 +37,9 @@ from ai_tools import (AIToolError, remove_background_media, track_motion, auto_r
                        analyze_beats, detect_scene_changes, detect_audio_onset)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.20.0'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.20.1'
 except OSError:
-    APP_VERSION = '3.20.0'
+    APP_VERSION = '3.20.1'
 
 
 def label(text,name=None):
@@ -95,14 +95,12 @@ def timeline_icon_label(symbol, tooltip):
 
 
 def timeline_tool_group(title, widgets):
-    """Put related timeline actions into a small, labelled visual group."""
+    """Put related timeline actions into one flat, tooltip-labelled group."""
     group=QFrame(); group.setObjectName('timelineToolGroup')
-    layout=QVBoxLayout(group); layout.setContentsMargins(5,3,5,3); layout.setSpacing(1)
-    caption=label(title,'timelineGroupLabel'); caption.setAlignment(Qt.AlignCenter); layout.addWidget(caption)
-    actions=QHBoxLayout(); actions.setContentsMargins(0,0,0,0); actions.setSpacing(1)
+    group.setToolTip(title); group.setAccessibleName(title)
+    layout=QHBoxLayout(group); layout.setContentsMargins(1,1,1,1); layout.setSpacing(1)
     for widget in widgets:
-        actions.addWidget(widget)
-    layout.addLayout(actions)
+        layout.addWidget(widget)
     return group
 
 
@@ -1093,18 +1091,18 @@ class Editor(QMainWindow):
         self.time_label=label('00:00.0 / 00:00.0','muted'); controls.addWidget(self.time_label); pl.addLayout(controls)
         source_controls=QHBoxLayout(); source_controls.setContentsMargins(0,0,0,0); source_controls.setSpacing(4)
         self.source_range_label=label('Quelle: Clip ansehen für In/Out','muted'); self.source_range_label.setObjectName('sourceRangeLabel'); source_controls.addWidget(self.source_range_label,1)
-        self.source_in_button=button('I  In',self.set_source_in); self.source_in_button.setObjectName('sourceMarkButton'); self.source_in_button.setToolTip('Quell-In am aktuellen Quellbild setzen · I')
-        self.source_out_button=button('O  Out',self.set_source_out); self.source_out_button.setObjectName('sourceMarkButton'); self.source_out_button.setToolTip('Quell-Out am aktuellen Quellbild setzen · O')
-        self.source_clear_button=button('×',self.clear_source_marks); self.source_clear_button.setObjectName('sourceMarkButton'); self.source_clear_button.setToolTip('Quell-In/Out auf den gesamten Clip zurücksetzen')
-        self.source_insert_button=button('Insert',self.insert_source_range); self.source_insert_button.setObjectName('sourceEditButton'); self.source_insert_button.setToolTip('Markierten Quellbereich am Abspielkopf einfügen und spätere Clips verschieben')
-        self.source_overwrite_button=button('Overwrite',self.overwrite_source_range); self.source_overwrite_button.setObjectName('sourceEditButton'); self.source_overwrite_button.setToolTip('Markierten Quellbereich am Abspielkopf überschreiben')
+        self.source_in_button=timeline_tool_button('I','Quell-In am aktuellen Quellbild setzen · I',self.set_source_in,object_name='sourceToolButton')
+        self.source_out_button=timeline_tool_button('O','Quell-Out am aktuellen Quellbild setzen · O',self.set_source_out,object_name='sourceToolButton')
+        self.source_clear_button=timeline_tool_button('×','Quell-In/Out auf den gesamten Clip zurücksetzen',self.clear_source_marks,object_name='sourceToolDanger')
+        self.source_insert_button=timeline_tool_button('↳','Markierten Quellbereich am Abspielkopf einfügen und spätere Clips verschieben',self.insert_source_range,'insert-object',object_name='sourceToolButton')
+        self.source_overwrite_button=timeline_tool_button('▣','Markierten Quellbereich am Abspielkopf überschreiben',self.overwrite_source_range,'document-save-as',object_name='sourceToolButton')
         for widget in (self.source_in_button,self.source_out_button,self.source_clear_button,self.source_insert_button,self.source_overwrite_button): source_controls.addWidget(widget)
         pl.addLayout(source_controls)
         work_controls=QHBoxLayout(); work_controls.setContentsMargins(0,0,0,0); work_controls.setSpacing(4)
         self.work_range_label=label('Arbeitsbereich: gesamte Timeline','muted'); self.work_range_label.setObjectName('sourceRangeLabel'); work_controls.addWidget(self.work_range_label,1)
-        self.work_in_button=button('I  In',self.set_work_in); self.work_in_button.setObjectName('sourceMarkButton'); self.work_in_button.setToolTip('Arbeitsbereich-In am Abspielkopf setzen · Strg+Alt+I')
-        self.work_out_button=button('O  Out',self.set_work_out); self.work_out_button.setObjectName('sourceMarkButton'); self.work_out_button.setToolTip('Arbeitsbereich-Out am Abspielkopf setzen · Strg+Alt+O')
-        self.work_clear_button=button('×',self.clear_work_area); self.work_clear_button.setObjectName('sourceMarkButton'); self.work_clear_button.setToolTip('Arbeitsbereich löschen')
+        self.work_in_button=timeline_tool_button('I','Arbeitsbereich-In am Abspielkopf setzen · Strg+Alt+I',self.set_work_in,object_name='sourceToolButton')
+        self.work_out_button=timeline_tool_button('O','Arbeitsbereich-Out am Abspielkopf setzen · Strg+Alt+O',self.set_work_out,object_name='sourceToolButton')
+        self.work_clear_button=timeline_tool_button('×','Arbeitsbereich löschen',self.clear_work_area,object_name='sourceToolDanger')
         for widget in (self.work_in_button,self.work_out_button,self.work_clear_button): work_controls.addWidget(widget)
         pl.addLayout(work_controls)
         top.addWidget(preview)
@@ -1113,11 +1111,6 @@ class Editor(QMainWindow):
         inspector_content=QWidget(); il=QVBoxLayout(inspector_content); il.setContentsMargins(0,0,0,0); il.setSpacing(8)
         inspector_scroll.setWidget(inspector_content); inspector_outer.addWidget(inspector_scroll)
         il.addWidget(label('CLIP-EINSTELLUNGEN','heading')); self.clip_name=label('Kein Clip ausgewählt','muted'); self.clip_name.setWordWrap(True); il.addWidget(self.clip_name)
-        inspector_modes=QHBoxLayout(); inspector_modes.setContentsMargins(0,0,0,0); inspector_modes.setSpacing(2)
-        for mode_name in ('Video','Audio','Speed','Animate','Adjust'):
-            mode_button=QPushButton(mode_name); mode_button.setObjectName('modeTabActive' if mode_name=='Video' else 'modeTab'); mode_button.setToolTip(f'{mode_name}-Werkzeuge im Inspector')
-            inspector_modes.addWidget(mode_button)
-        il.addLayout(inspector_modes)
         form=QFormLayout(); self.position=QDoubleSpinBox(); self.start=QDoubleSpinBox(); self.end=QDoubleSpinBox()
         for spin in [self.position,self.start,self.end]: spin.setRange(0,864000); spin.setDecimals(3); spin.setSuffix(' s'); spin.setSingleStep(.1)
         self.track_combo=QComboBox(); self.volume=QDoubleSpinBox(); self.volume.setRange(0,100); self.volume.setDecimals(0); self.volume.setSuffix(' %')
@@ -1361,7 +1354,7 @@ class Editor(QMainWindow):
         speed_ramp_buttons=QHBoxLayout(); speed_ramp_buttons.setContentsMargins(0,0,0,0); speed_ramp_buttons.addWidget(self.speed_ramp_set_button,1); speed_ramp_buttons.addWidget(self.speed_ramp_remove_button,1); il.addLayout(speed_ramp_buttons)
         il.addWidget(self.speed_ramp_list)
         il.addWidget(button('Bild zurücksetzen',self.reset_transform)); il.addWidget(button('Übernehmen',self.apply_properties,True)); il.addWidget(button('Audio aus Video extrahieren',self.extract_audio))
-        hint=label('Höhere Videospuren liegen vorne.\nTon aller Spuren wird gemischt.\n\nGleiche Spur: keine Überlappung.\nShift beim Ziehen: ohne Einrasten.\n\nSpurkopf: M = stumm schalten · L = Spur sperren.\nAudio: Rauschunterdrückung, 3-Band-EQ, Kompressor, Ducking, Sprachisolierung, Kanalmodus und Panorama.\nDucking auf einem Musikclip senkt ihn automatisch, sobald andere Audiospuren aktiv sind.\nBildtransformation: Zoom, Position, Crop, Rotation und Spiegeln.\nFarbkorrektur: Helligkeit, Kontrast, Sättigung, Presets und .cube/.3dl-LUTs.\nEffekt-Presets: Clean, Cinematic, Dream, Noir, Vivid und Soft Focus.\nAdjustment-Layer legt Effekte über die darunterliegende Komposition.\nVideoeffekte: Deckkraft, Unschärfe, Schärfe, Stabilisierung, Greenscreen und Masken.\nKI-Werkzeuge: lokale Hintergrundfreistellung, Motion-Tracking, Auto-Reframe und Objektentfernung; kein Cloud-Upload.\nAuto-Reframe erkennt Gesichter lokal und folgt dem Fokus in Projektformat, 16:9, 9:16 oder 1:1.\nKeyframes animieren Zoom, Bildposition, Rotation, Deckkraft und Unschärfe; Kurven: Linear, Ease in, Ease out und Ease in/out.\nSpeed-Ramping: mehrere Geschwindigkeits-Punkte zwischen 0,25× und 4× setzen.\nFreeze-Frame hält das letzte Bild; Reverse spielt Bild und Ton rückwärts.\nÜbergänge: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Blur, Pixelize, Circle, Radial sowie Fade to White.\nEinblenden / Ausblenden sind weiche Übergänge für Bild und Ton.\nTextclips liegen automatisch über dem Video.\nTextstil: Schrift, Fett/Kursiv, Kontur, Schatten und Hintergrund.\nTextanimation: Ein-/Ausblenden oder Hereinschieben.\nSRT/VTT importiert Cue-Zeiten als Textclips auf eigenen Spuren.\nAudio extrahieren erstellt eine eigene Audiodatei.\n\nShortcuts: Leertaste = Play/Pause · J = rückwärts · K = Pause · L = vorwärts\nPfeile = 1 s bewegen · Entf = Clip löschen','muted'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
+        hint=label('Kurztipps\n• Rechtsklick auf Clip, Spur oder freie Timeline öffnet Aktionen.\n• Clipmitte ziehen = verschieben · Ränder ziehen = kürzen.\n• Shift = ohne Einrasten · Strg+Klick = Mehrfachauswahl.\n• Leertaste = Play/Pause · Entf = Auswahl löschen.','muted'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
         top.addWidget(inspector); top.setSizes([78,300,760,330]); vertical.addWidget(top)
         bottom,bl=panel(); bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
         bar=QHBoxLayout(); bar.setContentsMargins(10,5,10,5); bar.setSpacing(6)
@@ -5312,7 +5305,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.20.0-Fenster.');return 1
+                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.20.1-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

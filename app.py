@@ -1,4 +1,4 @@
-"""Framecut 3.10 — native Linux multitrack editor."""
+"""Framecut 3.11 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -29,11 +29,12 @@ from style import STYLE
 from update_system import (configured_manifest_url,download_verified,fetch_manifest,
                            install_downloaded,preferred_kinds,select_artifact,update_cache_directory,
                            update_checks_disabled)
+from transcription import transcribe_media
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.10'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.11'
 except OSError:
-    APP_VERSION = '3.10'
+    APP_VERSION = '3.11'
 
 
 def label(text,name=None):
@@ -190,6 +191,105 @@ class ExportDialog(QDialog):
             self.export_settings=normalize_export_settings(self.settings())
         except ValueError as exc:
             QMessageBox.warning(self,'Export-Einstellungen',str(exc)); return
+        super().accept()
+
+
+class AutomaticSubtitleDialog(QDialog):
+    """Choose a local source and settings for speech-to-text subtitles."""
+
+    def __init__(self, sources, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Automatische Untertitel')
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(11)
+        layout.addWidget(label('AUTOMATISCHE UNTERTITEL · LOKALE SPRACHERKENNUNG', 'heading'))
+        intro = label(
+            'Framecut wandelt die Sprache aus einem Video oder einer Audiodatei in editierbare Textclips um. '
+            'Die Quelldatei bleibt auf deinem Rechner; beim ersten Einsatz wird nur das gewählte Sprachmodell geladen.',
+            'muted')
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        source_row = QHBoxLayout()
+        self.source_combo = QComboBox()
+        for title, path in sources:
+            self.source_combo.addItem(title, str(path))
+        self.source_combo.setToolTip('Bereits importiertes Video oder Audio verwenden')
+        source_row.addWidget(self.source_combo, 1)
+        browse = QPushButton('Datei auswählen …')
+        browse.clicked.connect(self.choose_file)
+        source_row.addWidget(browse)
+        source_widget = QWidget(); source_widget.setLayout(source_row)
+        form.addRow('Quelle', source_widget)
+
+        self.language_combo = QComboBox()
+        for value, title in (
+            ('auto', 'Automatisch erkennen'),
+            ('de', 'Deutsch'),
+            ('en', 'English'),
+            ('tr', 'Türkçe'),
+            ('az', 'Azərbaycanca'),
+            ('es', 'Español'),
+            ('fr', 'Français'),
+        ):
+            self.language_combo.addItem(title, value)
+        self.language_combo.setToolTip('Eine bekannte Sprache kann die Erkennung beschleunigen')
+        form.addRow('Sprache', self.language_combo)
+
+        self.model_combo = QComboBox()
+        for value, title in (
+            ('tiny', 'Schnell · tiny'),
+            ('base', 'Ausgewogen · base'),
+            ('small', 'Genauer · small'),
+        ):
+            self.model_combo.addItem(title, value)
+        self.model_combo.setCurrentIndex(self.model_combo.findData('base'))
+        self.model_combo.setToolTip('Größere Modelle sind genauer, brauchen aber länger und mehr Speicher')
+        form.addRow('Modell', self.model_combo)
+        layout.addLayout(form)
+
+        hint = label('Die Verarbeitung läuft als Hintergrundvorgang und kann jederzeit abgebrochen werden. '
+                     'Das Modell wird im Framecut-Benutzerordner zwischengespeichert.', 'muted')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText('Untertitel erstellen')
+        buttons.button(QDialogButtonBox.Cancel).setText('Abbrechen')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def choose_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Quelle für automatische Untertitel auswählen', '',
+            'Video und Audio (*.mp4 *.mkv *.mov *.webm *.avi *.mp3 *.wav *.m4a *.flac *.ogg);;Alle Dateien (*)')
+        if not path:
+            return
+        path = str(Path(path).expanduser().resolve())
+        index = self.source_combo.findData(path)
+        if index < 0:
+            self.source_combo.insertItem(0, f'{Path(path).name} · Datei', path)
+            index = 0
+        self.source_combo.setCurrentIndex(index)
+
+    def settings(self):
+        return {
+            'path': self.source_combo.currentData(),
+            'language': self.language_combo.currentData(),
+            'model_size': self.model_combo.currentData(),
+        }
+
+    def accept(self):
+        path = self.source_combo.currentData()
+        if not path:
+            QMessageBox.warning(self, 'Automatische Untertitel', 'Wähle zuerst ein Video oder eine Audiodatei aus.')
+            return
+        if not Path(path).is_file():
+            QMessageBox.warning(self, 'Automatische Untertitel', f'Die Quelldatei wurde nicht gefunden:\n{path}')
+            return
         super().accept()
 
 
@@ -693,6 +793,7 @@ class Editor(QMainWindow):
         ml.addWidget(label('MEDIEN','heading')); ml.addWidget(button('+ Video / Audio / Bild importieren',self.import_dialog,True))
         ml.addWidget(button('+ Bildsequenz importieren',self.import_sequence_dialog))
         ml.addWidget(button('+ Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog))
+        ml.addWidget(button('+ Automatische Untertitel',self.automatic_subtitle_dialog))
         self.media_search=QLineEdit(); self.media_search.setPlaceholderText('Medien durchsuchen …'); self.media_search.setClearButtonEnabled(True)
         self.media_search.setToolTip('Suche nach Dateiname, Pfad oder Medientyp')
         ml.addWidget(self.media_search)
@@ -936,6 +1037,7 @@ class Editor(QMainWindow):
         add_menu.addAction('Adjustment-Layer hinzufügen',self.add_adjustment_layer)
         add_menu.addSeparator()
         add_menu.addAction('Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog)
+        add_menu.addAction('Automatische Untertitel …',self.automatic_subtitle_dialog)
         add_button=timeline_menu_button('+','Element hinzufügen',add_menu,'list-add')
 
         more_menu=QMenu(self); more_menu.setTitle('Weitere Timeline-Aktionen')
@@ -1161,6 +1263,7 @@ class Editor(QMainWindow):
             menu.addAction('+ Text',self.add_text)
             menu.addAction('+ Adjustment-Layer',self.add_adjustment_layer)
             menu.addAction('+ Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog)
+            menu.addAction('+ Automatische Untertitel',self.automatic_subtitle_dialog)
             menu.addAction('Medien importieren',self.import_dialog)
             menu.addAction('Bildsequenz importieren',self.import_sequence_dialog)
             menu.addAction('Ausgewähltes Medium am Spurende hinzufügen',self.add_selected_asset)
@@ -1592,6 +1695,7 @@ class Editor(QMainWindow):
             ('Wiederholen', 'Ctrl+Shift+Z', self.redo),
             ('Textclip hinzufügen', '+ Text', self.add_text),
             ('Adjustment-Layer hinzufügen', '+ Adjustment-Layer', self.add_adjustment_layer),
+            ('Automatische Untertitel erstellen', '—', self.automatic_subtitle_dialog),
             ('Audio-Mixer öffnen', '—', self.open_mixer),
             ('Render-Queue öffnen', '—', self.show_render_queue),
             ('Timeline einpassen', '—', self.fit_timeline),
@@ -2423,6 +2527,61 @@ class Editor(QMainWindow):
         if ok:
             self.import_paths(paths,sequence_fps=fps)
 
+    def automatic_subtitle_dialog(self):
+        if self.worker:
+            return
+        sources=[]; seen=set()
+        candidates=[]
+        current=self.current_clip()
+        if current is not None:
+            candidates.append(current)
+        candidates.extend(self.assets)
+        candidates.extend(self.clips)
+        for candidate in candidates:
+            if candidate.kind not in ('video','audio') or candidate.source_type in ('image','image_sequence','adjustment'):
+                continue
+            path=str(candidate.path or '').strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            title=f'{Path(path).name} · {"Video" if candidate.kind == "video" else "Audio"}'
+            sources.append((title,path))
+        dialog=AutomaticSubtitleDialog(sources,self)
+        if dialog.exec()!=QDialog.Accepted:
+            return
+        settings=dialog.settings()
+        self.start_transcription(settings['path'],settings['language'],settings['model_size'])
+
+    def start_transcription(self,path,language='auto',model_size='base'):
+        if self.worker:
+            return
+        if not path:
+            return self.error('Wähle zuerst ein Video oder eine Audiodatei für die Spracherkennung aus.')
+        source=Path(path).expanduser().resolve()
+        if not source.is_file():
+            return self.error(f'Die Quelldatei wurde nicht gefunden:\n{source}')
+
+        def operation(progress,cancel):
+            return transcribe_media(source,model_size=model_size,language=language,
+                                    cache_dir=self.state_dir/'whisper-models',
+                                    progress=progress,cancel=cancel)
+        self.start_job('Automatische Untertitel werden erstellt …',operation,
+                       lambda result:self.transcription_done(result,source))
+
+    def transcription_done(self,result,source):
+        if not result['ok']:
+            return self.job_error(result)
+        payload=result['value']
+        cues=payload.get('cues',[]) if isinstance(payload,dict) else payload
+        if not cues:
+            return self.error('Keine gesprochenen Worte im Medium erkannt.')
+        try:
+            count=self.add_subtitle_cues(cues,Path(source).name,'automatisch erstellt')
+            detected=str(payload.get('language','auto')).upper() if isinstance(payload,dict) else 'AUTO'
+            self.statusBar().showMessage(f'{count} Untertitel automatisch erstellt · Sprache {detected}',6000)
+        except Exception as exc:
+            self.error(exc)
+
     def import_subtitle_dialog(self):
         if self.worker:
             return
@@ -2445,40 +2604,45 @@ class Editor(QMainWindow):
     def subtitle_import_done(self,result,path):
         if not result['ok']:
             return self.job_error(result)
-        cues=result['value']
         try:
-            existing=list(self.clips)
-            tracks=list(self.tracks)
-            video_tracks=[track for track in tracks if track > 0]
-            next_track=max(video_tracks,default=0)+1
-            subtitle_tracks=[]
-            new_clips=[]
-
-            def overlaps(track,start,end):
-                return any(item.track == track and item.position < end - 1e-7 and item.finish > start + 1e-7
-                           for item in existing + new_clips)
-
-            for cue in cues:
-                start=float(cue['start']); end=float(cue['end'])
-                track=next((candidate for candidate in subtitle_tracks if not overlaps(candidate,start,end)),None)
-                if track is None:
-                    track=next_track; next_track+=1; subtitle_tracks.append(track); tracks.append(track)
-                duration=end-start
-                candidate=Clip('',864000.0,start=0,end=duration,position=start,track=track,kind='text',
-                               has_audio=False,text=cue['text'],source_type='text')
-                new_clips.append(candidate)
-            proposed=existing+new_clips
-            validate_timeline(proposed,tracks)
-            self.checkpoint(); self.tracks=tracks
-            self.track_states=normalize_track_states(self.track_states,self.tracks)
-            self.track_names=normalize_track_names(self.track_names,self.tracks)
-            for index,track in enumerate(subtitle_tracks,1):
-                self.track_names[track]='Untertitel' if index == 1 else f'Untertitel {index}'
-            self.clips=proposed; self.selection=[clip.uid for clip in new_clips]
-            self.current=new_clips[-1].uid if new_clips else None; self.changed()
-            self.statusBar().showMessage(f'{len(new_clips)} Untertitel aus {Path(path).name} importiert.',5000)
+            self.add_subtitle_cues(result['value'],Path(path).name,'importiert')
         except Exception as exc:
             self.error(exc)
+
+    def add_subtitle_cues(self,cues,source_label,action='importiert'):
+        if not cues:
+            raise ValueError('Keine gültigen Untertitel gefunden.')
+        existing=list(self.clips)
+        tracks=list(self.tracks)
+        video_tracks=[track for track in tracks if track > 0]
+        next_track=max(video_tracks,default=0)+1
+        subtitle_tracks=[]
+        new_clips=[]
+
+        def overlaps(track,start,end):
+            return any(item.track == track and item.position < end - 1e-7 and item.finish > start + 1e-7
+                       for item in existing + new_clips)
+
+        for cue in cues:
+            start=float(cue['start']); end=float(cue['end'])
+            track=next((candidate for candidate in subtitle_tracks if not overlaps(candidate,start,end)),None)
+            if track is None:
+                track=next_track; next_track+=1; subtitle_tracks.append(track); tracks.append(track)
+            duration=end-start
+            candidate=Clip('',864000.0,start=0,end=duration,position=start,track=track,kind='text',
+                           has_audio=False,text=cue['text'],source_type='text')
+            new_clips.append(candidate)
+        proposed=existing+new_clips
+        validate_timeline(proposed,tracks)
+        self.checkpoint(); self.tracks=tracks
+        self.track_states=normalize_track_states(self.track_states,self.tracks)
+        self.track_names=normalize_track_names(self.track_names,self.tracks)
+        for index,track in enumerate(subtitle_tracks,1):
+            self.track_names[track]='Untertitel' if index == 1 else f'Untertitel {index}'
+        self.clips=proposed; self.selection=[clip.uid for clip in new_clips]
+        self.current=new_clips[-1].uid if new_clips else None; self.changed()
+        self.statusBar().showMessage(f'{len(new_clips)} Untertitel aus {source_label} {action}.',5000)
+        return len(new_clips)
 
     def import_paths(self,paths,sequence_fps=None):
         if not paths or self.worker:return
@@ -3331,7 +3495,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-        QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.10-Fenster.');return 1
+        QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.11-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

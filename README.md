@@ -1,13 +1,14 @@
-# Framecut 3.10 — Linux-Auslieferung, Updates, Effekte und professionelle Timeline
+# Framecut 3.11 — Linux-Auslieferung, Updates, Effekte und professionelle Timeline
 
 Native Linux-Videoschnitt-App mit einer CapCut-ähnlichen Anordnung. Eigener Code,
-keine CapCut-Kopie und keine KI. Python/PySide6 mit lokalem FFmpeg-Export.
+keine CapCut-Kopie. Python/PySide6 mit lokalem FFmpeg-Export und optionaler lokaler
+Whisper-Spracherkennung für automatische Untertitel.
 
 ## Update und Start auf deinem Linux Mint
 
 1. Framecut 0.1 schließen und die bisherigen Projekte speichern.
 2. Dieses ZIP in einen **neuen Ordner** entpacken. Version 0.1 als Rückfall behalten.
-3. Den Ordner `Framecut-3.10` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
+3. Den Ordner `Framecut-3.11` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
 4. Rechtsklick auf eine freie Stelle → „Im Terminal öffnen“.
 5. Ausführen:
 
@@ -16,14 +17,14 @@ keine CapCut-Kopie und keine KI. Python/PySide6 mit lokalem FFmpeg-Export.
    ```
 
 Für eine Desktop-Installation kannst du stattdessen `bash install.sh` ausführen.
-Der Installer legt Framecut unter `~/.local/share/framecut/3.10` ab und erstellt
+Der Installer legt Framecut unter `~/.local/share/framecut/3.11` ab und erstellt
 den Starter `~/.local/bin/framecut` sowie einen Eintrag im Anwendungsmenü.
 
-## Linux-Auslieferung 3.10
+## Linux-Auslieferung 3.11
 
 Das Quellpaket enthält jetzt drei reproduzierbare Auslieferungswege:
 
-- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.10_amd64.deb`. Installation mit `sudo apt install ./framecut_3.10_amd64.deb`. Die Anwendung legt ihre PySide6-Umgebung pro Benutzer unter `~/.local/share/framecut/3.10/.venv` an; FFmpeg und Python bleiben systemweit.
+- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.11_amd64.deb`. Installation mit `sudo apt install ./framecut_3.11_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.11/.venv` an; FFmpeg und Python bleiben systemweit.
 - **AppImage:** `bash build_appimage.sh` erzeugt aus der vorbereiteten `Framecut.AppDir` ein echtes Type-2-AppImage, sobald das offizielle `appimagetool` über `PATH` oder `APPIMAGETOOL=/pfad/appimagetool` verfügbar ist. Der Builder bricht ohne dieses Werkzeug bewusst ab und erzeugt keine Datei, die nur fälschlich `.AppImage` heißt.
 - **Komplettes Release:** `bash build_release.sh` erstellt das Linux-ZIP, das `.deb`, Prüfsummen und – falls `appimagetool` vorhanden ist – das AppImage. Ohne Tool bleibt eine kurze Build-Hinweisdatei neben den übrigen Artefakten.
 
@@ -62,7 +63,7 @@ neu gestartet werden. Die Manifest-Datei selbst wird nie automatisch verändert.
 
 ### GitHub-Release-Automation
 
-`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.10` automatisch
+`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.11` automatisch
 die getesteten ZIP-, `.deb`- und AppImage-Dateien sowie `updates.json`. Die Version
 kommt aus der Datei `VERSION`; Tag und Versionsdatei müssen übereinstimmen. Dadurch
 werden Prüfsummen und Download-Adressen für den Update-Checker bei jedem Release
@@ -76,7 +77,9 @@ sudo apt update && sudo apt install python3-venv ffmpeg libxcb-cursor0
 ```
 
 Der Starter erstellt eine lokale `.venv` und installiert beim ersten Start
-PySide6 6.8.3. Dafür sind Internet und einige hundert MB Platz nötig; pip kann
+PySide6 6.8.3 und faster-whisper. Dafür sind Internet und einige hundert MB Platz
+nötig; beim ersten automatischen Untertitel-Lauf wird zusätzlich das gewählte
+Whisper-Modell geladen. pip kann
 bereits heruntergeladene Pakete aus seinem Cache verwenden. Nicht mit sudo starten.
 Danach arbeitet die App lokal und lädt deine Videos nicht hoch.
 
@@ -87,6 +90,7 @@ Danach arbeitet die App lokal und lädt deine Videos nicht hoch.
 - Der weiße Abspielkopf lässt sich am Griff oben in der Timeline mit der Maus an jede beliebige Stelle ziehen.
 - **Textclips** lassen sich über **+ Text** anlegen, auf einer eigenen oberen Spur platzieren und im Inspector bearbeiten: Inhalt, Schriftart, Größe, Farbe, Fett/Kursiv, Kontur, Schatten, Hintergrund, Animation sowie X-/Y-Position.
 - **Untertitel** können direkt aus **SRT** oder **VTT** importiert werden. Cue-Zeiten und Zeilen werden als editierbare Textclips auf automatisch angelegten Untertitelspuren übernommen; überlappende Cues werden auf getrennte Spuren verteilt.
+- **Automatische Untertitel** öffnen sich über **+ Automatische Untertitel** links, im Timeline-Add-Menü, per Rechtsklick auf eine freie Timeline-Stelle oder über **Strg+K**. Wähle ein Projektmedium oder eine Datei, die Sprache (**Automatisch**, Deutsch, English, Türkçe, Azərbaycanca, Español oder Français) und das Modell **tiny**, **base** oder **small**. faster-whisper verarbeitet Video/Audio lokal im Hintergrund; das gewählte Modell wird nur beim ersten Einsatz heruntergeladen und danach im Framecut-Benutzerordner wiederverwendet. Die erzeugten Cues sind normale Textclips und können wie importierte Untertitel verschoben, gestaltet, geschnitten, per Undo/Redo bearbeitet und wieder als SRT/VTT exportiert werden.
 - Die Anzahl der Video- und Audiospuren lässt sich oben in der Timeline frei zwischen 1 und 10 wählen. Belegte Spuren werden geschützt.
 - Geschwindigkeit pro Clip von 0,25× bis 4× für Zeitlupe und Zeitraffer, inklusive synchron angepasstem Ton und Clipdauer.
 - Rechtsklick auf einen Clip öffnet ein Kontextmenü mit passenden Bearbeitungsaktionen: Vorschau, Teilen, Geschwindigkeit, Lautstärke, Audioextraktion, Textbearbeitung und Löschen. Auf leerem Timeline-Bereich stehen Schnellaktionen bereit.
@@ -183,7 +187,26 @@ Import-Reihenfolge, Name, Typ oder Dauer gestellt werden. Ein gefiltertes oder
 sortiertes Medium kann weiterhin direkt auf die Timeline gezogen oder mit
 **Am Spurende hinzufügen +** eingesetzt werden.
 
-## Untertitel importieren
+## Untertitel und automatische Transkription
+
+Über **+ Automatische Untertitel** links, im Add-Menü der Timeline, per Rechtsklick
+auf eine freie Timeline-Stelle oder über **Strg+K** öffnest du die lokale
+Spracherkennung. Wähle ein importiertes Video bzw. Audio oder eine Datei vom
+Datenträger. **Automatisch erkennen** funktioniert für mehrsprachiges Material;
+bei bekanntem Ton kannst du Deutsch, English, Türkçe, Azərbaycanca, Español oder
+Français fest vorgeben. Das Modell **tiny** ist am schnellsten, **base** ist die
+ausgewogene Standardwahl und **small** liefert meist die genaueren Zeitsegmente.
+
+Die Verarbeitung läuft im Hintergrund. Video und Audio werden nicht hochgeladen;
+faster-whisper decodiert sie lokal. Beim ersten Einsatz lädt Framecut das gewählte
+Whisper-Modell einmalig in den Framecut-Benutzerordner. Danach kann es offline
+wiederverwendet werden. Ein Abbruch stoppt die Verarbeitung, ohne das Projekt zu
+verändern.
+
+Die erkannten Segmente werden als normale, editierbare Textclips auf benannten
+Untertitelspuren angelegt. Du kannst sie verschieben, trimmen, teilen, gestalten,
+per Undo/Redo bearbeiten und anschließend über **Untertitel exportieren…** als SRT
+oder VTT ausgeben.
 
 Über **+ Untertitel importieren (SRT/VTT)** links oder **+ Untertitel** in der Timeline wählst du eine `.srt`- oder `.vtt`-Datei. Framecut erkennt Zeitstempel mit Komma oder Punkt, übernimmt mehrere Textzeilen und entfernt übliche SRT/VTT-Markup-Tags. Jeder Cue wird zu einem normalen Textclip: Du kannst ihn verschieben, teilen, trimmen, gestalten, animieren und per Undo/Redo bearbeiten. Die Untertitelspuren heißen automatisch **Untertitel**, **Untertitel 2** usw.; die importierte Datei bleibt unverändert.
 
@@ -380,7 +403,7 @@ Der Bereich **CLIP-EINSTELLUNGEN** kann jetzt unabhängig gescrollt werden. Dadu
 
 ## Kontextmenüs
 
-Ein Rechtsklick auf einen Video-, Audio- oder Textclip öffnet die passenden Aktionen direkt an der Maus. Bei Video- und Audioclips stehen Vorschau, Teilen, Geschwindigkeit, Lautstärke und Löschen zur Verfügung. Bei Videoclips mit Ton kommt **Audio aus Video extrahieren** hinzu. Textclips bieten zusätzlich den direkten Fokus auf das Textfeld im Inspector. Ein Rechtsklick auf eine leere Stelle bietet **+ Text**, **+ Adjustment-Layer**, **+ Untertitel**, Medienimport und das Hinzufügen des ausgewählten Mediums am Spurende.
+Ein Rechtsklick auf einen Video-, Audio- oder Textclip öffnet die passenden Aktionen direkt an der Maus. Bei Video- und Audioclips stehen Vorschau, Teilen, Geschwindigkeit, Lautstärke und Löschen zur Verfügung. Bei Videoclips mit Ton kommt **Audio aus Video extrahieren** hinzu. Textclips bieten zusätzlich den direkten Fokus auf das Textfeld im Inspector. Ein Rechtsklick auf eine leere Stelle bietet **+ Text**, **+ Adjustment-Layer**, **+ Untertitel**, **+ Automatische Untertitel**, Medienimport und das Hinzufügen des ausgewählten Mediums am Spurende.
 
 ## Geschwindigkeit
 
@@ -542,7 +565,7 @@ Erfolgreich in der Entwicklungsumgebung geprüft:
 - Medienablage wird mit echtem GUI-Workflow geprüft: Suche, Typfilter, Sortierung, Trefferzähler und korrektes Einfügen aus einer gefilterten Ansicht.
 - Standbilder, transparente PNG-Overlays, Bildsequenzen und relative Bildsequenz-Pfade werden im Render und Projekt-Roundtrip geprüft.
 - SRT-/VTT-Zeitstempel, mehrzeilige Cue-Texte, Textstilwerte, Animationen, Text-Render und Projekt-Roundtrip werden geprüft.
-- Schritt-4-Textworkflow wird geprüft: SRT-/VTT-Export, Filterung benannter Untertitelspuren und native Stilvorlagen für Titel, Untertitel und Lower Third.
+- Schritt-4-Textworkflow wird geprüft: lokale automatische Untertitel, SRT-/VTT-Export, Filterung benannter Untertitelspuren und native Stilvorlagen für Titel, Untertitel und Lower Third.
 - Schritt-5-Effektworkflow wird geprüft: Preset-Roundtrip, Adjustment-Layer ohne Quelldatei, Ease-in/out-Keyframes, Stabilisierung sowie Fade-to-White-, Blur-, Circle-, Radial-, Pixelize-, Smooth- und Cover-Übergänge im echten FFmpeg-Render.
 - Mehrfachauswahl, Auswahlrahmen, Kopieren/Einfügen, Duplizieren, Gruppen, Ripple-Löschen, Insert/Overwrite, benannte Spuren und das Löschen leerer Spuren werden im GUI-Workflow geprüft.
 - Abbruch während FFmpeg arbeitet schützt vorhandene Zieldateien; Quelldateien

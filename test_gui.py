@@ -271,6 +271,28 @@ class GuiTest(unittest.TestCase):
             self.assertFalse(errors)
             w.dirty=False;w.close();QTest.qWait(50)
 
+    def test_automatic_subtitle_pipeline_uses_local_transcript(self):
+        with tempfile.TemporaryDirectory() as state:
+            w=Editor(state,recovery=False);w.show();QTest.qWait(100)
+            errors=[];w.error=lambda text:errors.append(str(text))
+            w.import_paths([str(test_core.EditorCoreTest.blue)]);self.wait_job(w)
+            w.drop_asset(0,0,1)
+
+            def fake_transcribe(path,model_size,language,cache_dir,progress,cancel):
+                progress(100)
+                return {'cues':[{'start':.25,'end':.9,'text':'Lokaler Test'}],
+                        'language':'de','source':str(path)}
+
+            with patch('app.transcribe_media',side_effect=fake_transcribe):
+                w.start_transcription(str(test_core.EditorCoreTest.blue),'de','tiny')
+                self.wait_job(w)
+            text_clips=[clip for clip in w.clips if clip.kind=='text']
+            self.assertFalse(errors);self.assertEqual(len(text_clips),1)
+            self.assertEqual(text_clips[0].text,'Lokaler Test')
+            self.assertTrue(any(name.startswith('Untertitel') for name in w.track_names.values()))
+            self.assertIn('automatisch erstellt',w.statusBar().currentMessage())
+            w.dirty=False;w.close();QTest.qWait(50)
+
     def test_step4_subtitle_export_and_native_style_preset(self):
         with tempfile.TemporaryDirectory() as state:
             subtitle=Path(state)/'captions.srt'

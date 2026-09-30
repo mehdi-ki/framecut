@@ -70,6 +70,10 @@ class DeliveryTest(unittest.TestCase):
     def test_packaging_metadata_has_icon_and_framecut_mime(self):
         root=Path(__file__).parent
         self.assertTrue((root/'framecut.svg').is_file())
+        self.assertTrue((root/'transcription.py').is_file())
+        self.assertIn('faster-whisper', (root/'requirements.txt').read_text(encoding='utf-8'))
+        self.assertIn('transcription.py', (root/'build_deb.sh').read_text(encoding='utf-8'))
+        self.assertIn('transcription.py', (root/'build_appimage.sh').read_text(encoding='utf-8'))
         self.assertIn('application/x-framecut', (root/'application-x-framecut.xml').read_text(encoding='utf-8'))
         desktop=(root/'framecut.desktop').read_text(encoding='utf-8')
         self.assertIn('Icon=framecut',desktop)

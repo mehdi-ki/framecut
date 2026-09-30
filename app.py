@@ -10,8 +10,8 @@ import subprocess
 from pathlib import Path
 from dataclasses import replace
 
-from PySide6.QtCore import Qt, QUrl, QThread, Signal, QTimer, QLockFile
-from PySide6.QtGui import QAction, QImage, QColor, QFont, QPainter, QIcon
+from PySide6.QtCore import Qt, QUrl, QThread, Signal, QTimer, QLockFile, QSize
+from PySide6.QtGui import QAction, QImage, QColor, QFont, QPainter, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,
     QPushButton,QListWidgetItem,QFileDialog,QMessageBox,QSplitter,QDoubleSpinBox,QFormLayout,
     QComboBox,QSlider,QScrollArea,QProgressDialog,QFrame,QCheckBox,QStackedWidget,QSpinBox,QLineEdit,QInputDialog,QSizePolicy,QMenu,QColorDialog,QListWidget,QFontComboBox,QDialog,QDialogButtonBox,QGridLayout)
@@ -414,21 +414,74 @@ class Editor(QMainWindow):
         if configured_manifest_url(): QTimer.singleShot(2500,lambda:self.check_for_updates(True))
 
     def build_ui(self):
-        root=QWidget(); outer=QVBoxLayout(root); outer.setContentsMargins(16,14,16,8); outer.setSpacing(12)
-        head=QHBoxLayout(); head.addWidget(label('FRAMECUT','brand')); head.addWidget(label(f'{APP_VERSION} / MULTITRACK','muted')); head.addStretch()
-        for text,fn in [('Neu',self.new_project),('Öffnen',self.open_project),('Speichern',self.save)]: head.addWidget(button(text,fn))
-        self.update_button=button('Nach Updates suchen',self.check_for_updates); head.addWidget(self.update_button)
-        self.relink_button=button('Medien neu verknüpfen…',self.relink_media); head.addWidget(self.relink_button)
-        self.archive_button=button('Archivieren…',self.archive_project_dialog); head.addWidget(self.archive_button)
-        self.render_queue_button=button('Render-Queue (0)',self.show_render_queue); head.addWidget(self.render_queue_button)
-        self.mixer_button=button('Audio-Mixer',self.open_mixer); head.addWidget(self.mixer_button)
-        self.preset=QComboBox(); self.preset.addItems(PRESETS); self.preset.currentTextChanged.connect(self.preset_changed)
-        head.addWidget(self.preset); head.addWidget(button('Exportieren ↗',self.start_export,True)); outer.addLayout(head)
+        root=QWidget(); outer=QVBoxLayout(root); outer.setContentsMargins(10,10,10,7); outer.setSpacing(7)
+
+        # Header: project identity and the actions that belong to the whole
+        # edit. Keeping this separate from the workspace makes the hierarchy
+        # readable even when the inspector is scrolled deeply.
+        header=QFrame(); header.setObjectName('topbar')
+        head=QHBoxLayout(header); head.setContentsMargins(14,7,10,7); head.setSpacing(6)
+        head.addWidget(label('FRAMECUT','brand')); head.addWidget(label(f'{APP_VERSION} · EDITOR','muted'))
+        head.addStretch()
+        head.addWidget(label('Untitled project','projectTitle'))
+        head.addWidget(label('● Autosave aktiv','statusPill'))
+        head.addStretch()
+        header_actions=[]
+        for text,fn in [('Neu',self.new_project),('Öffnen',self.open_project),('Speichern',self.save)]:
+            action=button(text,fn); action.setObjectName('iconButton'); header_actions.append(action); head.addWidget(action)
+        self.update_button=button('Updates',self.check_for_updates); self.update_button.setObjectName('iconButton'); head.addWidget(self.update_button)
+        self.relink_button=button('Neu verknüpfen',self.relink_media); self.relink_button.setObjectName('iconButton'); head.addWidget(self.relink_button)
+        self.archive_button=button('Archiv',self.archive_project_dialog); self.archive_button.setObjectName('iconButton'); head.addWidget(self.archive_button)
+        self.render_queue_button=button('Queue (0)',self.show_render_queue); self.render_queue_button.setObjectName('iconButton'); head.addWidget(self.render_queue_button)
+        self.mixer_button=button('Mixer',self.open_mixer); self.mixer_button.setObjectName('iconButton'); head.addWidget(self.mixer_button)
+        self.preset=QComboBox(); self.preset.addItems(PRESETS); self.preset.currentTextChanged.connect(self.preset_changed); self.preset.setToolTip('Projektformat und Vorschaugröße')
+        head.addWidget(self.preset)
+        export_button=button('Exportieren  ↗',self.start_export,True); export_button.setObjectName('exportButton'); head.addWidget(export_button)
+        outer.addWidget(header)
+
+        # The reference uses a lightweight mode strip above the three-column
+        # workspace. These shortcuts expose existing actions without hiding
+        # any of the editor's current controls.
+        modebar=QFrame(); modebar.setObjectName('modebar')
+        mode_layout=QHBoxLayout(modebar); mode_layout.setContentsMargins(4,0,4,0); mode_layout.setSpacing(3)
+        self.mode_buttons=[]
+        def mode_tab(text, callback=None, active=False, tooltip=''):
+            tab=QPushButton(text); tab.setObjectName('modeTabActive' if active else 'modeTab')
+            if tooltip: tab.setToolTip(tooltip)
+            self.mode_buttons.append(tab)
+            def activate(checked=False):
+                for other in self.mode_buttons:
+                    other.setObjectName('modeTab')
+                    other.style().unpolish(other); other.style().polish(other); other.update()
+                tab.setObjectName('modeTabActive'); tab.style().unpolish(tab); tab.style().polish(tab); tab.update()
+                if callback: callback()
+            tab.clicked.connect(activate); mode_layout.addWidget(tab)
+            return tab
+        mode_tab('Medien',lambda:self.media_search.setFocus(),True,'Medienablage öffnen')
+        mode_tab('Audio',self.open_mixer,'Audio-Mixer öffnen')
+        mode_tab('Text',self.add_text,'Textclip am Spurende anlegen')
+        mode_tab('Sticker',lambda:self.statusBar().showMessage('Sticker-Bereich · eigene Medien lassen sich über Import hinzufügen'))
+        mode_tab('Effekte',lambda:self.statusBar().showMessage('Effekte findest du rechts im Inspector · Presets und Adjustment-Layer sind verfügbar'))
+        mode_tab('Übergänge',lambda:self.statusBar().showMessage('Übergänge findest du rechts im Inspector · Clip auswählen'))
+        mode_tab('Filter',lambda:self.statusBar().showMessage('Filter findest du rechts im Inspector · Clip auswählen'))
+        mode_layout.addStretch()
+        mode_layout.addWidget(label('WORKSPACE','muted'))
+        outer.addWidget(modebar)
+
         vertical=QSplitter(Qt.Vertical); top=QSplitter(Qt.Horizontal)
         # Let the vertical splitter decide the height. The default Preferred
         # policy inherits the tall media-panel size hint and blocks the handle.
         top.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
-        media,ml=panel(); media.setMinimumWidth(220)
+        rail=QFrame(); rail.setObjectName('workspaceRail'); rail.setMinimumWidth(72); rail.setMaximumWidth(88)
+        rail_layout=QVBoxLayout(rail); rail_layout.setContentsMargins(6,10,6,10); rail_layout.setSpacing(5)
+        rail_layout.addWidget(label('ASSETS','eyebrow'))
+        local_button=button('▦\nLokal',lambda:self.media_search.setFocus()); local_button.setObjectName('railButtonActive'); local_button.setToolTip('Lokale Medien')
+        library_button=button('▤\nBibliothek',lambda:self.statusBar().showMessage('Bibliothek · lokale Dateien über Import hinzufügen')); library_button.setObjectName('railButton'); library_button.setToolTip('Bibliothek')
+        rail_layout.addWidget(local_button); rail_layout.addWidget(library_button); rail_layout.addStretch()
+        rail_layout.addWidget(label('DROP\nMEDIA','muted'))
+        top.addWidget(rail)
+
+        media,ml=panel(); media.setObjectName('mediaPanel'); media.setMinimumWidth(220)
         ml.addWidget(label('MEDIEN','heading')); ml.addWidget(button('+ Video / Audio / Bild importieren',self.import_dialog,True))
         ml.addWidget(button('+ Bildsequenz importieren',self.import_sequence_dialog))
         ml.addWidget(button('+ Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog))
@@ -447,12 +500,17 @@ class Editor(QMainWindow):
         media_filter_row.addWidget(self.media_filter,1); media_filter_row.addWidget(self.media_sort,1); ml.addLayout(media_filter_row)
         self.media_count=label('0 Medien','muted'); ml.addWidget(self.media_count)
         ml.addWidget(label('In eine Timeline-Spur ziehen','muted'))
-        self.media_list=MediaList(); self.media_list.itemDoubleClicked.connect(lambda _:self.add_selected_asset())
+        self.media_list=MediaList(); self.media_list.setViewMode(QListWidget.IconMode)
+        self.media_list.setResizeMode(QListWidget.Adjust); self.media_list.setWrapping(True); self.media_list.setSpacing(4)
+        self.media_list.setIconSize(QSize(116,66)); self.media_list.setGridSize(QSize(142,104)); self.media_list.setUniformItemSizes(True)
+        self.media_list.itemDoubleClicked.connect(lambda _:self.add_selected_asset())
         self.media_search.textChanged.connect(self.refresh_media); self.media_filter.currentIndexChanged.connect(self.refresh_media); self.media_sort.currentIndexChanged.connect(self.refresh_media)
         ml.addWidget(self.media_list,1)
         ml.addWidget(button('Am Spurende hinzufügen +',self.add_selected_asset))
         top.addWidget(media)
-        preview,pl=panel(); pl.addWidget(label('VORSCHAU','heading'))
+        preview,pl=panel(); preview.setObjectName('previewPanel')
+        preview_header=QHBoxLayout(); preview_header.setContentsMargins(0,0,0,0)
+        preview_header.addWidget(label('VORSCHAU','heading')); preview_header.addStretch(); preview_header.addWidget(label('TIMELINE MIX','statusPill')); pl.addLayout(preview_header)
         self.preview_status=label('Timeline-Vorschau wird beim ersten Abspielen berechnet.','muted'); self.preview_status.setWordWrap(True); pl.addWidget(self.preview_status)
         preview_options=QHBoxLayout(); self.live_preview_box=QCheckBox('Live-Vorschau'); self.live_preview_box.setChecked(True); self.live_preview_box.setToolTip('Nach einer Änderung automatisch eine neue Vorschau berechnen')
         self.quick_preview_box=QCheckBox('Schnellvorschau'); self.quick_preview_box.setChecked(True); self.quick_preview_box.setToolTip('Niedrigere Auflösung und schnelleres Rendering für die Vorschau')
@@ -469,7 +527,7 @@ class Editor(QMainWindow):
         self.cache_status=label('Cache wird automatisch begrenzt','muted'); self.cache_clear_button=button('Cache leeren',self.clear_cache)
         self.proxy_box.toggled.connect(self.proxy_toggled); self.proxy_profile_combo.currentIndexChanged.connect(self.proxy_profile_changed)
         performance_options.addWidget(self.proxy_box); performance_options.addWidget(label('Profil','muted')); performance_options.addWidget(self.proxy_profile_combo); performance_options.addStretch(); performance_options.addWidget(self.cache_status); performance_options.addWidget(self.cache_clear_button); pl.addLayout(performance_options)
-        self.video_stack=QStackedWidget(); self.video_stack.setMinimumSize(330,190)
+        self.video_stack=QStackedWidget(); self.video_stack.setObjectName('previewCanvas'); self.video_stack.setMinimumSize(330,190)
         self.placeholder=label('Dein Film beginnt hier.\n\nMedien importieren → in die Timeline ziehen', 'muted')
         self.placeholder.setAlignment(Qt.AlignCenter); self.video_stack.addWidget(self.placeholder)
         self.video=VideoView(); self.player.setVideoSink(self.video.sink); self.video_stack.addWidget(self.video)
@@ -479,11 +537,16 @@ class Editor(QMainWindow):
         controls.addWidget(button('Clip ansehen',self.source_preview)); controls.addStretch()
         self.time_label=label('00:00.0 / 00:00.0','muted'); controls.addWidget(self.time_label); pl.addLayout(controls)
         top.addWidget(preview)
-        inspector,inspector_outer=panel(); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
+        inspector,inspector_outer=panel(); inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
         inspector_scroll=QScrollArea(); inspector_scroll.setWidgetResizable(True); inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         inspector_content=QWidget(); il=QVBoxLayout(inspector_content); il.setContentsMargins(0,0,0,0); il.setSpacing(8)
         inspector_scroll.setWidget(inspector_content); inspector_outer.addWidget(inspector_scroll)
         il.addWidget(label('CLIP-EINSTELLUNGEN','heading')); self.clip_name=label('Kein Clip ausgewählt','muted'); self.clip_name.setWordWrap(True); il.addWidget(self.clip_name)
+        inspector_modes=QHBoxLayout(); inspector_modes.setContentsMargins(0,0,0,0); inspector_modes.setSpacing(2)
+        for mode_name in ('Video','Audio','Speed','Animate','Adjust'):
+            mode_button=QPushButton(mode_name); mode_button.setObjectName('modeTabActive' if mode_name=='Video' else 'modeTab'); mode_button.setToolTip(f'{mode_name}-Werkzeuge im Inspector')
+            inspector_modes.addWidget(mode_button)
+        il.addLayout(inspector_modes)
         form=QFormLayout(); self.position=QDoubleSpinBox(); self.start=QDoubleSpinBox(); self.end=QDoubleSpinBox()
         for spin in [self.position,self.start,self.end]: spin.setRange(0,864000); spin.setDecimals(3); spin.setSuffix(' s'); spin.setSingleStep(.1)
         self.track_combo=QComboBox(); self.volume=QDoubleSpinBox(); self.volume.setRange(0,100); self.volume.setDecimals(0); self.volume.setSuffix(' %')
@@ -637,8 +700,8 @@ class Editor(QMainWindow):
         il.addWidget(self.speed_ramp_list)
         il.addWidget(button('Bild zurücksetzen',self.reset_transform)); il.addWidget(button('Übernehmen',self.apply_properties,True)); il.addWidget(button('Audio aus Video extrahieren',self.extract_audio))
         hint=label('Höhere Videospuren liegen vorne.\nTon aller Spuren wird gemischt.\n\nGleiche Spur: keine Überlappung.\nShift beim Ziehen: ohne Einrasten.\n\nSpurkopf: M = stumm schalten · L = Spur sperren.\nAudio: Rauschunterdrückung, 3-Band-EQ, Kompressor, Ducking, Kanalmodus und Panorama.\nDucking auf einem Musikclip senkt ihn automatisch, sobald andere Audiospuren aktiv sind.\nBildtransformation: Zoom, Position, Crop, Rotation und Spiegeln.\nFarbkorrektur: Helligkeit, Kontrast, Sättigung, Presets und .cube/.3dl-LUTs.\nEffekt-Presets: Clean, Cinematic, Dream, Noir, Vivid und Soft Focus.\nAdjustment-Layer legt Effekte über die darunterliegende Komposition.\nVideoeffekte: Deckkraft, Unschärfe, Schärfe, Stabilisierung, Greenscreen und Masken.\nKeyframes animieren Zoom, Bildposition, Rotation, Deckkraft und Unschärfe; Kurven: Linear, Ease in, Ease out und Ease in/out.\nSpeed-Ramping: mehrere Geschwindigkeits-Punkte zwischen 0,25× und 4× setzen.\nFreeze-Frame hält das letzte Bild; Reverse spielt Bild und Ton rückwärts.\nÜbergänge: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Blur, Pixelize, Circle, Radial sowie Fade to White.\nEinblenden / Ausblenden sind weiche Übergänge für Bild und Ton.\nTextclips liegen automatisch über dem Video.\nTextstil: Schrift, Fett/Kursiv, Kontur, Schatten und Hintergrund.\nTextanimation: Ein-/Ausblenden oder Hereinschieben.\nSRT/VTT importiert Cue-Zeiten als Textclips auf eigenen Spuren.\nAudio extrahieren erstellt eine eigene Audiodatei.\n\nShortcuts: Leertaste = Play/Pause · J = rückwärts · K = Pause · L = vorwärts\nPfeile = 1 s bewegen · Entf = Clip löschen','muted'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
-        top.addWidget(inspector); top.setSizes([250,780,280]); vertical.addWidget(top)
-        bottom,bl=panel(); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
+        top.addWidget(inspector); top.setSizes([78,300,760,330]); vertical.addWidget(top)
+        bottom,bl=panel(); bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
         bar=QHBoxLayout(); bar.addWidget(label('TIMELINE','heading'))
         for title,fn in [('↶',self.undo),('↷',self.redo),('Teilen',self.split),('Entfernen',self.remove),
                          ('Kopieren',self.copy_selection),('Einfügen',self.paste_selection),('Insert',self.insert_selection),('Overwrite',self.overwrite_selection),
@@ -2185,6 +2248,10 @@ class Editor(QMainWindow):
         for index,c,category,offline,icon,label_kind in rows:
             marker='⚠  ' if offline else ''
             item=QListWidgetItem(f'{marker}{icon}  {Path(c.path).name}\n{c.duration:.1f} s  ·  {label_kind}')
+            poster=self.thumbnails.get(c.path) if hasattr(self,'thumbnails') else None
+            if poster is not None and not poster.isNull():
+                item.setIcon(QIcon(QPixmap.fromImage(poster).scaled(116,66,Qt.KeepAspectRatio,Qt.SmoothTransformation)))
+            item.setSizeHint(QSize(132,96))
             item.setToolTip(c.path); item.setData(MediaList.ASSET_INDEX_ROLE,index); item.setData(MediaList.ASSET_UID_ROLE,c.uid); self.media_list.addItem(item)
         self.media_list.setUpdatesEnabled(True)
         if selected_uid:

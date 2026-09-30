@@ -259,7 +259,7 @@ class Timeline(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), QColor('#11151c'))
+        p.fillRect(self.rect(), QColor('#101318'))
         p.setFont(QFont('Sans',9))
         viewport = QRectF(event.rect())
         steps = [.1,.25,.5,1,2,5,10,15,30,60,120,300,600]
@@ -268,15 +268,15 @@ class Timeline(QWidget):
         end = int((viewport.right()-self.LEFT)/self.scale/step)+2
         for k in range(begin,end):
             t=k*step; x=self.LEFT+t*self.scale
-            p.setPen(QColor('#222a36')); p.drawLine(int(x),self.TOP,int(x),self.height())
-            p.setPen(QColor('#8492a8'))
+            p.setPen(QColor('#222a33')); p.drawLine(int(x),self.TOP,int(x),self.height())
+            p.setPen(QColor('#7d8999'))
             p.drawText(int(x)+5,22,f'{int(t)//60:02}:{t%60:04.1f}' if step<1 else f'{int(t)//60:02}:{int(t)%60:02}')
-        p.fillRect(0,0,self.LEFT,self.height(),QColor('#181d26'))
-        p.setPen(QPen(QColor('#3a4556'),1)); p.drawLine(self.LEFT,0,self.LEFT,self.height())
+        p.fillRect(0,0,self.LEFT,self.height(),QColor('#1a1f27'))
+        p.setPen(QPen(QColor('#35404d'),1)); p.drawLine(self.LEFT,0,self.LEFT,self.height())
         for i, track in enumerate(self.tracks):
             y=self.TOP+i*self.ROW
-            p.setPen(QColor('#293344')); p.drawLine(0,y,self.width(),y)
-            p.setPen(QColor('#9ec2e4' if track>0 else '#8bd9b9'))
+            p.setPen(QColor('#29323d')); p.drawLine(0,y,self.width(),y)
+            p.setPen(QColor('#9bc8df' if track>0 else '#8bd9b9'))
             name=self.track_names.get(track, f'VIDEO {track}' if track>0 else f'AUDIO {-track}')
             p.drawText(QRectF(12,y+10,self.LEFT-62,27),Qt.AlignLeft|Qt.AlignVCenter,name)
             state = self.track_states.get(track, {})
@@ -284,7 +284,7 @@ class Timeline(QWidget):
             p.drawText(QRectF(self.LEFT-52,y+10,22,27),Qt.AlignCenter,'M')
             p.setPen(QColor('#ffd166' if state.get('locked') else '#75869d'))
             p.drawText(QRectF(self.LEFT-28,y+10,22,27),Qt.AlignCenter,'L')
-            p.setPen(QColor('#738299')); p.drawText(QRectF(12,y+36,self.LEFT-24,20),Qt.AlignLeft|Qt.AlignVCenter,'Bild + Ton' if track>0 else 'Musik / Ton')
+            p.setPen(QColor('#6f7c8d')); p.drawText(QRectF(12,y+36,self.LEFT-24,20),Qt.AlignLeft|Qt.AlignVCenter,'Bild + Ton' if track>0 else 'Musik / Ton')
         for marker in self.markers:
             marker_time = float(marker.get('time', 0.0))
             x = self.LEFT + marker_time * self.scale
@@ -309,13 +309,13 @@ class Timeline(QWidget):
             rect = QRectF(self.marquee_start, self.marquee_current).normalized()
             p.setPen(QPen(QColor('#63ead4'), 1, Qt.DashLine)); p.setBrush(QColor(99,234,212,35)); p.drawRect(rect)
         if not self.clips:
-            p.setPen(QColor('#91a2b8')); p.drawText(self.LEFT+24,self.TOP+40,'Medien hierher ziehen oder mit + hinzufügen')
+            p.setPen(QColor('#8794a6')); p.drawText(self.LEFT+24,self.TOP+40,'Medien hierher ziehen oder mit + hinzufügen')
         if self.snapline is not None:
             p.setPen(QPen(QColor('#f8c86f'),1,Qt.DashLine))
             x=int(self.LEFT+self.snapline*self.scale); p.drawLine(x,28,x,self.height())
-        p.setPen(QPen(QColor('#ecf8ff'),2))
+        p.setPen(QPen(QColor('#f2fffc'),2))
         x=int(self.LEFT+self.playhead*self.scale); p.drawLine(x,24,x,self.height())
-        p.fillRect(x-4,24,8,10,QColor('#ecf8ff'))
+        p.fillRect(x-4,24,8,10,QColor('#f2fffc'))
 
     def draw_clip(self,p,c,ghost,viewport=None):
         r=self.rect_for(c)
@@ -323,8 +323,8 @@ class Timeline(QWidget):
             return
         selected=c.uid in self.selection
         p.setOpacity(.7 if ghost else 1)
-        p.setPen(QPen(QColor('#63ead4' if selected else '#456788' if c.track>0 else '#397961'),2 if selected else 1))
-        p.setBrush(QColor('#665226' if c.source_type=='adjustment' else '#46345c' if c.kind=='text' else '#264251' if c.track>0 else '#214638'))
+        p.setPen(QPen(QColor('#62dfce' if selected else '#456878' if c.track>0 else '#397961'),2 if selected else 1))
+        p.setBrush(QColor('#5b4b28' if c.source_type=='adjustment' else '#49365e' if c.kind=='text' else '#23424d' if c.track>0 else '#203f38'))
         p.drawRoundedRect(r,6,6)
         if selected:
             p.setBrush(QColor(99,234,212,38)); p.setPen(Qt.NoPen); p.drawRoundedRect(r.adjusted(3,3,-3,-3),4,4)

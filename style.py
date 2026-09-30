@@ -165,6 +165,100 @@ QPushButton#iconButton:hover {
     border-color: #37424f;
 }
 
+QFrame#timelineToolGroup,
+QFrame#timelineControlGroup {
+    background: #1a1e25;
+    border: 1px solid #2b333e;
+    border-radius: 8px;
+}
+
+QLabel#timelineGroupLabel {
+    color: #758293;
+    background: transparent;
+    font-size: 8px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    padding: 0 2px;
+}
+
+QFrame#timelineSeparator {
+    background: #303844;
+    border: none;
+    max-width: 1px;
+}
+
+QToolButton#timelineToolButton,
+QToolButton#timelineToolToggle,
+QToolButton#timelineMenuButton,
+QToolButton#timelineToolDanger {
+    color: #b8c2cf;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 4px;
+    min-width: 32px;
+    min-height: 26px;
+    font-size: 14px;
+    font-weight: 700;
+}
+
+QToolButton#timelineToolButton:hover,
+QToolButton#timelineToolToggle:hover,
+QToolButton#timelineMenuButton:hover {
+    color: #effffb;
+    background: #27333a;
+    border-color: #3d5960;
+}
+
+QToolButton#timelineToolDanger {
+    color: #de9aa4;
+}
+
+QToolButton#timelineToolDanger:hover {
+    color: #ffd9dd;
+    background: #40272d;
+    border-color: #8b4c58;
+}
+
+QToolButton#timelineToolButton:pressed,
+QToolButton#timelineToolToggle:pressed,
+QToolButton#timelineMenuButton:pressed {
+    background: #151a20;
+}
+
+QToolButton#timelineToolToggle:checked {
+    color: #071c19;
+    background: #65e3d0;
+    border-color: #65e3d0;
+}
+
+QToolButton#timelineToolButton:disabled,
+QToolButton#timelineToolToggle:disabled,
+QToolButton#timelineMenuButton:disabled,
+QToolButton#timelineToolDanger:disabled {
+    color: #5f6875;
+    background: transparent;
+}
+
+QLabel#timelineIconLabel {
+    color: #9aa7b7;
+    background: transparent;
+    font-size: 13px;
+    font-weight: 800;
+    padding-left: 1px;
+    padding-right: 1px;
+}
+
+QLabel#timelineTotal {
+    color: #9aa7b7;
+    padding-left: 4px;
+}
+
+QFrame#timelineControlGroup QSpinBox {
+    min-height: 20px;
+    padding: 2px 4px;
+}
+
 QPushButton#modeTab {
     color: #8792a1;
     background: transparent;
@@ -375,8 +469,44 @@ QToolTip {
     padding: 5px 7px;
 }
 
+QMenu {
+    color: #e9eef3;
+    background: #1a1e25;
+    border: 1px solid #3a4552;
+    padding: 5px;
+}
+
+QMenu::item {
+    border-radius: 5px;
+    padding: 6px 28px 6px 10px;
+}
+
+QMenu::item:selected {
+    color: #effffb;
+    background: #28504b;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #303844;
+    margin: 5px 7px;
+}
+
 QDialog {
     background: #15181e;
+}
+
+QDialog#cinemaDialog {
+    background: #080a0d;
+}
+
+QDialog#cinemaDialog QFrame,
+QDialog#cinemaDialog QLabel {
+    background: transparent;
+}
+
+QDialog#cinemaDialog QVideoWidget {
+    background: #050608;
 }
 
 QStackedWidget#previewCanvas {

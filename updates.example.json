@@ -1,18 +1,18 @@
 {
   "product": "Framecut",
-  "version": "3.7",
+  "version": "3.10",
   "release_notes": [
     "Beispiel für die nächste Framecut-Version."
   ],
   "artifacts": {
     "appimage": {
-      "filename": "Framecut-3.7-x86_64.AppImage",
-      "url": "https://downloads.example.org/framecut/Framecut-3.7-x86_64.AppImage",
+      "filename": "Framecut-3.10-x86_64.AppImage",
+      "url": "https://downloads.example.org/framecut/Framecut-3.10-x86_64.AppImage",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     },
     "deb": {
-      "filename": "framecut_3.7_amd64.deb",
-      "url": "https://downloads.example.org/framecut/framecut_3.7_amd64.deb",
+      "filename": "framecut_3.10_amd64.deb",
+      "url": "https://downloads.example.org/framecut/framecut_3.10_amd64.deb",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     }
   }

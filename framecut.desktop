@@ -8,4 +8,4 @@ Terminal=false
 Categories=AudioVideo;Video;AudioVideoEditing;
 MimeType=application/x-framecut;
 StartupWMClass=Framecut
-X-AppImage-Version=3.7
+X-AppImage-Version=3.10

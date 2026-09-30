@@ -1,4 +1,4 @@
-"""Framecut 3.7 — native Linux multitrack editor."""
+"""Framecut 3.10 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -13,7 +13,7 @@ from dataclasses import replace
 from PySide6.QtCore import Qt, QUrl, QThread, Signal, QTimer, QLockFile, QSize
 from PySide6.QtGui import QAction, QImage, QColor, QFont, QPainter, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,
-    QPushButton,QListWidgetItem,QFileDialog,QMessageBox,QSplitter,QDoubleSpinBox,QFormLayout,
+    QPushButton,QToolButton,QListWidgetItem,QFileDialog,QMessageBox,QSplitter,QDoubleSpinBox,QFormLayout,
     QComboBox,QSlider,QScrollArea,QProgressDialog,QFrame,QCheckBox,QStackedWidget,QSpinBox,QLineEdit,QInputDialog,QSizePolicy,QMenu,QColorDialog,QListWidget,QFontComboBox,QDialog,QDialogButtonBox,QGridLayout)
 from PySide6.QtMultimedia import (QMediaPlayer,QAudioOutput,QMediaCaptureSession,QAudioInput,
                                   QMediaRecorder,QMediaFormat)
@@ -31,9 +31,9 @@ from update_system import (configured_manifest_url,download_verified,fetch_manif
                            update_checks_disabled)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.7'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.10'
 except OSError:
-    APP_VERSION = '3.7'
+    APP_VERSION = '3.10'
 
 
 def label(text,name=None):
@@ -46,6 +46,78 @@ def button(text,callback,primary=False):
     widget=QPushButton(text); widget.clicked.connect(callback)
     if primary: widget.setObjectName('primary')
     return widget
+
+
+def timeline_tool_button(symbol, tooltip, callback=None, theme_name=None, toggle=False, object_name=None):
+    """Create a compact, icon-first timeline action with a descriptive tooltip."""
+    widget=QToolButton()
+    widget.setText(symbol)
+    icon=QIcon.fromTheme(theme_name) if theme_name else QIcon()
+    if not icon.isNull():
+        widget.setIcon(icon)
+        widget.setToolButtonStyle(Qt.ToolButtonIconOnly)
+    else:
+        widget.setToolButtonStyle(Qt.ToolButtonTextOnly)
+    widget.setObjectName(object_name or ('timelineToolToggle' if toggle else 'timelineToolButton'))
+    widget.setToolTip(tooltip)
+    widget.setStatusTip(tooltip)
+    widget.setAccessibleName(tooltip)
+    widget.setIconSize(QSize(18,18))
+    widget.setFixedSize(32,30)
+    widget.setAutoRaise(True)
+    if toggle:
+        widget.setCheckable(True)
+    if callback is not None:
+        widget.clicked.connect(callback)
+    return widget
+
+
+def timeline_menu_button(symbol, tooltip, menu, theme_name=None):
+    """Create an icon-only timeline button that opens a compact action menu."""
+    widget=timeline_tool_button(symbol, tooltip, theme_name=theme_name, object_name='timelineMenuButton')
+    widget.setPopupMode(QToolButton.InstantPopup)
+    widget.setMenu(menu)
+    return widget
+
+
+def timeline_icon_label(symbol, tooltip):
+    """Return a tiny symbol label for non-action timeline controls."""
+    widget=label(symbol,'timelineIconLabel')
+    widget.setToolTip(tooltip)
+    widget.setStatusTip(tooltip)
+    return widget
+
+
+def timeline_tool_group(title, widgets):
+    """Put related timeline actions into a small, labelled visual group."""
+    group=QFrame(); group.setObjectName('timelineToolGroup')
+    layout=QVBoxLayout(group); layout.setContentsMargins(5,3,5,3); layout.setSpacing(1)
+    caption=label(title,'timelineGroupLabel'); caption.setAlignment(Qt.AlignCenter); layout.addWidget(caption)
+    actions=QHBoxLayout(); actions.setContentsMargins(0,0,0,0); actions.setSpacing(1)
+    for widget in widgets:
+        actions.addWidget(widget)
+    layout.addLayout(actions)
+    return group
+
+
+def timeline_separator():
+    separator=QFrame(); separator.setObjectName('timelineSeparator'); separator.setFrameShape(QFrame.VLine)
+    separator.setFixedHeight(30)
+    return separator
+
+
+def timeline_track_group(video_spin, audio_spin):
+    """Create the compact video/audio track count control."""
+    group=QFrame(); group.setObjectName('timelineControlGroup')
+    layout=QVBoxLayout(group); layout.setContentsMargins(7,3,7,3); layout.setSpacing(1)
+    caption=label('SPUREN','timelineGroupLabel'); caption.setAlignment(Qt.AlignCenter); layout.addWidget(caption)
+    controls=QHBoxLayout(); controls.setContentsMargins(0,0,0,0); controls.setSpacing(4)
+    video_icon=timeline_icon_label('▣','Video-Spuren'); controls.addWidget(video_icon)
+    video_spin.setFixedWidth(40); controls.addWidget(video_spin)
+    audio_icon=timeline_icon_label('♫','Audio-Spuren'); controls.addWidget(audio_icon)
+    audio_spin.setFixedWidth(40); controls.addWidget(audio_spin)
+    layout.addLayout(controls)
+    return group
 
 
 def panel():
@@ -119,6 +191,139 @@ class ExportDialog(QDialog):
         except ValueError as exc:
             QMessageBox.warning(self,'Export-Einstellungen',str(exc)); return
         super().accept()
+
+
+class CommandPaletteDialog(QDialog):
+    """Searchable launcher for the editor's most important actions."""
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+        self.setWindowTitle('Framecut · Befehle')
+        self.setModal(True)
+        self.setMinimumSize(560, 430)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+        layout.addWidget(label('BEFEHLE UND SHORTCUTS', 'heading'))
+        hint = label('Suche eine Aktion und bestätige mit Enter. Öffnen jederzeit mit Strg+K.', 'muted')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.query = QLineEdit()
+        self.query.setPlaceholderText('Befehl suchen …')
+        self.query.setClearButtonEnabled(True)
+        layout.addWidget(self.query)
+        self.commands = editor.command_definitions()
+        self.results = QListWidget()
+        self.results.setViewMode(QListWidget.ListMode)
+        self.results.itemDoubleClicked.connect(self.run_selected)
+        layout.addWidget(self.results, 1)
+        footer = QHBoxLayout()
+        footer.addWidget(label('↑ ↓ auswählen · Enter ausführen · Esc schließen', 'muted'))
+        footer.addStretch()
+        close = QPushButton('Schließen')
+        close.clicked.connect(self.reject)
+        footer.addWidget(close)
+        layout.addLayout(footer)
+        self.query.textChanged.connect(self.refresh_results)
+        self.query.returnPressed.connect(self.run_selected)
+        self.refresh_results()
+        self.query.setFocus()
+
+    def refresh_results(self, *_):
+        query = self.query.text().strip().casefold()
+        self.results.clear()
+        for title, shortcut, callback in self.commands:
+            searchable = f'{title} {shortcut}'.casefold()
+            if query and query not in searchable:
+                continue
+            item = QListWidgetItem(f'{title}    {shortcut}')
+            item.setData(Qt.UserRole, callback)
+            self.results.addItem(item)
+        if self.results.count():
+            self.results.setCurrentRow(0)
+        else:
+            empty = QListWidgetItem('Keine passenden Befehle')
+            empty.setFlags(Qt.NoItemFlags)
+            self.results.addItem(empty)
+
+    def run_selected(self, *_):
+        item = self.results.currentItem()
+        callback = item.data(Qt.UserRole) if item is not None else None
+        if not callable(callback):
+            return
+        self.accept()
+        QTimer.singleShot(0, callback)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.reject()
+            return
+        super().keyPressEvent(event)
+
+
+class CinemaPreviewDialog(QDialog):
+    """Fullscreen preview that temporarily uses its own video sink."""
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+        self.setObjectName('cinemaDialog')
+        self.setWindowTitle(f'Framecut {APP_VERSION} · Cinema-Vorschau')
+        self.setWindowFlag(Qt.Window)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 16)
+        layout.setSpacing(10)
+        header = QHBoxLayout()
+        header.addWidget(label('FRAMECUT · CINEMA PREVIEW', 'heading'))
+        header.addStretch()
+        close = QPushButton('Schließen  Esc')
+        close.setObjectName('iconButton')
+        close.clicked.connect(self.close)
+        header.addWidget(close)
+        layout.addLayout(header)
+        self.canvas = VideoView()
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.frame = editor.video.frame
+        layout.addWidget(self.canvas, 1)
+        controls = QHBoxLayout()
+        self.play_button = QPushButton('▶ Timeline')
+        self.play_button.clicked.connect(editor.toggle_play)
+        controls.addWidget(self.play_button)
+        controls.addWidget(label('F11 oder Esc zum Schließen', 'muted'))
+        controls.addStretch()
+        self.time = label(editor.time_label.text(), 'muted')
+        controls.addWidget(self.time)
+        layout.addLayout(controls)
+        editor.player.setVideoSink(self.canvas.sink)
+        editor.player.playbackStateChanged.connect(self.sync_play_state)
+        editor.player.positionChanged.connect(self.sync_time)
+        self.sync_play_state(editor.player.playbackState())
+
+    def sync_play_state(self, state):
+        if state == QMediaPlayer.PlayingState:
+            self.play_button.setText('Ⅱ Pause')
+        else:
+            self.play_button.setText('▶ Timeline')
+
+    def sync_time(self, *_):
+        self.time.setText(self.editor.time_label.text())
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Escape, Qt.Key_F11):
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self.editor.player.setVideoSink(self.editor.video.sink)
+        self.editor.video.frame = self.canvas.frame
+        self.editor.video.update()
+        self.editor.cinema_dialog = None
+        if hasattr(self.editor, 'cinema_button'):
+            self.editor.cinema_button.setText('⛶ Cinema')
+        super().closeEvent(event)
 
 
 class LevelMeter(QWidget):
@@ -378,6 +583,7 @@ class Editor(QMainWindow):
         self.transport_rate=0.0; self.transport_rate_pending=None
         self.voiceover_capture=None; self.voiceover_input=None; self.voiceover_recorder=None
         self.voiceover_dialog=None; self.voiceover_target=None
+        self.cinema_dialog=None
         self.transport_timer=QTimer(self); self.transport_timer.setInterval(40); self.transport_timer.timeout.connect(self.transport_tick)
         self.pending_seek=None; self.worker=None; self.recovery_enabled=recovery
         self._closing=False
@@ -402,6 +608,7 @@ class Editor(QMainWindow):
                    ('Ctrl+D',self.duplicate_selection),('Ctrl+G',self.group_selection),('Ctrl+Shift+G',self.ungroup_selection),
                    ('Ctrl+Shift+Delete',self.ripple_delete),
                    ('Ctrl+A',self.select_all),('J',self.transport_j),('K',self.transport_stop),('L',self.transport_l),
+                   ('Ctrl+K',self.open_command_palette),('F11',self.toggle_cinema_preview),
                    ('Space',self.toggle_play),('Delete',self.remove),('Backspace',self.remove),
                    ('Left',lambda:self.nudge_playhead(-1)),('Right',lambda:self.nudge_playhead(1)),
                    ('Shift+Left',lambda:self.nudge_playhead(-5)),('Shift+Right',lambda:self.nudge_playhead(5)),
@@ -434,6 +641,7 @@ class Editor(QMainWindow):
         self.archive_button=button('Archiv',self.archive_project_dialog); self.archive_button.setObjectName('iconButton'); head.addWidget(self.archive_button)
         self.render_queue_button=button('Queue (0)',self.show_render_queue); self.render_queue_button.setObjectName('iconButton'); head.addWidget(self.render_queue_button)
         self.mixer_button=button('Mixer',self.open_mixer); self.mixer_button.setObjectName('iconButton'); head.addWidget(self.mixer_button)
+        self.command_button=button('Befehle  ⌘K',self.open_command_palette); self.command_button.setObjectName('iconButton'); head.addWidget(self.command_button)
         self.preset=QComboBox(); self.preset.addItems(PRESETS); self.preset.currentTextChanged.connect(self.preset_changed); self.preset.setToolTip('Projektformat und Vorschaugröße')
         head.addWidget(self.preset)
         export_button=button('Exportieren  ↗',self.start_export,True); export_button.setObjectName('exportButton'); head.addWidget(export_button)
@@ -535,6 +743,7 @@ class Editor(QMainWindow):
         self.seek=QSlider(Qt.Horizontal); self.seek.setRange(0,10000); self.seek.sliderMoved.connect(self.seek_slider); pl.addWidget(self.seek)
         controls=QHBoxLayout(); self.play_button=button('▶ Timeline',self.toggle_play); controls.addWidget(self.play_button)
         controls.addWidget(button('Clip ansehen',self.source_preview)); controls.addStretch()
+        self.cinema_button=button('⛶ Cinema',self.toggle_cinema_preview); self.cinema_button.setObjectName('iconButton'); controls.addWidget(self.cinema_button)
         self.time_label=label('00:00.0 / 00:00.0','muted'); controls.addWidget(self.time_label); pl.addLayout(controls)
         top.addWidget(preview)
         inspector,inspector_outer=panel(); inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
@@ -702,19 +911,65 @@ class Editor(QMainWindow):
         hint=label('Höhere Videospuren liegen vorne.\nTon aller Spuren wird gemischt.\n\nGleiche Spur: keine Überlappung.\nShift beim Ziehen: ohne Einrasten.\n\nSpurkopf: M = stumm schalten · L = Spur sperren.\nAudio: Rauschunterdrückung, 3-Band-EQ, Kompressor, Ducking, Kanalmodus und Panorama.\nDucking auf einem Musikclip senkt ihn automatisch, sobald andere Audiospuren aktiv sind.\nBildtransformation: Zoom, Position, Crop, Rotation und Spiegeln.\nFarbkorrektur: Helligkeit, Kontrast, Sättigung, Presets und .cube/.3dl-LUTs.\nEffekt-Presets: Clean, Cinematic, Dream, Noir, Vivid und Soft Focus.\nAdjustment-Layer legt Effekte über die darunterliegende Komposition.\nVideoeffekte: Deckkraft, Unschärfe, Schärfe, Stabilisierung, Greenscreen und Masken.\nKeyframes animieren Zoom, Bildposition, Rotation, Deckkraft und Unschärfe; Kurven: Linear, Ease in, Ease out und Ease in/out.\nSpeed-Ramping: mehrere Geschwindigkeits-Punkte zwischen 0,25× und 4× setzen.\nFreeze-Frame hält das letzte Bild; Reverse spielt Bild und Ton rückwärts.\nÜbergänge: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Blur, Pixelize, Circle, Radial sowie Fade to White.\nEinblenden / Ausblenden sind weiche Übergänge für Bild und Ton.\nTextclips liegen automatisch über dem Video.\nTextstil: Schrift, Fett/Kursiv, Kontur, Schatten und Hintergrund.\nTextanimation: Ein-/Ausblenden oder Hereinschieben.\nSRT/VTT importiert Cue-Zeiten als Textclips auf eigenen Spuren.\nAudio extrahieren erstellt eine eigene Audiodatei.\n\nShortcuts: Leertaste = Play/Pause · J = rückwärts · K = Pause · L = vorwärts\nPfeile = 1 s bewegen · Entf = Clip löschen','muted'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
         top.addWidget(inspector); top.setSizes([78,300,760,330]); vertical.addWidget(top)
         bottom,bl=panel(); bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
-        bar=QHBoxLayout(); bar.addWidget(label('TIMELINE','heading'))
-        for title,fn in [('↶',self.undo),('↷',self.redo),('Teilen',self.split),('Entfernen',self.remove),
-                         ('Kopieren',self.copy_selection),('Einfügen',self.paste_selection),('Insert',self.insert_selection),('Overwrite',self.overwrite_selection),
-                         ('Duplizieren',self.duplicate_selection),('Ripple löschen',self.ripple_delete),
-                         ('Gruppieren',self.group_selection),('Marker +',lambda:self.add_marker('marker')),('Kapitel +',lambda:self.add_marker('chapter')),
-                         ('+ Text',self.add_text),('+ Adjustment-Layer',self.add_adjustment_layer),('+ Untertitel',self.import_subtitle_dialog)]:bar.addWidget(button(title,fn))
-        self.subtitle_export_button=button('Untertitel exportieren…',self.export_subtitles); bar.addWidget(self.subtitle_export_button)
-        bar.addWidget(label('Video','muted')); self.video_tracks=QSpinBox(); self.video_tracks.setRange(1,10); self.video_tracks.setValue(2); self.video_tracks.valueChanged.connect(self.track_counts_changed); bar.addWidget(self.video_tracks)
-        bar.addWidget(label('Audio','muted')); self.audio_tracks=QSpinBox(); self.audio_tracks.setRange(1,10); self.audio_tracks.setValue(2); self.audio_tracks.valueChanged.connect(self.track_counts_changed); bar.addWidget(self.audio_tracks)
-        self.snap_box=QCheckBox('Einrasten'); self.snap_box.setChecked(True); self.snap_box.toggled.connect(lambda b:setattr(self.timeline,'snap',b)); bar.addWidget(self.snap_box); bar.addStretch()
-        self.total=label('','muted'); bar.addWidget(self.total); bl.addLayout(bar)
-        row=QHBoxLayout(); self.autosave_label=label('Autosave bereit','muted'); row.addWidget(self.autosave_label); row.addStretch(); row.addWidget(button('Einpassen',self.fit_timeline))
-        row.addWidget(label('Zoom','muted')); self.zoom_slider=QSlider(Qt.Horizontal); self.zoom_slider.setRange(2,200); self.zoom_slider.setValue(60); self.zoom_slider.setFixedWidth(120); self.zoom_slider.valueChanged.connect(self.zoom); row.addWidget(self.zoom_slider); bl.addLayout(row)
+        bar=QHBoxLayout(); bar.setContentsMargins(10,5,10,5); bar.setSpacing(6)
+        bar.addWidget(label('TIMELINE','heading')); bar.addSpacing(2); bar.addWidget(timeline_separator())
+
+        # Keep the primary editing actions visible, but give them enough
+        # hierarchy that the toolbar reads as a toolset instead of a glyph
+        # soup. Less frequent actions live in the two popup groups below.
+        undo_button=timeline_tool_button('↶','Rückgängig · Strg+Z',self.undo,'edit-undo')
+        redo_button=timeline_tool_button('↷','Wiederholen · Strg+Shift+Z',self.redo,'edit-redo')
+        split_button=timeline_tool_button('✂','Am Abspielkopf teilen · Strg+B',self.split,'edit-cut')
+        remove_button=timeline_tool_button('⌫','Auswahl entfernen · Entf',self.remove,'edit-delete',object_name='timelineToolDanger')
+        copy_button=timeline_tool_button('⧉','Auswahl kopieren · Strg+C',self.copy_selection,'edit-copy')
+        paste_button=timeline_tool_button('⎘','Einfügen · Strg+V',self.paste_selection,'edit-paste')
+        insert_button=timeline_tool_button('↳','Insert einfügen · Strg+Shift+V',self.insert_selection,'insert-object')
+        overwrite_button=timeline_tool_button('▣','Overwrite einfügen',self.overwrite_selection,'document-save-as')
+
+        marker_menu=QMenu(self); marker_menu.setTitle('Marker')
+        marker_menu.addAction('Marker hinzufügen',lambda:self.add_marker('marker'))
+        marker_menu.addAction('Kapitel hinzufügen',lambda:self.add_marker('chapter'))
+        marker_button=timeline_menu_button('⚑','Marker oder Kapitel hinzufügen',marker_menu,'bookmark-new')
+
+        add_menu=QMenu(self); add_menu.setTitle('Timeline-Element hinzufügen')
+        add_menu.addAction('Text hinzufügen',self.add_text)
+        add_menu.addAction('Adjustment-Layer hinzufügen',self.add_adjustment_layer)
+        add_menu.addSeparator()
+        add_menu.addAction('Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog)
+        add_button=timeline_menu_button('+','Element hinzufügen',add_menu,'list-add')
+
+        more_menu=QMenu(self); more_menu.setTitle('Weitere Timeline-Aktionen')
+        more_menu.addAction('Duplizieren · Strg+D',self.duplicate_selection)
+        more_menu.addAction('Ripple löschen · Strg+Shift+Entf',self.ripple_delete)
+        more_menu.addSeparator()
+        more_menu.addAction('Gruppieren · Strg+G',self.group_selection)
+        more_menu.addAction('Gruppe lösen · Strg+Shift+G',self.ungroup_selection)
+        more_button=timeline_menu_button('⋯','Weitere Timeline-Aktionen',more_menu,'view-more')
+
+        bar.addWidget(timeline_tool_group('VERLAUF',[undo_button,redo_button]))
+        bar.addWidget(timeline_tool_group('BEARBEITEN',[split_button,remove_button,copy_button,paste_button]))
+        bar.addWidget(timeline_tool_group('EINFÜGEN',[insert_button,overwrite_button]))
+        bar.addWidget(timeline_tool_group('MARKER',[marker_button]))
+        bar.addWidget(timeline_tool_group('ADD',[add_button]))
+        self.subtitle_export_button=timeline_tool_button('⇩','Untertitel exportieren',theme_name='document-export')
+        self.subtitle_export_button.clicked.connect(self.export_subtitles)
+        bar.addWidget(timeline_tool_group('EXPORT',[self.subtitle_export_button]))
+        bar.addWidget(timeline_tool_group('MEHR',[more_button]))
+        bar.addStretch()
+        self.snap_box=timeline_tool_button('⌁','Einrasten ein/aus',toggle=True,theme_name='snap-to-grid')
+        self.snap_box.setChecked(True); self.snap_box.toggled.connect(lambda b:setattr(self.timeline,'snap',b))
+        bar.addWidget(timeline_tool_group('AUSRICHTEN',[self.snap_box]))
+        self.total=label('','muted'); self.total.setObjectName('timelineTotal'); bar.addWidget(self.total); bl.addLayout(bar)
+
+        row=QHBoxLayout(); row.setContentsMargins(10,0,10,6); row.setSpacing(6)
+        self.autosave_label=label('Autosave bereit','muted'); row.addWidget(self.autosave_label); row.addStretch()
+        self.video_tracks=QSpinBox(); self.video_tracks.setRange(1,10); self.video_tracks.setValue(2); self.video_tracks.setToolTip('Anzahl der Video-Spuren'); self.video_tracks.valueChanged.connect(self.track_counts_changed)
+        self.audio_tracks=QSpinBox(); self.audio_tracks.setRange(1,10); self.audio_tracks.setValue(2); self.audio_tracks.setToolTip('Anzahl der Audio-Spuren'); self.audio_tracks.valueChanged.connect(self.track_counts_changed)
+        row.addWidget(timeline_track_group(self.video_tracks,self.audio_tracks))
+        fit_button=timeline_tool_button('⛶','Timeline einpassen',self.fit_timeline,'view-fullscreen')
+        zoom_icon=timeline_icon_label('⌕','Timeline-Zoom')
+        self.zoom_slider=QSlider(Qt.Horizontal); self.zoom_slider.setToolTip('Timeline-Zoom'); self.zoom_slider.setRange(2,200); self.zoom_slider.setValue(60); self.zoom_slider.setFixedWidth(120); self.zoom_slider.valueChanged.connect(self.zoom)
+        row.addWidget(timeline_tool_group('ANSICHT',[fit_button,zoom_icon,self.zoom_slider])); bl.addLayout(row)
         self.timeline=Timeline(); self.timeline.selection_changed.connect(self.timeline_selection_changed); self.timeline.seek.connect(self.set_playhead)
         self.timeline.context_requested.connect(self.show_context_menu)
         self.timeline.track_context_requested.connect(self.show_track_context_menu)
@@ -1321,6 +1576,43 @@ class Editor(QMainWindow):
             self.mixer_dialog.raise_(); self.mixer_dialog.activateWindow(); return
         self.mixer_dialog=MixerDialog(self)
         self.mixer_dialog.show()
+
+    def command_definitions(self):
+        """Return the high-value actions exposed by Ctrl+K."""
+        return [
+            ('Neues Projekt', 'Ctrl+N', self.new_project),
+            ('Projekt öffnen', 'Ctrl+O', self.open_project),
+            ('Projekt speichern', 'Ctrl+S', self.save),
+            ('Medien importieren', 'Ctrl+I', self.import_dialog),
+            ('Timeline abspielen / pausieren', 'Leertaste', self.toggle_play),
+            ('Vollbildvorschau öffnen / schließen', 'F11', self.toggle_cinema_preview),
+            ('Clip teilen', 'S / Ctrl+B', self.split),
+            ('Auswahl entfernen', 'Entf', self.remove),
+            ('Rückgängig', 'Ctrl+Z', self.undo),
+            ('Wiederholen', 'Ctrl+Shift+Z', self.redo),
+            ('Textclip hinzufügen', '+ Text', self.add_text),
+            ('Adjustment-Layer hinzufügen', '+ Adjustment-Layer', self.add_adjustment_layer),
+            ('Audio-Mixer öffnen', '—', self.open_mixer),
+            ('Render-Queue öffnen', '—', self.show_render_queue),
+            ('Timeline einpassen', '—', self.fit_timeline),
+            ('Nach Updates suchen', '—', self.check_for_updates),
+        ]
+
+    def open_command_palette(self):
+        if self.worker:
+            return
+        dialog=CommandPaletteDialog(self)
+        dialog.exec()
+
+    def toggle_cinema_preview(self):
+        if self.worker:
+            return
+        if self.cinema_dialog is not None:
+            self.cinema_dialog.close()
+            return
+        self.cinema_dialog=CinemaPreviewDialog(self)
+        self.cinema_button.setText('× Cinema schließen')
+        self.cinema_dialog.showFullScreen()
 
     def start_voiceover_recording(self):
         """Record a WAV through Qt Multimedia and place it at the playhead."""
@@ -3014,6 +3306,8 @@ class Editor(QMainWindow):
             self.render_queue.clear(); self.update_render_queue_button()
         if self.can_discard():
             self._closing=True
+            if self.cinema_dialog is not None:
+                self.cinema_dialog.close()
             self.autosave_timer.stop(); self.live_preview_timer.stop(); self.transport_timer.stop()
             self.preview_queued=False; self.preview_play_requested=False
             self.transport_stop()
@@ -3037,7 +3331,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-        QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.7-Fenster.');return 1
+        QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.10-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

@@ -1,4 +1,4 @@
-# Framecut 3.21.0 — Workspace-Redesign
+# Framecut 3.22.0 — UX-Workbench
 
 Native Linux-Videoschnitt-App mit einer CapCut-ähnlichen Anordnung. Eigener Code,
 keine CapCut-Kopie. Python/PySide6 mit lokalem FFmpeg-Export und optionaler lokaler
@@ -8,7 +8,7 @@ Whisper-Spracherkennung für automatische Untertitel.
 
 1. Framecut 0.1 schließen und die bisherigen Projekte speichern.
 2. Dieses ZIP in einen **neuen Ordner** entpacken. Version 0.1 als Rückfall behalten.
-3. Den Ordner `Framecut-3.21.0` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
+3. Den Ordner `Framecut-3.22.0` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
 4. Rechtsklick auf eine freie Stelle → „Im Terminal öffnen“.
 5. Ausführen:
 
@@ -17,14 +17,14 @@ Whisper-Spracherkennung für automatische Untertitel.
    ```
 
 Für eine Desktop-Installation kannst du stattdessen `bash install.sh` ausführen.
-Der Installer legt Framecut unter `~/.local/share/framecut/3.21.0` ab und erstellt
+Der Installer legt Framecut unter `~/.local/share/framecut/3.22.0` ab und erstellt
 den Starter `~/.local/bin/framecut` sowie einen Eintrag im Anwendungsmenü.
 
-## Linux-Auslieferung 3.21.0
+## Linux-Auslieferung 3.22.0
 
 Das Quellpaket enthält jetzt drei reproduzierbare Auslieferungswege:
 
-- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.21.0_amd64.deb`. Installation mit `sudo apt install ./framecut_3.21.0_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.21.0/.venv` an; FFmpeg und Python bleiben systemweit.
+- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.22.0_amd64.deb`. Installation mit `sudo apt install ./framecut_3.22.0_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.22.0/.venv` an; FFmpeg und Python bleiben systemweit.
 - **AppImage:** `bash build_appimage.sh` erzeugt aus der vorbereiteten `Framecut.AppDir` ein echtes Type-2-AppImage, sobald das offizielle `appimagetool` über `PATH` oder `APPIMAGETOOL=/pfad/appimagetool` verfügbar ist. Der Builder bricht ohne dieses Werkzeug bewusst ab und erzeugt keine Datei, die nur fälschlich `.AppImage` heißt.
 - **Komplettes Release:** `bash build_release.sh` erstellt das Linux-ZIP, das `.deb`, Prüfsummen und – falls `appimagetool` vorhanden ist – das AppImage. Ohne Tool bleibt eine kurze Build-Hinweisdatei neben den übrigen Artefakten.
 
@@ -63,7 +63,7 @@ neu gestartet werden. Die Manifest-Datei selbst wird nie automatisch verändert.
 
 ### GitHub-Release-Automation
 
-`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.21.0` automatisch
+`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.22.0` automatisch
 die getesteten ZIP-, `.deb`- und AppImage-Dateien sowie `updates.json`. Die Version
 kommt aus der Datei `VERSION`; Tag und Versionsdatei müssen übereinstimmen. Dadurch
 werden Prüfsummen und Download-Adressen für den Update-Checker bei jedem Release
@@ -137,6 +137,7 @@ Danach arbeitet die App lokal und lädt deine Videos nicht hoch.
 - **Feature-Batch 3.20.0**: **Export-Presets** wählen passende Codec-, FPS-, Qualitäts- und Zielgrößen für Master, YouTube, Shorts/TikTok/Reels, Instagram und Archiv. **Arbeitsbereich-In/Out** exportiert nur den markierten Timeline-Bereich. **Attribute-Clipboard** übernimmt Look, Audio und Übergänge; das **Keyframe-Clipboard** skaliert Animationen auf den Zielclip. **Audio-Sync** richtet beliebige Video-/Audioclips lokal über ihre Onsets aus. **Clip-Loudness** normalisiert einzelne Dialog- oder Musikclips. **Standbild am Abspielkopf**, **PNG-Frame-Capture**, **FFmpeg-Kapiteldateien** und **Spurlücken schließen** verkürzen den täglichen Schnittworkflow.
 - **UX-Patch 3.20.1**: Die Timeline-Toolbar ist flach und symbolbasiert, Quell- und Arbeitsbereich-Aktionen nutzen ein einheitliches Icon-System, nicht funktionale Inspector-Tabs wurden entfernt, und doppelte Timeline-Kontextmenü-Events werden abgefangen.
 - **Workspace-Redesign 3.21.0**: Die Oberfläche folgt jetzt einer klaren 3-Spalten-Struktur mit Medienablage links, größerer Vorschau in der Mitte und aufklappbaren Inspector-Bereichen rechts. Header-Aktionen, Vorschau-Steuerung, Abstände, Panels und Timeline-Farben wurden vereinheitlicht; die Timeline-Spurköpfe und Clipzustände sind deutlich lesbarer.
+- **UX-Workbench 3.22.0**: Einfach-/Pro-Modus, fünf Aufgaben-Layouts, Fokusansicht, kontextabhängige Clip-Aktionen, Medienkarten oder Listenansicht mit Favoriten, klarere leere Zustände, kompaktere Timeline-Badges und eine ruhigere Inspector-Hierarchie. Bestehende Schnitt-, Audio-, Effekt-, KI- und Exportfunktionen bleiben unverändert erhalten.
 - **Videoeffekte** stehen pro Videoclip zur Verfügung: Deckkraft für Overlays/Picture-in-Picture, Unschärfe, Schärfe, Stabilisierung, Greenscreen-Keying und weiche Rechteck-/Ellipsenmasken. Deckkraft und Unschärfe lassen sich zusätzlich per Keyframe animieren.
 - **Speed-Ramping, Freeze-Frame und Reverse**: Mehrere lokale Geschwindigkeitspunkte werden interpoliert; ein Freeze-Frame hält das letzte Bild für eine einstellbare Dauer und Reverse dreht Bild und Originalton um.
 - **Übergänge**: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Dip to Black, Fade to White, Blur In, Pixelize, Circle Open/Close und Radial können zwischen direkt angrenzenden Video- oder Audioclips derselben Spur gewählt werden. Bild und Ton werden passend zur eingestellten Dauer behandelt.

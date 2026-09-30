@@ -1,4 +1,4 @@
-"""Framecut 3.21.0 — native Linux multitrack editor."""
+"""Framecut 3.22.0 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -37,9 +37,9 @@ from ai_tools import (AIToolError, remove_background_media, track_motion, auto_r
                        analyze_beats, detect_scene_changes, detect_audio_onset)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.21.0'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.22.0'
 except OSError:
-    APP_VERSION = '3.21.0'
+    APP_VERSION = '3.22.0'
 
 
 def label(text,name=None):
@@ -923,6 +923,14 @@ class Editor(QMainWindow):
         self.track_states=normalize_track_states(None,self.tracks); self.track_names=normalize_track_names(None,self.tracks)
         self.master_mixer=normalize_master_mixer(None); self.mixer_dialog=None
         self.current=None; self.selection=[]; self.clipboard=[]; self.attribute_clipboard=None; self.keyframe_clipboard=None; self.markers=[]
+        # These are UI preferences, not project media.  They keep the editor
+        # calm for beginners while leaving the full professional surface one
+        # click away.
+        self.edit_mode='simple'
+        self.workspace_preset='Schnitt'
+        self.focus_mode=False
+        self.favorite_assets=set()
+        self.inspector_sections=[]
         self.project_path=None; self.suggested_name='Mein-Film.framecut'
         self.history=[]; self.future=[]; self.dirty=False; self.revision=0
         self.preview_revision=-1; self.preview_signature=None; self.preview_path=None
@@ -972,7 +980,7 @@ class Editor(QMainWindow):
                    ('Shift+Alt+Left',lambda:self.slip_selected(-1)),
                    ('Shift+Alt+Right',lambda:self.slip_selected(1)),
                    ('Ctrl+A',self.select_all),('J',self.transport_j),('K',self.transport_stop),('L',self.transport_l),
-                   ('Ctrl+K',self.open_command_palette),('F11',self.toggle_cinema_preview),
+                   ('Ctrl+K',self.open_command_palette),('Ctrl+Shift+F',self.toggle_focus_mode),('F11',self.toggle_cinema_preview),
                    ('Space',self.toggle_play),('Delete',self.remove),('Backspace',self.remove),
                    ('Left',lambda:self.nudge_playhead(-1)),('Right',lambda:self.nudge_playhead(1)),
                    ('Shift+Left',lambda:self.nudge_playhead(-5)),('Shift+Right',lambda:self.nudge_playhead(5)),
@@ -1018,7 +1026,7 @@ class Editor(QMainWindow):
         # The reference uses a lightweight mode strip above the three-column
         # workspace. These shortcuts expose existing actions without hiding
         # any of the editor's current controls.
-        modebar=QFrame(); modebar.setObjectName('modebar')
+        modebar=QFrame(); self.modebar=modebar; modebar.setObjectName('modebar')
         mode_layout=QHBoxLayout(modebar); mode_layout.setContentsMargins(7,3,7,3); mode_layout.setSpacing(3)
         mode_layout.addWidget(label('ARBEITSBEREICH','eyebrow'))
         mode_layout.addWidget(timeline_separator())
@@ -1043,14 +1051,31 @@ class Editor(QMainWindow):
         mode_tab('Übergänge',lambda:self.statusBar().showMessage('Übergänge findest du rechts im Inspector · Clip auswählen'))
         mode_tab('Filter',lambda:self.statusBar().showMessage('Filter findest du rechts im Inspector · Clip auswählen'))
         mode_layout.addStretch()
-        mode_layout.addWidget(label('CAPCUT WORKSPACE','muted'))
+        mode_layout.addWidget(label('LAYOUT','eyebrow'))
+        self.workspace_preset_combo=QComboBox(); self.workspace_preset_combo.setObjectName('workspacePreset')
+        self.workspace_preset_combo.addItem('Schnitt','edit')
+        self.workspace_preset_combo.addItem('Shorts / Reels','shorts')
+        self.workspace_preset_combo.addItem('Audio','audio')
+        self.workspace_preset_combo.addItem('Farbe','color')
+        self.workspace_preset_combo.addItem('Untertitel','captions')
+        self.workspace_preset_combo.setToolTip('Arbeitsbereich für die aktuelle Aufgabe wählen')
+        self.workspace_preset_combo.currentIndexChanged.connect(self.apply_workspace_preset)
+        mode_layout.addWidget(self.workspace_preset_combo)
+        mode_layout.addWidget(label('MODUS','eyebrow'))
+        self.edit_mode_combo=QComboBox(); self.edit_mode_combo.setObjectName('editModeCombo')
+        self.edit_mode_combo.addItem('Einfach','simple'); self.edit_mode_combo.addItem('Pro','pro')
+        self.edit_mode_combo.setToolTip('Einfach zeigt nur die häufigsten Einstellungen · Pro zeigt alle Werkzeuge')
+        self.edit_mode_combo.currentIndexChanged.connect(self.set_edit_mode)
+        mode_layout.addWidget(self.edit_mode_combo)
+        self.focus_button=QPushButton('Fokus'); self.focus_button.setObjectName('modeTab'); self.focus_button.setToolTip('Vorschau und Timeline vergrößern · Strg+Shift+F')
+        self.focus_button.clicked.connect(self.toggle_focus_mode); mode_layout.addWidget(self.focus_button)
         outer.addWidget(modebar)
 
-        vertical=QSplitter(Qt.Vertical); top=QSplitter(Qt.Horizontal); top.setChildrenCollapsible(False)
+        vertical=QSplitter(Qt.Vertical); self.vertical=vertical; top=QSplitter(Qt.Horizontal); self.top=top; top.setChildrenCollapsible(False)
         # Let the vertical splitter decide the height. The default Preferred
         # policy inherits the tall media-panel size hint and blocks the handle.
         top.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
-        media,ml=panel(); media.setObjectName('mediaPanel'); media.setMinimumWidth(250)
+        media,ml=panel(); self.media_panel=media; media.setObjectName('mediaPanel'); media.setMinimumWidth(250)
         media_header=QHBoxLayout(); media_header.setContentsMargins(0,0,0,0); media_header.setSpacing(6)
         media_header.addWidget(label('MEDIEN','heading')); media_header.addStretch()
         self.media_count=label('0 Medien','muted'); media_header.addWidget(self.media_count); ml.addLayout(media_header)
@@ -1072,16 +1097,28 @@ class Editor(QMainWindow):
             self.media_sort.addItem(title,value)
         self.media_sort.setToolTip('Reihenfolge der Medienablage')
         media_filter_row.addWidget(self.media_filter,1); media_filter_row.addWidget(self.media_sort,1); ml.addLayout(media_filter_row)
+        library_tools=QHBoxLayout(); library_tools.setContentsMargins(0,0,0,0); library_tools.setSpacing(5)
+        self.media_view_combo=QComboBox(); self.media_view_combo.setObjectName('mediaViewCombo')
+        self.media_view_combo.addItem('Karten','cards'); self.media_view_combo.addItem('Liste','list')
+        self.media_view_combo.setToolTip('Medienablage als Karten oder kompakte Liste anzeigen')
+        self.media_view_combo.currentIndexChanged.connect(self.set_media_view)
+        self.media_favorites_only=QCheckBox('★ Favoriten'); self.media_favorites_only.setObjectName('mediaFavorites')
+        self.media_favorites_only.setToolTip('Nur markierte Medien anzeigen')
+        self.media_favorites_only.toggled.connect(lambda *_: self.refresh_media())
+        self.media_favorite_button=QToolButton(); self.media_favorite_button.setObjectName('mediaFavoriteButton'); self.media_favorite_button.setText('☆'); self.media_favorite_button.setToolTip('Ausgewähltes Medium als Favorit markieren'); self.media_favorite_button.setAccessibleName('Medium als Favorit markieren'); self.media_favorite_button.clicked.connect(self.toggle_asset_favorite)
+        library_tools.addWidget(label('ANSICHT','muted')); library_tools.addWidget(self.media_view_combo); library_tools.addWidget(self.media_favorites_only); library_tools.addStretch(); library_tools.addWidget(self.media_favorite_button); ml.addLayout(library_tools)
         media_hint=label('Ziehen zum Einfügen · Doppelklick zum Anhängen','subtle'); media_hint.setWordWrap(True); ml.addWidget(media_hint)
+        self.media_empty_hint=label('Noch keine Medien\nImportiere ein Video, Audio oder Bild, um zu starten.','emptyState'); self.media_empty_hint.setAlignment(Qt.AlignCenter); self.media_empty_hint.setWordWrap(True); self.media_empty_hint.setVisible(False); ml.addWidget(self.media_empty_hint)
         self.media_list=MediaList(); self.media_list.setObjectName('mediaList'); self.media_list.setViewMode(QListWidget.IconMode)
         self.media_list.setResizeMode(QListWidget.Adjust); self.media_list.setWrapping(True); self.media_list.setSpacing(4)
         self.media_list.setIconSize(QSize(124,72)); self.media_list.setGridSize(QSize(150,108)); self.media_list.setUniformItemSizes(True)
         self.media_list.itemDoubleClicked.connect(lambda _:self.add_selected_asset())
+        self.media_list.currentItemChanged.connect(lambda *_: self.update_media_favorite_button())
         self.media_search.textChanged.connect(self.refresh_media); self.media_filter.currentIndexChanged.connect(self.refresh_media); self.media_sort.currentIndexChanged.connect(self.refresh_media)
         ml.addWidget(self.media_list,1)
         ml.addWidget(button('＋ Zur Timeline hinzufügen',self.add_selected_asset))
         top.addWidget(media)
-        preview,pl=panel(); preview.setObjectName('previewPanel')
+        preview,pl=panel(); self.preview_panel=preview; preview.setObjectName('previewPanel')
         preview_header=QHBoxLayout(); preview_header.setContentsMargins(0,0,0,0)
         preview_header.addWidget(label('VORSCHAU','heading')); preview_header.addStretch(); preview_header.addWidget(label('TIMELINE MIX','statusPill')); pl.addLayout(preview_header)
         self.preview_status=label('Timeline-Vorschau wird beim ersten Abspielen berechnet.','muted'); self.preview_status.setWordWrap(True); pl.addWidget(self.preview_status)
@@ -1130,7 +1167,7 @@ class Editor(QMainWindow):
         preview_tools_layout=QVBoxLayout(preview_tools); preview_tools_layout.setContentsMargins(8,4,8,4); preview_tools_layout.setSpacing(1)
         preview_tools_layout.addLayout(preview_options); preview_tools_layout.addLayout(performance_options); pl.addWidget(preview_tools)
         top.addWidget(preview)
-        inspector,inspector_outer=panel(); inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
+        inspector,inspector_outer=panel(); self.inspector_panel=inspector; inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
         inspector_scroll=QScrollArea(); inspector_scroll.setWidgetResizable(True); inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         inspector_content=QWidget(); il=QVBoxLayout(inspector_content); il.setContentsMargins(0,0,0,0); il.setSpacing(8)
         inspector_scroll.setWidget(inspector_content); inspector_outer.addWidget(inspector_scroll)
@@ -1140,7 +1177,19 @@ class Editor(QMainWindow):
         self.clip_name=label('Kein Clip ausgewählt','projectTitle'); self.clip_name.setWordWrap(True); inspector_header_layout.addWidget(self.clip_name)
         il.addWidget(inspector_header)
 
-        def inspector_section(title, expanded=True):
+        # Context actions keep the most common clip operations next to the
+        # selected object. The permanent timeline toolbar stays compact while
+        # this row changes with the current selection.
+        self.context_toolbar=QFrame(); self.context_toolbar.setObjectName('contextToolbar')
+        context_layout=QHBoxLayout(self.context_toolbar); context_layout.setContentsMargins(5,4,5,4); context_layout.setSpacing(2)
+        self.context_split_button=timeline_tool_button('✂','Ausgewählten Clip am Abspielkopf teilen · S',self.split,'edit-cut',object_name='contextAction')
+        self.context_duplicate_button=timeline_tool_button('⧉','Auswahl duplizieren · Strg+D',self.duplicate_selection,'edit-copy',object_name='contextAction')
+        self.context_reset_button=timeline_tool_button('↺','Bild- und Effekteinstellungen zurücksetzen',self.reset_transform,'view-refresh',object_name='contextAction')
+        self.context_delete_button=timeline_tool_button('⌫','Auswahl entfernen · Entf',self.remove,'edit-delete',object_name='contextAction')
+        for action in (self.context_split_button,self.context_duplicate_button,self.context_reset_button,self.context_delete_button): context_layout.addWidget(action)
+        context_layout.addStretch(); il.addWidget(self.context_toolbar)
+
+        def inspector_section(title, expanded=True, advanced=False):
             section=QFrame(); section.setObjectName('inspectorSection')
             section_layout=QVBoxLayout(section); section_layout.setContentsMargins(0,0,0,0); section_layout.setSpacing(0)
             toggle=QToolButton(); toggle.setObjectName('inspectorSectionHeader'); toggle.setText(title); toggle.setCheckable(True); toggle.setChecked(expanded); toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow); toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); toggle.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Fixed)
@@ -1148,6 +1197,7 @@ class Editor(QMainWindow):
             body_layout=QVBoxLayout(body); body_layout.setContentsMargins(10,7,10,10); body_layout.setSpacing(7)
             toggle.toggled.connect(lambda checked, body=body, toggle=toggle: (body.setVisible(checked), toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)))
             section_layout.addWidget(toggle); section_layout.addWidget(body); il.addWidget(section)
+            self.inspector_sections.append({'section':section,'advanced':advanced,'toggle':toggle})
             return body_layout
 
         self.position=QDoubleSpinBox(); self.start=QDoubleSpinBox(); self.end=QDoubleSpinBox()
@@ -1358,7 +1408,7 @@ class Editor(QMainWindow):
         audio_form.addRow('Auto-Cut',auto_cut_row); audio_form.addRow('',self.auto_cut_status)
         multicam_row=QHBoxLayout(); multicam_row.setContentsMargins(0,0,0,0); multicam_row.addWidget(self.multicam_sync_button,1); multicam_row.addWidget(self.multicam_switch_button,1)
         audio_form.addRow('Multi-Kamera',multicam_row); audio_form.addRow('',self.multicam_status)
-        audio_section=inspector_section('AUDIO · MIX UND SMART TOOLS',False); audio_section.addLayout(audio_form)
+        audio_section=inspector_section('AUDIO · MIX UND SMART TOOLS',False,True); audio_section.addLayout(audio_form)
         color_form=configure_form(QFormLayout()); color_form.addRow('Helligkeit',self.brightness); color_form.addRow('Kontrast',self.contrast); color_form.addRow('Sättigung',self.saturation); color_form.addRow('Filter',self.filter_preset)
         effect_preset_row=QHBoxLayout(); effect_preset_row.setContentsMargins(0,0,0,0); effect_preset_row.addWidget(self.effect_preset,1); effect_preset_row.addWidget(self.effect_preset_apply_button); color_form.addRow('Effekt-Preset',effect_preset_row)
         lut_row=QHBoxLayout(); lut_row.setContentsMargins(0,0,0,0); lut_row.addWidget(self.lut_path,1); lut_row.addWidget(self.lut_browse_button); color_form.addRow('LUT',lut_row)
@@ -1370,12 +1420,12 @@ class Editor(QMainWindow):
                 spin=self.color_wheel_spins[f'color_{wheel}_{channel}']; spin.setToolTip(f'{title} · {title_channel}')
                 row.addWidget(spin,1)
             grading_form.addRow(title,row)
-        grading_section=inspector_section('FARBE · 3-WEGE-GRADING',False); grading_section.addLayout(grading_form)
+        grading_section=inspector_section('FARBE · 3-WEGE-GRADING',False,True); grading_section.addLayout(grading_form)
         effects_form=configure_form(QFormLayout()); effects_form.addRow('Deckkraft',self.opacity); effects_form.addRow('Unschärfe',self.blur); effects_form.addRow('Schärfe',self.sharpen); effects_form.addRow('Stabilisierung',self.stabilization); effects_form.addRow('Greenscreen',self.chroma_key_enabled); effects_form.addRow('Key-Farbe',self.chroma_key_color); effects_form.addRow('Ähnlichkeit',self.chroma_key_similarity); effects_form.addRow('Weichheit',self.chroma_key_blend)
         effects_section=inspector_section('EFFEKTE · VIDEO',True); effects_section.addLayout(effects_form)
         mask_form=configure_form(QFormLayout()); mask_form.addRow('Maskentyp',self.mask_type); mask_form.addRow('Maske X',self.mask_x); mask_form.addRow('Maske Y',self.mask_y); mask_form.addRow('Maskenbreite',self.mask_width); mask_form.addRow('Maskenhöhe',self.mask_height); mask_form.addRow('Maskenweichheit',self.mask_feather)
         mask_points_row=QHBoxLayout(); mask_points_row.setContentsMargins(0,0,0,0); mask_points_row.addWidget(self.mask_points,1); mask_points_row.addWidget(self.mask_points_apply); mask_form.addRow('Bezier-Punkte',mask_points_row)
-        mask_section=inspector_section('MASKEN · ROTOSKOPIE',False); mask_section.addLayout(mask_form)
+        mask_section=inspector_section('MASKEN · ROTOSKOPIE',False,True); mask_section.addLayout(mask_form)
         mask_path_form=configure_form(QFormLayout()); mask_path_form.addRow('Rotoskopie-Zeit',self.mask_path_time)
         mask_path_buttons=QHBoxLayout(); mask_path_buttons.setContentsMargins(0,0,0,0); mask_path_buttons.addWidget(self.mask_path_set_button,1); mask_path_buttons.addWidget(self.mask_path_remove_button,1)
         mask_section.addLayout(mask_path_form); mask_section.addLayout(mask_path_buttons); mask_section.addWidget(self.mask_path_list)
@@ -1388,10 +1438,10 @@ class Editor(QMainWindow):
         ai_form.addRow('Tracking',tracking_buttons); ai_form.addRow('',self.tracking_status); ai_form.addRow('Objekt entfernen',self.object_removal_enabled)
         ai_form.addRow('Auto-Reframe',self.auto_reframe_format); ai_form.addRow('',self.auto_reframe_enabled)
         ai_form.addRow('',auto_reframe_buttons); ai_form.addRow('',self.auto_reframe_status)
-        ai_section=inspector_section('KI-WERKZEUGE · LOKAL',False); ai_section.addLayout(ai_form)
+        ai_section=inspector_section('KI-WERKZEUGE · LOKAL',False,True); ai_section.addLayout(ai_form)
         transition_form=configure_form(QFormLayout()); transition_form.addRow('Übergang',self.transition_type); transition_form.addRow('Dauer',self.transition_duration)
         transition_section=inspector_section('ÜBERGÄNGE',False); transition_section.addLayout(transition_form)
-        keyframe_section=inspector_section('ANIMATION · KEYFRAMES UND SPEED-RAMPING',False)
+        keyframe_section=inspector_section('ANIMATION · KEYFRAMES UND SPEED-RAMPING',False,True)
         keyframe_form=configure_form(QFormLayout()); keyframe_form.addRow('Zeit im Clip',self.keyframe_time); keyframe_form.addRow('Kurve',self.keyframe_curve); keyframe_section.addLayout(keyframe_form)
         keyframe_buttons=QHBoxLayout(); keyframe_buttons.setContentsMargins(0,0,0,0); keyframe_buttons.addWidget(self.keyframe_set_button,1); keyframe_buttons.addWidget(self.keyframe_remove_button,1)
         keyframe_section.addLayout(keyframe_buttons)
@@ -1409,7 +1459,7 @@ class Editor(QMainWindow):
         actions_section.addWidget(button('Bild zurücksetzen',self.reset_transform)); actions_section.addWidget(button('Übernehmen',self.apply_properties,True)); actions_section.addWidget(button('Audio aus Video extrahieren',self.extract_audio))
         hint=label('Rechtsklick = Aktionen · Mitte ziehen = verschieben · Ränder = kürzen\nShift = ohne Einrasten · Strg-Klick = Mehrfachauswahl · Leertaste = Play/Pause','subtle'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
         top.addWidget(inspector); top.setSizes([310,760,360]); top.setStretchFactor(0,0); top.setStretchFactor(1,1); top.setStretchFactor(2,0); vertical.addWidget(top)
-        bottom,bl=panel(); bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
+        bottom,bl=panel(); self.timeline_panel=bottom; bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
         bar=QHBoxLayout(); bar.setContentsMargins(10,5,10,5); bar.setSpacing(6)
         bar.addWidget(label('TIMELINE','heading')); bar.addSpacing(2); bar.addWidget(timeline_separator())
 
@@ -1539,7 +1589,10 @@ class Editor(QMainWindow):
         self.mask_type.activated.connect(lambda *_: self.apply_properties())
         self.transition_type.activated.connect(lambda *_: self.apply_properties()); self.transition_duration.editingFinished.connect(self.apply_properties)
         vertical.addWidget(bottom); vertical.setStretchFactor(0,5); vertical.setStretchFactor(1,3); vertical.setChildrenCollapsible(False); vertical.setSizes([560,340]); outer.addWidget(vertical,1); self.setCentralWidget(root)
+        self.refresh_media()
         self.update_source_monitor_controls()
+        self.set_edit_mode()
+        self.apply_workspace_preset()
 
     def error(self,message): QMessageBox.warning(self,'Framecut',str(message))
 
@@ -1553,6 +1606,102 @@ class Editor(QMainWindow):
         self.autosave_pill.setText('● Ungespeichert' if self.dirty else '● Autosave')
         self.autosave_pill.setProperty('dirty',bool(self.dirty))
         self.autosave_pill.style().unpolish(self.autosave_pill); self.autosave_pill.style().polish(self.autosave_pill); self.autosave_pill.update()
+
+    def set_edit_mode(self, *_):
+        """Switch between a calm beginner inspector and the full toolset."""
+        if not hasattr(self, 'edit_mode_combo'):
+            return
+        mode=self.edit_mode_combo.currentData() or 'simple'
+        self.edit_mode=str(mode)
+        for entry in getattr(self, 'inspector_sections', []):
+            entry['section'].setVisible(self.edit_mode == 'pro' or not entry['advanced'])
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage(
+                'Einfach-Modus · häufige Einstellungen sichtbar' if self.edit_mode == 'simple'
+                else 'Pro-Modus · alle Inspector-Werkzeuge sichtbar', 2500)
+
+    def apply_workspace_preset(self, *_):
+        """Apply a task-oriented layout without creating another editor mode."""
+        if not hasattr(self, 'workspace_preset_combo') or not hasattr(self, 'top'):
+            return
+        preset=self.workspace_preset_combo.currentData() or 'edit'
+        self.workspace_preset=str(preset)
+        if self.focus_mode:
+            return
+        sizes={
+            'edit':[300, 820, 350],
+            'shorts':[230, 930, 290],
+            'audio':[250, 650, 470],
+            'color':[190, 820, 480],
+            'captions':[280, 720, 430],
+        }.get(preset,[300,820,350])
+        self.top.setSizes(sizes)
+        if hasattr(self, 'vertical'):
+            self.vertical.setSizes([560,340] if preset != 'audio' else [500,400])
+        labels={'edit':'Schnitt-Layout','shorts':'Shorts-Layout','audio':'Audio-Layout','color':'Farb-Layout','captions':'Untertitel-Layout'}
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage(f'{labels.get(preset,"Arbeitsbereich")} aktiviert.',2500)
+
+    def toggle_focus_mode(self):
+        """Give the preview and timeline the full width with one safe toggle."""
+        if not hasattr(self, 'top'):
+            return
+        self.focus_mode=not self.focus_mode
+        self.media_panel.setVisible(not self.focus_mode)
+        self.inspector_panel.setVisible(not self.focus_mode)
+        self.focus_button.setText('Fokus schließen' if self.focus_mode else 'Fokus')
+        self.focus_button.setToolTip('Seitenbereiche wieder einblenden · Strg+Shift+F' if self.focus_mode else 'Vorschau und Timeline vergrößern · Strg+Shift+F')
+        if self.focus_mode:
+            self.top.setSizes([0, 1200, 0])
+            self.statusBar().showMessage('Fokusmodus · Vorschau und Timeline maximiert',3000)
+        else:
+            self.apply_workspace_preset()
+            self.statusBar().showMessage('Fokusmodus beendet · Arbeitsbereich wiederhergestellt',3000)
+
+    def update_context_toolbar(self):
+        if not hasattr(self, 'context_toolbar'):
+            return
+        clip=self.current_clip()
+        available=clip is not None and not self.worker
+        self.context_toolbar.setVisible(bool(clip))
+        for action in (self.context_split_button,self.context_duplicate_button,self.context_reset_button,self.context_delete_button):
+            action.setEnabled(available)
+
+    def set_media_view(self, *_):
+        """Switch the media browser between visual cards and a compact list."""
+        if not hasattr(self, 'media_view_combo') or not hasattr(self, 'media_list'):
+            return
+        list_view=self.media_view_combo.currentData() == 'list'
+        self.media_list.setViewMode(QListWidget.ListMode if list_view else QListWidget.IconMode)
+        self.media_list.setWrapping(not list_view)
+        self.media_list.setSpacing(1 if list_view else 4)
+        self.media_list.setUniformItemSizes(list_view)
+        self.media_list.setIconSize(QSize(44,36) if list_view else QSize(124,72))
+        self.media_list.setGridSize(QSize(0,0) if list_view else QSize(150,108))
+        self.refresh_media()
+
+    def toggle_asset_favorite(self):
+        item=self.media_list.currentItem() if hasattr(self, 'media_list') else None
+        if item is None:
+            return self.statusBar().showMessage('Wähle zuerst ein Medium aus.',2500)
+        uid=item.data(MediaList.ASSET_UID_ROLE)
+        if uid in self.favorite_assets:
+            self.favorite_assets.remove(uid); message='Favorit entfernt.'
+        else:
+            self.favorite_assets.add(uid); message='Medium als Favorit markiert.'
+        self.refresh_media()
+        self.statusBar().showMessage(message,2500)
+
+    def update_media_favorite_button(self):
+        if not hasattr(self, 'media_favorite_button'):
+            return
+        item=self.media_list.currentItem()
+        uid=item.data(MediaList.ASSET_UID_ROLE) if item is not None else None
+        favorite=uid in self.favorite_assets if uid is not None else False
+        self.media_favorite_button.setEnabled(item is not None)
+        self.media_favorite_button.setText('★' if favorite else '☆')
+        self.media_favorite_button.setToolTip('Favorit entfernen' if favorite else 'Ausgewähltes Medium als Favorit markieren')
+        self.media_favorite_button.setAccessibleName(self.media_favorite_button.toolTip())
 
     def update_color_button(self,color):
         self.text_palette_button.setStyleSheet(f'QPushButton {{ background: {color}; color: #101216; border: 1px solid #e9edf2; }} QPushButton:hover {{ background: {color}; }}')
@@ -2559,6 +2708,13 @@ class Editor(QMainWindow):
             ('Projekt öffnen', 'Ctrl+O', self.open_project),
             ('Projekt speichern', 'Ctrl+S', self.save),
             ('Medien importieren', 'Ctrl+I', self.import_dialog),
+            ('Fokusmodus umschalten', 'Ctrl+Shift+F', self.toggle_focus_mode),
+            ('Einfach-Modus aktivieren', '—', lambda: self.edit_mode_combo.setCurrentIndex(self.edit_mode_combo.findData('simple'))),
+            ('Pro-Modus aktivieren', '—', lambda: self.edit_mode_combo.setCurrentIndex(self.edit_mode_combo.findData('pro'))),
+            ('Schnitt-Layout aktivieren', '—', lambda: self.workspace_preset_combo.setCurrentIndex(self.workspace_preset_combo.findData('edit'))),
+            ('Shorts-Layout aktivieren', '—', lambda: self.workspace_preset_combo.setCurrentIndex(self.workspace_preset_combo.findData('shorts'))),
+            ('Audio-Layout aktivieren', '—', lambda: self.workspace_preset_combo.setCurrentIndex(self.workspace_preset_combo.findData('audio'))),
+            ('Medien-Favorit umschalten', '—', self.toggle_asset_favorite),
             ('Timeline abspielen / pausieren', 'Leertaste', self.toggle_play),
             ('Vollbildvorschau öffnen / schließen', 'F11', self.toggle_cinema_preview),
             ('Clip teilen', 'S / Ctrl+B', self.split),
@@ -3081,6 +3237,7 @@ class Editor(QMainWindow):
         self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
 
     def fill_inspector(self):
+        self.update_context_toolbar()
         c=self.current_clip(); self.track_combo.clear()
         if len(self.selection)>1:
             self.clip_name.setText(f'{len(self.selection)} Clips ausgewählt')
@@ -4405,6 +4562,7 @@ class Editor(QMainWindow):
         query=self.media_search.text().strip().casefold() if hasattr(self,'media_search') else ''
         filter_value=self.media_filter.currentData() if hasattr(self,'media_filter') else 'all'
         sort_value=self.media_sort.currentData() if hasattr(self,'media_sort') else 'order'
+        favorites_only=self.media_favorites_only.isChecked() if hasattr(self,'media_favorites_only') else False
         rows=[]
         for index,c in enumerate(self.assets):
             icon='▦' if c.source_type=='image_sequence' else '▧' if c.source_type=='image' else '▸' if c.kind=='video' else '♫'
@@ -4417,6 +4575,8 @@ class Editor(QMainWindow):
                 continue
             if filter_value not in ('all',category) and not (filter_value=='offline' and offline):
                 continue
+            if favorites_only and c.uid not in self.favorite_assets:
+                continue
             rows.append((index,c,category,offline,icon,label_kind))
         if sort_value == 'name':
             rows.sort(key=lambda row:(Path(row[1].path).name.casefold(),row[0]))
@@ -4426,12 +4586,13 @@ class Editor(QMainWindow):
             rows.sort(key=lambda row:(-float(row[1].duration),Path(row[1].path).name.casefold(),row[0]))
         self.media_list.setUpdatesEnabled(False); self.media_list.clear()
         for index,c,category,offline,icon,label_kind in rows:
-            marker='⚠  ' if offline else ''
+            marker=('⚠  ' if offline else '')+('★  ' if c.uid in self.favorite_assets else '')
             item=QListWidgetItem(f'{marker}{icon}  {Path(c.path).name}\n{c.duration:.1f} s  ·  {label_kind}')
             poster=self.thumbnails.get(c.path) if hasattr(self,'thumbnails') else None
             if poster is not None and not poster.isNull():
-                item.setIcon(QIcon(QPixmap.fromImage(poster).scaled(116,66,Qt.KeepAspectRatio,Qt.SmoothTransformation)))
-            item.setSizeHint(QSize(132,96))
+                target=QSize(42,34) if getattr(self.media_list,'viewMode',lambda:QListWidget.IconMode)() == QListWidget.ListMode else QSize(116,66)
+                item.setIcon(QIcon(QPixmap.fromImage(poster).scaled(target,Qt.KeepAspectRatio,Qt.SmoothTransformation)))
+            item.setSizeHint(QSize(0,48) if getattr(self.media_list,'viewMode',lambda:QListWidget.IconMode)() == QListWidget.ListMode else QSize(132,96))
             item.setToolTip(c.path); item.setData(MediaList.ASSET_INDEX_ROLE,index); item.setData(MediaList.ASSET_UID_ROLE,c.uid); self.media_list.addItem(item)
         self.media_list.setUpdatesEnabled(True)
         if selected_uid:
@@ -4446,6 +4607,15 @@ class Editor(QMainWindow):
         if hasattr(self,'media_count'):
             total=len(self.assets); visible=len(rows)
             self.media_count.setText(f'{visible} / {total} Medien' if visible != total else f'{total} Medien')
+        if hasattr(self,'media_empty_hint'):
+            self.media_empty_hint.setVisible(not rows)
+            if not self.assets:
+                self.media_empty_hint.setText('Noch keine Medien\nImportiere ein Video, Audio oder Bild, um zu starten.')
+            elif favorites_only:
+                self.media_empty_hint.setText('Keine Favoriten sichtbar\nMarkiere ein Medium mit ☆, um es hier zu sammeln.')
+            else:
+                self.media_empty_hint.setText('Keine Medien passen zu diesem Filter\nSuche oder Filter zurücksetzen.')
+        self.update_media_favorite_button()
         if hasattr(self,'proxy_box'):
             available=any(c.kind in ('video','audio') and c.source_type not in ('image','image_sequence')
                           and c.path and Path(c.path).is_file() for c in self.assets+self.clips)
@@ -5370,7 +5540,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.21.0-Fenster.');return 1
+                QMessageBox.warning(None,'Framecut läuft bereits',f'Bitte nutze das bereits geöffnete Framecut-{APP_VERSION}-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

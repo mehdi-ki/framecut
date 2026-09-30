@@ -299,7 +299,8 @@ class Timeline(QWidget):
             p.setPen(QColor('#8bd9c5' if track < 0 else '#8fc9e1'))
             p.setFont(QFont('Sans',9,QFont.Bold))
             name=self.track_names.get(track, f'VIDEO {track}' if track>0 else f'AUDIO {-track}')
-            p.drawText(QRectF(12,y+9,self.LEFT-64,22),Qt.AlignLeft|Qt.AlignVCenter,name)
+            track_icon='▣' if track > 0 else '♫'
+            p.drawText(QRectF(12,y+9,self.LEFT-64,22),Qt.AlignLeft|Qt.AlignVCenter,f'{track_icon}  {name}')
             p.setFont(QFont('Sans',8))
             p.setPen(QColor('#6f8797'))
             p.drawText(QRectF(12,y+32,self.LEFT-24,18),Qt.AlignLeft|Qt.AlignVCenter,'Bild + Ton' if track>0 else 'Musik / Ton')
@@ -334,7 +335,7 @@ class Timeline(QWidget):
             rect = QRectF(self.marquee_start, self.marquee_current).normalized()
             p.setPen(QPen(QColor('#63ead4'), 1, Qt.DashLine)); p.setBrush(QColor(99,234,212,35)); p.drawRect(rect)
         if not self.clips:
-            p.setPen(QColor('#8794a6')); p.drawText(self.LEFT+24,self.TOP+40,'Medien hierher ziehen oder mit + hinzufügen')
+            p.setPen(QColor('#8794a6')); p.setFont(QFont('Sans',10,QFont.Bold)); p.drawText(self.LEFT+24,self.TOP+40,'Timeline leer · Medien hierher ziehen oder mit + hinzufügen')
         if self.snapline is not None:
             p.setPen(QPen(QColor('#f8c86f'),1,Qt.DashLine))
             x=int(self.LEFT+self.snapline*self.scale); p.drawLine(x,28,x,self.height())
@@ -416,6 +417,28 @@ class Timeline(QWidget):
                 x=r.left()+max(0.0,min(c.length,float(keyframe.get('time',0))))*self.scale
                 y=r.bottom()-6
                 p.drawPolygon(QPolygonF([QPointF(x,y-4),QPointF(x+4,y),QPointF(x,y+4),QPointF(x-4,y)]))
+        # Small state badges make effects and animation discoverable without
+        # opening the Inspector. They are intentionally short and stable so
+        # the timeline remains readable at compact zoom levels.
+        badges=[]
+        if c.source_type == 'adjustment' or getattr(c,'effect_preset','clean') != 'clean':
+            badges.append(('FX','#e6bf67'))
+        if getattr(c,'keyframes',None):
+            badges.append(('KF','#f8c86f'))
+        if getattr(c,'volume_keyframes',None):
+            badges.append(('VOL','#8bd9b9'))
+        if getattr(c,'transition_type','none') != 'none':
+            badges.append(('TR','#c898ed'))
+        if badges and r.width() > 68:
+            p.save(); p.setOpacity(.96 if not ghost else .45)
+            badge_x=r.right()-5
+            for text,color in reversed(badges):
+                width=25 if text != 'VOL' else 31
+                badge_x-=width
+                p.setPen(Qt.NoPen); p.setBrush(QColor(color)); p.drawRoundedRect(QRectF(badge_x,r.top()+8,width,16),4,4)
+                p.setPen(QColor('#12202a')); p.setFont(QFont('Sans',7,QFont.Bold)); p.drawText(QRectF(badge_x,r.top()+8,width,16),Qt.AlignCenter,text)
+                badge_x-=3
+            p.restore()
         if self.track_states.get(c.track, {}).get('muted'):
             p.save(); p.setBrush(QColor(10,14,20,92)); p.setPen(QPen(QColor('#ff8f8f'),1,Qt.DashLine)); p.drawRoundedRect(r.adjusted(2,2,-2,-2),4,4); p.restore()
         p.setOpacity(1)

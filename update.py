@@ -18,9 +18,9 @@ from update_system import (
 )
 
 try:
-    DEFAULT_VERSION = Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip() or "3.21.0"
+    DEFAULT_VERSION = Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip() or "3.22.0"
 except OSError:
-    DEFAULT_VERSION = "3.21.0"
+    DEFAULT_VERSION = "3.22.0"
 
 
 def main(argv=None) -> int:

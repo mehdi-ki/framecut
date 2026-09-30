@@ -8,7 +8,7 @@ from unittest.mock import patch
 from PySide6.QtCore import Qt,QPoint,QMimeData,QPointF
 from PySide6.QtGui import QDragEnterEvent,QDropEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication,QMessageBox,QInputDialog,QFileDialog,QToolButton,QFrame
+from PySide6.QtWidgets import QApplication,QMessageBox,QInputDialog,QFileDialog,QToolButton,QFrame,QListWidget
 from app import Editor,ExportDialog,STYLE
 from core import load_project,length,parse_subtitle_file,save_project
 from timeline import ASSET_MIME,Timeline
@@ -48,6 +48,17 @@ class GuiTest(unittest.TestCase):
             self.assertGreaterEqual(len(w.findChildren(QToolButton,'inspectorSectionHeader')),10)
             self.assertIsNotNone(w.findChild(QFrame,'previewToolbar'))
             self.assertIsNotNone(w.findChild(QFrame,'previewSubbar'))
+            self.assertEqual(w.edit_mode_combo.currentData(),'simple')
+            self.assertTrue(w.media_empty_hint.isVisible())
+            self.assertFalse(w.context_toolbar.isVisible())
+            advanced=[entry['section'] for entry in w.inspector_sections if entry['advanced']]
+            self.assertTrue(advanced); self.assertTrue(all(not section.isVisible() for section in advanced))
+            w.edit_mode_combo.setCurrentIndex(w.edit_mode_combo.findData('pro'))
+            self.assertTrue(all(section.isVisible() for section in advanced))
+            w.media_view_combo.setCurrentIndex(w.media_view_combo.findData('list'))
+            self.assertEqual(w.media_list.viewMode(),QListWidget.ListMode)
+            w.toggle_focus_mode();self.assertFalse(w.media_panel.isVisible());self.assertFalse(w.inspector_panel.isVisible())
+            w.toggle_focus_mode();self.assertTrue(w.media_panel.isVisible());self.assertTrue(w.inspector_panel.isVisible())
             w.close();QTest.qWait(30)
 
     def test_framecut_file_association_loads_project_argument(self):
@@ -484,6 +495,82 @@ class GuiTest(unittest.TestCase):
                 'bitrate_kbps':1200,'encoder':'software','hdr':False},'label':'Queue-Test'})
             w.update_render_queue_button();w.process_render_queue();self.wait_job(w)
             self.assertTrue(target.is_file());self.assertEqual(w.render_queue_button.text(),'Render-Queue (0)')
+            w.dirty=False;w.close();QTest.qWait(50)
+
+    def test_step8_professional_trim_tools(self):
+        with tempfile.TemporaryDirectory() as state:
+            w=Editor(state,recovery=False);w.show();QTest.qWait(100)
+            errors=[];w.error=lambda text:errors.append(str(text))
+            w.import_paths([str(test_core.EditorCoreTest.blue),str(test_core.EditorCoreTest.red)]);self.wait_job(w)
+            w.drop_asset(0,0,1);w.drop_asset(1,3,1)
+            first,second=w.clips
+            w.select_clip(first.uid);w.set_playhead(1);w.ripple_trim_out()
+            self.assertAlmostEqual(w.current_clip().finish,1,places=3)
+            self.assertAlmostEqual(next(value for value in w.clips if value.uid==second.uid).position,1,places=3)
+            w.undo()
+
+            w.dirty=False;w.new_project();w.import_paths([str(test_core.EditorCoreTest.blue),str(test_core.EditorCoreTest.red)]);self.wait_job(w)
+            w.drop_asset(0,0,1);w.drop_asset(1,3,1)
+            left,right=w.clips;right=replace(right,start=.5);w.clips=[left,right];w.refresh()
+            w.select_clip(right.uid);w.set_playhead(2.5);w.roll_to_playhead()
+            rolled_left=next(value for value in w.clips if value.uid==left.uid)
+            rolled_right=next(value for value in w.clips if value.uid==right.uid)
+            self.assertAlmostEqual(rolled_left.finish,2.5,places=3)
+            self.assertAlmostEqual(rolled_right.position,2.5,places=3)
+
+            w.dirty=False;w.new_project();w.import_paths([str(test_core.EditorCoreTest.blue),str(test_core.EditorCoreTest.red)]);self.wait_job(w)
+            w.drop_asset(0,0,1);w.drop_asset(1,3,1);w.drop_asset(0,4,1)
+            first,middle,following=w.clips
+            middle=replace(middle,position=2)
+            first=replace(first,end=2)
+            following=replace(following,start=.5,position=3)
+            w.clips=[first,middle,following];w.refresh()
+            w.select_clip(middle.uid);w.slide_selected(1)
+            self.assertGreater(w.current_clip().position,2)
+            w.select_clip(w.clips[0].uid);before=w.current_clip().start;w.slip_selected(1)
+            self.assertGreater(w.current_clip().start,before)
+            self.assertFalse(errors)
+            w.dirty=False;w.close();QTest.qWait(50)
+
+    def test_step9_source_monitor_in_out_insert_and_overwrite(self):
+        """Source marks create clean Insert/Overwrite candidates without export work."""
+        with tempfile.TemporaryDirectory() as state:
+            w=Editor(state,recovery=False);w.show();QTest.qWait(100)
+            errors=[];w.error=lambda text:errors.append(str(text))
+            w.import_paths([str(test_core.EditorCoreTest.blue)]);self.wait_job(w)
+            w.drop_asset(0,0,1)
+            source=w.clips[0]
+            # Avoid depending on the platform media backend for this focused
+            # source-monitor test; the UI state and edit transactions are real.
+            with patch.object(w,'load_player'):
+                w.source_preview()
+            self.assertEqual(w.mode,'source');self.assertEqual(w.source_clip_uid,source.uid)
+            with patch.object(w,'_source_position',return_value=.5):
+                w.set_source_in()
+            with patch.object(w,'_source_position',return_value=1.5):
+                w.set_source_out()
+            self.assertAlmostEqual(w.source_in,.5,places=3);self.assertAlmostEqual(w.source_out,1.5,places=3)
+            self.assertIn('I 00:00.50',w.source_range_label.text())
+            self.assertIn('O 00:01.50',w.source_range_label.text())
+
+            w.set_playhead(0);w.insert_source_range()
+            self.assertEqual(len(w.clips),2)
+            inserted=next(value for value in w.clips if value.uid==w.current)
+            self.assertAlmostEqual(inserted.start,.5,places=3);self.assertAlmostEqual(inserted.end,1.5,places=3)
+            self.assertAlmostEqual(next(value for value in w.clips if value.uid!=inserted.uid).position,1,places=3)
+
+            w.dirty=False;w.new_project();w.import_paths([str(test_core.EditorCoreTest.blue)]);self.wait_job(w)
+            w.drop_asset(0,0,1);source=w.clips[0]
+            with patch.object(w,'load_player'):
+                w.source_preview()
+            with patch.object(w,'_source_position',return_value=.5):w.set_source_in()
+            with patch.object(w,'_source_position',return_value=1.5):w.set_source_out()
+            w.set_playhead(1);w.overwrite_source_range()
+            self.assertEqual(len(w.clips),3)
+            self.assertEqual(sorted(round(value.position,3) for value in w.clips),[0,1,2])
+            overwritten=next(value for value in w.clips if value.uid==w.current)
+            self.assertAlmostEqual(overwritten.start,.5,places=3);self.assertAlmostEqual(overwritten.end,1.5,places=3)
+            self.assertFalse(errors)
             w.dirty=False;w.close();QTest.qWait(50)
 
 

@@ -69,6 +69,35 @@ QFrame#previewSubbar {
     border-radius: 7px;
 }
 
+QFrame#contextToolbar {
+    background: #101923;
+    border: 1px solid #223744;
+    border-radius: 8px;
+}
+
+QToolButton#contextAction {
+    color: #a9c2c9;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 4px;
+    min-width: 30px;
+    min-height: 26px;
+    font-size: 14px;
+    font-weight: 700;
+}
+
+QToolButton#contextAction:hover {
+    color: #effffb;
+    background: #214143;
+    border-color: #4d8b83;
+}
+
+QToolButton#contextAction:disabled {
+    color: #566576;
+    background: transparent;
+}
+
 QFrame#headerDivider {
     background: #2a3a4a;
     border: none;
@@ -333,6 +362,15 @@ QLabel#sourceRangeLabel {
     font-size: 10px;
 }
 
+QLabel#emptyState {
+    color: #7e96a6;
+    background: #101923;
+    border: 1px dashed #2a4654;
+    border-radius: 8px;
+    padding: 14px 10px;
+    min-height: 48px;
+}
+
 QFrame#timelineControlGroup QSpinBox {
     min-height: 20px;
     padding: 2px 4px;
@@ -357,6 +395,53 @@ QPushButton#modeTabActive {
 QPushButton#modeTabActive {
     color: #7ce8d6;
     font-weight: 800;
+}
+
+QComboBox#workspacePreset,
+QComboBox#editModeCombo,
+QComboBox#mediaViewCombo {
+    color: #d9f5ef;
+    background: #172d31;
+    border: 1px solid #2d5d59;
+    border-radius: 6px;
+    padding: 4px 7px;
+    min-height: 22px;
+    min-width: 86px;
+}
+
+QComboBox#editModeCombo {
+    min-width: 66px;
+}
+
+QComboBox#mediaViewCombo {
+    min-width: 70px;
+}
+
+QCheckBox#mediaFavorites {
+    color: #e7cb78;
+    spacing: 4px;
+}
+
+QToolButton#mediaFavoriteButton {
+    color: #e7cb78;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 3px 7px;
+    min-width: 28px;
+    min-height: 24px;
+    font-size: 16px;
+}
+
+QToolButton#mediaFavoriteButton:hover {
+    color: #fff3b0;
+    background: #3a3521;
+    border-color: #76612d;
+}
+
+QToolButton#mediaFavoriteButton:disabled {
+    color: #59626a;
+    background: transparent;
 }
 
 QPushButton#railButton {

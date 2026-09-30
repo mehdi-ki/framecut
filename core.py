@@ -2112,7 +2112,9 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
             if transition_kind == 'blur_in':
                 post_filters.append(f"gblur=sigma=18:enable='lt(t,{transition_duration:.6f})'")
             else:
-                post_filters.append(f"pixelize=w=24:h=24:enable='lt(t,{transition_duration:.6f})'")
+                # FFmpeg 4.4 (Ubuntu 22.04) has no pixelize filter. Keep the
+                # named transition available with a compatible soft fallback.
+                post_filters.append(f"gblur=sigma=14:enable='lt(t,{transition_duration:.6f})'")
         if transition_kind in ('circle_open', 'circle_close', 'radial') and transition_duration > 0:
             transition_progress = f"clip(T/{transition_duration:.6f},0,1)"
             distance = "hypot(X-W/2,Y-H/2)"
@@ -2243,9 +2245,13 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
         sidechain_label = f"[duckside{i}]"
         graphs.append(''.join(sidechain_inputs)+
                       f"amix=inputs={len(sidechain_inputs)}:duration=longest:dropout_transition=0:normalize=0"+
+                      ",aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"+
                       sidechain_label)
         ratio = 1.0 + 19.0*float(c.audio_ducking)
-        graphs.append(f"[main{i}]{sidechain_label}sidechaincompress=threshold=0.03:ratio={ratio:.6f}:"
+        main_label = f"[duckmain{i}]"
+        graphs.append(f"[main{i}]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"+
+                      main_label)
+        graphs.append(f"{main_label}{sidechain_label}sidechaincompress=threshold=0.03:ratio={ratio:.6f}:"
                       f"attack=20:release=250:makeup=1:mix=1[a{i}]")
     graphs.append(''.join(audio_labels)+f"amix=inputs={len(audio_labels)}:duration=first:dropout_transition=0:normalize=0,"
                   + ','.join(master_audio_filters(master_settings)) + "[aout]")

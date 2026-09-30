@@ -379,6 +379,19 @@ QDialog {
     background: #15181e;
 }
 
+QDialog#cinemaDialog {
+    background: #080a0d;
+}
+
+QDialog#cinemaDialog QFrame,
+QDialog#cinemaDialog QLabel {
+    background: transparent;
+}
+
+QDialog#cinemaDialog QVideoWidget {
+    background: #050608;
+}
+
 QStackedWidget#previewCanvas {
     background: #090b0e;
     border: 1px solid #252c35;

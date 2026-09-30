@@ -1,4 +1,4 @@
-"""Framecut 3.7 — native Linux multitrack editor."""
+"""Framecut 3.8 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -31,9 +31,9 @@ from update_system import (configured_manifest_url,download_verified,fetch_manif
                            update_checks_disabled)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.7'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.8'
 except OSError:
-    APP_VERSION = '3.7'
+    APP_VERSION = '3.8'
 
 
 def label(text,name=None):
@@ -119,6 +119,139 @@ class ExportDialog(QDialog):
         except ValueError as exc:
             QMessageBox.warning(self,'Export-Einstellungen',str(exc)); return
         super().accept()
+
+
+class CommandPaletteDialog(QDialog):
+    """Searchable launcher for the editor's most important actions."""
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+        self.setWindowTitle('Framecut · Befehle')
+        self.setModal(True)
+        self.setMinimumSize(560, 430)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+        layout.addWidget(label('BEFEHLE UND SHORTCUTS', 'heading'))
+        hint = label('Suche eine Aktion und bestätige mit Enter. Öffnen jederzeit mit Strg+K.', 'muted')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.query = QLineEdit()
+        self.query.setPlaceholderText('Befehl suchen …')
+        self.query.setClearButtonEnabled(True)
+        layout.addWidget(self.query)
+        self.commands = editor.command_definitions()
+        self.results = QListWidget()
+        self.results.setViewMode(QListWidget.ListMode)
+        self.results.itemDoubleClicked.connect(self.run_selected)
+        layout.addWidget(self.results, 1)
+        footer = QHBoxLayout()
+        footer.addWidget(label('↑ ↓ auswählen · Enter ausführen · Esc schließen', 'muted'))
+        footer.addStretch()
+        close = QPushButton('Schließen')
+        close.clicked.connect(self.reject)
+        footer.addWidget(close)
+        layout.addLayout(footer)
+        self.query.textChanged.connect(self.refresh_results)
+        self.query.returnPressed.connect(self.run_selected)
+        self.refresh_results()
+        self.query.setFocus()
+
+    def refresh_results(self, *_):
+        query = self.query.text().strip().casefold()
+        self.results.clear()
+        for title, shortcut, callback in self.commands:
+            searchable = f'{title} {shortcut}'.casefold()
+            if query and query not in searchable:
+                continue
+            item = QListWidgetItem(f'{title}    {shortcut}')
+            item.setData(Qt.UserRole, callback)
+            self.results.addItem(item)
+        if self.results.count():
+            self.results.setCurrentRow(0)
+        else:
+            empty = QListWidgetItem('Keine passenden Befehle')
+            empty.setFlags(Qt.NoItemFlags)
+            self.results.addItem(empty)
+
+    def run_selected(self, *_):
+        item = self.results.currentItem()
+        callback = item.data(Qt.UserRole) if item is not None else None
+        if not callable(callback):
+            return
+        self.accept()
+        QTimer.singleShot(0, callback)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.reject()
+            return
+        super().keyPressEvent(event)
+
+
+class CinemaPreviewDialog(QDialog):
+    """Fullscreen preview that temporarily uses its own video sink."""
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+        self.setObjectName('cinemaDialog')
+        self.setWindowTitle(f'Framecut {APP_VERSION} · Cinema-Vorschau')
+        self.setWindowFlag(Qt.Window)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 16)
+        layout.setSpacing(10)
+        header = QHBoxLayout()
+        header.addWidget(label('FRAMECUT · CINEMA PREVIEW', 'heading'))
+        header.addStretch()
+        close = QPushButton('Schließen  Esc')
+        close.setObjectName('iconButton')
+        close.clicked.connect(self.close)
+        header.addWidget(close)
+        layout.addLayout(header)
+        self.canvas = VideoView()
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.frame = editor.video.frame
+        layout.addWidget(self.canvas, 1)
+        controls = QHBoxLayout()
+        self.play_button = QPushButton('▶ Timeline')
+        self.play_button.clicked.connect(editor.toggle_play)
+        controls.addWidget(self.play_button)
+        controls.addWidget(label('F11 oder Esc zum Schließen', 'muted'))
+        controls.addStretch()
+        self.time = label(editor.time_label.text(), 'muted')
+        controls.addWidget(self.time)
+        layout.addLayout(controls)
+        editor.player.setVideoSink(self.canvas.sink)
+        editor.player.playbackStateChanged.connect(self.sync_play_state)
+        editor.player.positionChanged.connect(self.sync_time)
+        self.sync_play_state(editor.player.playbackState())
+
+    def sync_play_state(self, state):
+        if state == QMediaPlayer.PlayingState:
+            self.play_button.setText('Ⅱ Pause')
+        else:
+            self.play_button.setText('▶ Timeline')
+
+    def sync_time(self, *_):
+        self.time.setText(self.editor.time_label.text())
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Escape, Qt.Key_F11):
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self.editor.player.setVideoSink(self.editor.video.sink)
+        self.editor.video.frame = self.canvas.frame
+        self.editor.video.update()
+        self.editor.cinema_dialog = None
+        if hasattr(self.editor, 'cinema_button'):
+            self.editor.cinema_button.setText('⛶ Cinema')
+        super().closeEvent(event)
 
 
 class LevelMeter(QWidget):
@@ -378,6 +511,7 @@ class Editor(QMainWindow):
         self.transport_rate=0.0; self.transport_rate_pending=None
         self.voiceover_capture=None; self.voiceover_input=None; self.voiceover_recorder=None
         self.voiceover_dialog=None; self.voiceover_target=None
+        self.cinema_dialog=None
         self.transport_timer=QTimer(self); self.transport_timer.setInterval(40); self.transport_timer.timeout.connect(self.transport_tick)
         self.pending_seek=None; self.worker=None; self.recovery_enabled=recovery
         self._closing=False
@@ -402,6 +536,7 @@ class Editor(QMainWindow):
                    ('Ctrl+D',self.duplicate_selection),('Ctrl+G',self.group_selection),('Ctrl+Shift+G',self.ungroup_selection),
                    ('Ctrl+Shift+Delete',self.ripple_delete),
                    ('Ctrl+A',self.select_all),('J',self.transport_j),('K',self.transport_stop),('L',self.transport_l),
+                   ('Ctrl+K',self.open_command_palette),('F11',self.toggle_cinema_preview),
                    ('Space',self.toggle_play),('Delete',self.remove),('Backspace',self.remove),
                    ('Left',lambda:self.nudge_playhead(-1)),('Right',lambda:self.nudge_playhead(1)),
                    ('Shift+Left',lambda:self.nudge_playhead(-5)),('Shift+Right',lambda:self.nudge_playhead(5)),
@@ -434,6 +569,7 @@ class Editor(QMainWindow):
         self.archive_button=button('Archiv',self.archive_project_dialog); self.archive_button.setObjectName('iconButton'); head.addWidget(self.archive_button)
         self.render_queue_button=button('Queue (0)',self.show_render_queue); self.render_queue_button.setObjectName('iconButton'); head.addWidget(self.render_queue_button)
         self.mixer_button=button('Mixer',self.open_mixer); self.mixer_button.setObjectName('iconButton'); head.addWidget(self.mixer_button)
+        self.command_button=button('Befehle  ⌘K',self.open_command_palette); self.command_button.setObjectName('iconButton'); head.addWidget(self.command_button)
         self.preset=QComboBox(); self.preset.addItems(PRESETS); self.preset.currentTextChanged.connect(self.preset_changed); self.preset.setToolTip('Projektformat und Vorschaugröße')
         head.addWidget(self.preset)
         export_button=button('Exportieren  ↗',self.start_export,True); export_button.setObjectName('exportButton'); head.addWidget(export_button)
@@ -535,6 +671,7 @@ class Editor(QMainWindow):
         self.seek=QSlider(Qt.Horizontal); self.seek.setRange(0,10000); self.seek.sliderMoved.connect(self.seek_slider); pl.addWidget(self.seek)
         controls=QHBoxLayout(); self.play_button=button('▶ Timeline',self.toggle_play); controls.addWidget(self.play_button)
         controls.addWidget(button('Clip ansehen',self.source_preview)); controls.addStretch()
+        self.cinema_button=button('⛶ Cinema',self.toggle_cinema_preview); self.cinema_button.setObjectName('iconButton'); controls.addWidget(self.cinema_button)
         self.time_label=label('00:00.0 / 00:00.0','muted'); controls.addWidget(self.time_label); pl.addLayout(controls)
         top.addWidget(preview)
         inspector,inspector_outer=panel(); inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
@@ -1321,6 +1458,43 @@ class Editor(QMainWindow):
             self.mixer_dialog.raise_(); self.mixer_dialog.activateWindow(); return
         self.mixer_dialog=MixerDialog(self)
         self.mixer_dialog.show()
+
+    def command_definitions(self):
+        """Return the high-value actions exposed by Ctrl+K."""
+        return [
+            ('Neues Projekt', 'Ctrl+N', self.new_project),
+            ('Projekt öffnen', 'Ctrl+O', self.open_project),
+            ('Projekt speichern', 'Ctrl+S', self.save),
+            ('Medien importieren', 'Ctrl+I', self.import_dialog),
+            ('Timeline abspielen / pausieren', 'Leertaste', self.toggle_play),
+            ('Vollbildvorschau öffnen / schließen', 'F11', self.toggle_cinema_preview),
+            ('Clip teilen', 'S / Ctrl+B', self.split),
+            ('Auswahl entfernen', 'Entf', self.remove),
+            ('Rückgängig', 'Ctrl+Z', self.undo),
+            ('Wiederholen', 'Ctrl+Shift+Z', self.redo),
+            ('Textclip hinzufügen', '+ Text', self.add_text),
+            ('Adjustment-Layer hinzufügen', '+ Adjustment-Layer', self.add_adjustment_layer),
+            ('Audio-Mixer öffnen', '—', self.open_mixer),
+            ('Render-Queue öffnen', '—', self.show_render_queue),
+            ('Timeline einpassen', '—', self.fit_timeline),
+            ('Nach Updates suchen', '—', self.check_for_updates),
+        ]
+
+    def open_command_palette(self):
+        if self.worker:
+            return
+        dialog=CommandPaletteDialog(self)
+        dialog.exec()
+
+    def toggle_cinema_preview(self):
+        if self.worker:
+            return
+        if self.cinema_dialog is not None:
+            self.cinema_dialog.close()
+            return
+        self.cinema_dialog=CinemaPreviewDialog(self)
+        self.cinema_button.setText('× Cinema schließen')
+        self.cinema_dialog.showFullScreen()
 
     def start_voiceover_recording(self):
         """Record a WAV through Qt Multimedia and place it at the playhead."""
@@ -3014,6 +3188,8 @@ class Editor(QMainWindow):
             self.render_queue.clear(); self.update_render_queue_button()
         if self.can_discard():
             self._closing=True
+            if self.cinema_dialog is not None:
+                self.cinema_dialog.close()
             self.autosave_timer.stop(); self.live_preview_timer.stop(); self.transport_timer.stop()
             self.preview_queued=False; self.preview_play_requested=False
             self.transport_stop()
@@ -3037,7 +3213,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-        QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.7-Fenster.');return 1
+        QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.8-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

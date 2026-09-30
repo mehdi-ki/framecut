@@ -1,0 +1,65 @@
+name: Framecut Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Tag und Versionsdatei prüfen
+        shell: bash
+        run: |
+          test "${GITHUB_REF_NAME}" = "v$(<VERSION)" || {
+            echo "Tag ${GITHUB_REF_NAME} passt nicht zu VERSION $(<VERSION)."
+            exit 1
+          }
+
+      - name: Linux-Abhängigkeiten installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libxcb-cursor0 python3-venv zip dpkg
+
+      - name: Python-Umgebung vorbereiten
+        run: |
+          python3 -m venv "$RUNNER_TEMP/framecut-venv"
+          "$RUNNER_TEMP/framecut-venv/bin/python" -m pip install -r requirements.txt
+
+      - name: Tests ausführen
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          "$RUNNER_TEMP/framecut-venv/bin/python" -m unittest -q test_delivery.py test_core.py test_gui.py
+
+      - name: Offizielles AppImage-Werkzeug laden
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            --output "$RUNNER_TEMP/appimagetool"
+          chmod +x "$RUNNER_TEMP/appimagetool"
+
+      - name: Release-Artefakte bauen
+        env:
+          APPIMAGETOOL: ${{ runner.temp }}/appimagetool
+          FRAMECUT_RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          ./build_release.sh "$RUNNER_TEMP/release"
+
+      - name: GitHub Release veröffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Framecut ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "$RUNNER_TEMP/release"/*

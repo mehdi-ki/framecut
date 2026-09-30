@@ -89,6 +89,10 @@ class Timeline(QWidget):
         self._scaled_waveforms = {}
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
+        # QScrollArea/viewport combinations can swallow the default
+        # QWidget context-menu event on Linux. Handle the right button
+        # directly in mousePressEvent so the editor always receives it.
+        self.setContextMenuPolicy(Qt.NoContextMenu)
         self.setAcceptDrops(True)
         self.setToolTip('M = Spur stumm · L = Spur sperren · Clipmitte ziehen: verschieben · Ränder ziehen: kürzen · leere Fläche ziehen: Mehrfachauswahl · Strg+Linksklick: Auswahl erweitern · Strg+Linksklick ziehen: Timeline verschieben · Umschalt: ohne Einrasten · Strg+Mausrad: Zoom · weißen Abspielkopf oben ziehen')
         self.refresh([], self.tracks, None)
@@ -392,6 +396,11 @@ class Timeline(QWidget):
         return any(self.track_locked(clip.track) for clip in self.clips if clip.uid in self.selection)
 
     def mousePressEvent(self,event):
+        if event.button()==Qt.RightButton:
+            point=event.position().toPoint()
+            self._request_context_menu(point,self.mapToGlobal(point))
+            event.accept()
+            return
         if event.button()!=Qt.LeftButton:
             return
         self.setFocus()
@@ -586,20 +595,26 @@ class Timeline(QWidget):
         else:
             event.ignore()
 
-    def contextMenuEvent(self,event):
-        if event.position().x() < self.LEFT and event.position().y() >= self.TOP:
-            track=self.track_at(event.position().y())
+    def _request_context_menu(self, point, global_pos=None):
+        """Forward a right-click to the editor's contextual action menus."""
+        if global_pos is None:
+            global_pos = self.mapToGlobal(point)
+        if point.x() < self.LEFT and point.y() >= self.TOP:
+            track=self.track_at(point.y())
             if track is not None:
-                self.track_context_requested.emit(track,event.globalPos())
-                event.accept()
+                self.track_context_requested.emit(track,global_pos)
                 return
-        marker = self.marker_at(event.position())
+        marker = self.marker_at(point)
         if marker is not None:
-            self.marker_context_requested.emit(float(marker.get('time', 0.0)), event.globalPos())
-            event.accept()
+            self.marker_context_requested.emit(float(marker.get('time', 0.0)), global_pos)
             return
-        clip=self.hit(event.pos())
-        self.context_requested.emit(clip.uid if clip else '', event.globalPos())
+        clip=self.hit(point)
+        self.context_requested.emit(clip.uid if clip else '', global_pos)
+
+    def contextMenuEvent(self,event):
+        # Keep the native event path working for callers that send a
+        # QContextMenuEvent directly (including older Qt test harnesses).
+        self._request_context_menu(event.pos(), event.globalPos())
         event.accept()
 
     def dragEnterEvent(self,event):

@@ -361,8 +361,14 @@ class Timeline(QWidget):
                 p.restore()
         p.save(); p.setClipRect(r.adjusted(8,2,-7,-2))
         if c.kind != 'text' and c.source_type != 'adjustment':
-            p.setPen(QColor('#e4f3f8')); p.drawText(int(r.left()+10),int(r.top()+22),Path(c.path).name)
-            p.setPen(QColor('#b2c8d1')); p.drawText(int(r.left()+10),int(r.top()+42),f'{c.length:.2f} s  ·  {c.volume:.0%}')
+            title = c.compound_name or Path(c.path).name
+            if c.camera_angle:
+                title = f'{title} · {c.camera_angle}'
+            p.setPen(QColor('#e4f3f8')); p.drawText(int(r.left()+10),int(r.top()+22),title[:32])
+            detail = f'{c.length:.2f} s  ·  {c.volume:.0%}'
+            if c.multicam_group and not c.multicam_active:
+                detail += '  ·  inaktiver Winkel'
+            p.setPen(QColor('#b2c8d1')); p.drawText(int(r.left()+10),int(r.top()+42),detail)
         p.restore()
         if selected and r.width()>18:
             p.setOpacity(1)
@@ -388,9 +394,12 @@ class Timeline(QWidget):
         p.setOpacity(1)
 
     def _group_ids(self, clip):
-        if not clip.group_id:
-            return [clip.uid]
-        return [value.uid for value in self.clips if value.group_id == clip.group_id]
+        ids = {clip.uid}
+        if clip.group_id:
+            ids.update(value.uid for value in self.clips if value.group_id == clip.group_id)
+        if clip.compound_id:
+            ids.update(value.uid for value in self.clips if value.compound_id == clip.compound_id)
+        return [value.uid for value in self.clips if value.uid in ids]
 
     def _selection_locked(self):
         return any(self.track_locked(clip.track) for clip in self.clips if clip.uid in self.selection)

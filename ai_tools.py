@@ -340,6 +340,115 @@ def auto_reframe_video(source, start, end, target_aspect, progress=lambda value:
         capture.release()
 
 
+def detect_scene_changes(source, start, end, progress=lambda value: None, cancel=None,
+                         sample_fps=6.0, threshold=0.22, min_gap=0.4):
+    """Detect hard scene changes with a local grayscale frame-difference pass."""
+    source = Path(source).expanduser().resolve()
+    if not source.is_file():
+        raise AIToolError(f"Quelldatei nicht gefunden: {source}")
+    cv2 = _cv2()
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        raise AIToolError(f"Video konnte nicht für Szenenerkennung geöffnet werden: {source.name}")
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
+    if not 1.0 <= fps <= 240.0:
+        fps = 30.0
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if frame_count <= 0:
+        capture.release()
+        raise AIToolError("Das Video enthält keine Szenenerkennungs-Frames.")
+    start = max(0.0, float(start)); end = max(start, float(end))
+    start_frame = max(0, min(frame_count-1, round(start*fps)))
+    end_frame = max(start_frame, min(frame_count-1, round(end*fps)))
+    stride = max(1, round(fps/max(1.0, float(sample_fps))))
+    total_frames = max(1, end_frame-start_frame+1)
+    capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    previous = None
+    changes = []
+    last_change = -float(min_gap)
+    try:
+        for frame_index in range(start_frame, end_frame+1):
+            if _cancelled(cancel):
+                raise AIToolError("Szenenerkennung abgebrochen.")
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if (frame_index-start_frame) % stride == 0 or previous is None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.resize(gray, (320, 180), interpolation=cv2.INTER_AREA)
+                if previous is not None:
+                    score = float(cv2.absdiff(gray, previous).mean())/255.0
+                    local_time = (frame_index-start_frame)/fps
+                    if score >= float(threshold) and local_time-last_change >= float(min_gap):
+                        changes.append(round(local_time, 6)); last_change = local_time
+                previous = gray
+            progress(min(99, int((frame_index-start_frame+1)/total_frames*100)))
+        progress(100)
+        return changes
+    finally:
+        capture.release()
+
+
+def detect_audio_onset(source, start, end, progress=lambda value: None, cancel=None):
+    """Return the first audible local onset for multi-camera synchronization."""
+    source = Path(source).expanduser().resolve()
+    if not source.is_file():
+        raise AIToolError(f"Quelldatei nicht gefunden: {source}")
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        raise AIToolError('FFmpeg fehlt. Installiere es mit: sudo apt install ffmpeg')
+    start = max(0.0, float(start)); duration = max(0.05, float(end)-start)
+    sample_rate = 16000; chunk_samples = 512
+    command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin',
+               '-ss', f'{start:.6f}', '-t', f'{duration:.6f}', '-i', str(source),
+               '-vn', '-ac', '1', '-ar', str(sample_rate), '-f', 's16le', 'pipe:1']
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    energies = []
+    try:
+        while True:
+            if _cancelled(cancel):
+                process.terminate()
+                raise AIToolError('Multi-Kamera-Synchronisation abgebrochen.')
+            data = process.stdout.read(chunk_samples*2)
+            if not data:
+                break
+            samples = array('h'); samples.frombytes(data)
+            if samples:
+                rms = math.sqrt(sum(float(value)*float(value) for value in samples)/len(samples))/32768.0
+                energies.append(rms)
+                progress(min(92, int(len(energies)*chunk_samples/sample_rate/duration*92)))
+        detail = process.stderr.read().decode(errors='replace').strip()
+        return_code = process.wait(timeout=30)
+        if return_code:
+            raise AIToolError('Audio konnte für die Multi-Kamera-Synchronisation nicht gelesen werden.'
+                              + (f'\n{detail}' if detail else ''))
+    except subprocess.TimeoutExpired as exc:
+        process.kill(); process.wait()
+        raise AIToolError('Multi-Kamera-Synchronisation brauchte zu lange.') from exc
+    finally:
+        if process.poll() is None:
+            process.kill(); process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+    progress(100)
+    if not energies or max(energies) < 1e-4:
+        return 0.0
+    noise_window = energies[:max(1, min(len(energies), round(sample_rate/chunk_samples*.5)))]
+    ordered_noise = sorted(noise_window)
+    baseline = ordered_noise[min(len(ordered_noise)-1, round((len(ordered_noise)-1)*.2))]
+    threshold = max(.012, baseline*3.0)
+    for index, energy in enumerate(energies):
+        if energy >= threshold:
+            return round(index*chunk_samples/sample_rate, 6)
+    fallback = max(.012, max(energies)*.15)
+    for index, energy in enumerate(energies):
+        if energy >= fallback:
+            return round(index*chunk_samples/sample_rate, 6)
+    return 0.0
+
+
 def analyze_beats(source, start, end, progress=lambda value: None, cancel=None):
     """Detect musical onsets locally with an FFmpeg PCM energy pass."""
     source = Path(source).expanduser().resolve()

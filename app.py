@@ -1,4 +1,4 @@
-"""Framecut 3.18.0 — native Linux multitrack editor."""
+"""Framecut 3.19.0 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -23,19 +23,21 @@ from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_
                   archive_project,extract_project_archive,find_relink_candidates,relink_project_media,missing_project_media,create_proxy_files,
                   preview_acceleration_info,cache_size,prune_cache,
                   ExportCancelled,validate_timeline,length,normalize_markers,edited_clip,retime_keyframes,retime_volume_keyframes,retime_speed_keyframes,
-                  normalize_track_states,normalize_track_names,normalize_master_mixer,slip_clip,roll_edit,slide_edit,retime_tracking_keyframes,retime_auto_reframe_keyframes,retime_mask_path_keyframes)
+                  normalize_track_states,normalize_track_names,normalize_master_mixer,slip_clip,roll_edit,slide_edit,retime_tracking_keyframes,retime_auto_reframe_keyframes,retime_mask_path_keyframes,
+                  cut_clip_ranges,split_clip_at_times,build_auto_cut_points,mask_path_keyframes_from_tracking)
 from timeline import Timeline,MediaList
 from style import STYLE
 from update_system import (configured_manifest_url,download_verified,fetch_manifest,
                            install_downloaded,preferred_kinds,select_artifact,update_cache_directory,
                            update_checks_disabled)
-from transcription import transcribe_media
-from ai_tools import AIToolError, remove_background_media, track_motion, auto_reframe_video, analyze_beats
+from transcription import transcribe_media, build_text_edit_plan
+from ai_tools import (AIToolError, remove_background_media, track_motion, auto_reframe_video,
+                       analyze_beats, detect_scene_changes, detect_audio_onset)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.18.0'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.19.0'
 except OSError:
-    APP_VERSION = '3.18.0'
+    APP_VERSION = '3.19.0'
 
 
 def label(text,name=None):
@@ -1113,6 +1115,7 @@ class Editor(QMainWindow):
         self.background_clear_button=button('Freistellung zurücksetzen',self.clear_background_removal)
         self.background_remove_status=label('Noch keine Freistellung erzeugt.','muted'); self.background_remove_status.setWordWrap(True)
         self.track_motion_button=button('Motion-Tracking starten',self.start_motion_tracking)
+        self.mask_track_button=button('Bezier-Maske verfolgen',self.start_mask_tracking)
         self.clear_tracking_button=button('Tracking löschen',self.clear_motion_tracking)
         self.tracking_status=label('Kein Tracking vorhanden.','muted'); self.tracking_status.setWordWrap(True)
         self.auto_reframe_enabled=QCheckBox('Auto-Reframe verwenden')
@@ -1177,6 +1180,13 @@ class Editor(QMainWindow):
         self.beat_analyze_button=button('Beats analysieren',self.start_beat_analysis)
         self.beat_clear_button=button('Beats löschen',self.clear_beat_markers)
         self.beat_status=label('Keine Beat-Marker vorhanden.','muted'); self.beat_status.setWordWrap(True)
+        self.text_cut_button=button('Textschnitt starten',self.start_text_based_cut)
+        self.text_cut_status=label('Pausen und Füllwörter werden lokal entfernt.','muted'); self.text_cut_status.setWordWrap(True)
+        self.auto_cut_button=button('Beat-/Szenen-Auto-Cut',self.start_auto_cut)
+        self.auto_cut_status=label('Noch kein automatischer Schnitt.','muted'); self.auto_cut_status.setWordWrap(True)
+        self.multicam_sync_button=button('Multi-Kamera synchronisieren',self.sync_multicam)
+        self.multicam_switch_button=button('Als aktive Kamera verwenden',self.switch_multicam_angle)
+        self.multicam_status=label('Keine Multi-Kamera-Gruppe.','muted'); self.multicam_status.setWordWrap(True)
         form.setVerticalSpacing(4)
         color_row=QHBoxLayout(); color_row.setContentsMargins(0,0,0,0); color_row.addWidget(self.text_color,1); color_row.addWidget(self.text_palette_button)
         for name,widget in [('Spur',self.track_combo),('Position',self.position),('Quellstart',self.start),('Quellende',self.end),('Geschwindigkeit',self.speed),('Freeze-Frame',self.freeze_enabled),('Freeze-Dauer',self.freeze_duration),('Reverse',self.reverse_clip),('Einblenden',self.fade_in),('Ausblenden',self.fade_out),('Lautstärke',self.volume),('Text',self.text_value),('Textgröße',self.text_size),('Schrift',self.text_font)]:form.addRow(name,widget)
@@ -1207,6 +1217,11 @@ class Editor(QMainWindow):
         audio_form.addRow('Audio-Ducking',self.audio_ducking); audio_form.addRow('Sprachisolierung',self.audio_voice_isolation); audio_form.addRow('Kanäle',self.audio_channel_mode); audio_form.addRow('Panorama',self.audio_pan)
         beat_buttons=QHBoxLayout(); beat_buttons.setContentsMargins(0,0,0,0); beat_buttons.addWidget(self.beat_analyze_button,1); beat_buttons.addWidget(self.beat_clear_button,1)
         audio_form.addRow('Beat-Sync',beat_buttons); audio_form.addRow('',self.beat_status)
+        audio_form.addRow('Textschnitt',self.text_cut_button); audio_form.addRow('',self.text_cut_status)
+        auto_cut_row=QHBoxLayout(); auto_cut_row.setContentsMargins(0,0,0,0); auto_cut_row.addWidget(self.auto_cut_button,1)
+        audio_form.addRow('Auto-Cut',auto_cut_row); audio_form.addRow('',self.auto_cut_status)
+        multicam_row=QHBoxLayout(); multicam_row.setContentsMargins(0,0,0,0); multicam_row.addWidget(self.multicam_sync_button,1); multicam_row.addWidget(self.multicam_switch_button,1)
+        audio_form.addRow('Multi-Kamera',multicam_row); audio_form.addRow('',self.multicam_status)
         il.addWidget(label('AUDIO · MIX UND KANÄLE','heading')); il.addLayout(audio_form)
         il.addWidget(label('BILDTRANSFORMATION','heading')); il.addLayout(transform_form)
         color_form=QFormLayout(); color_form.addRow('Helligkeit',self.brightness); color_form.addRow('Kontrast',self.contrast); color_form.addRow('Sättigung',self.saturation); color_form.addRow('Filter',self.filter_preset)
@@ -1232,6 +1247,7 @@ class Editor(QMainWindow):
         ai_form=QFormLayout()
         background_buttons=QHBoxLayout(); background_buttons.setContentsMargins(0,0,0,0); background_buttons.addWidget(self.background_remove_button,1); background_buttons.addWidget(self.background_clear_button,1)
         tracking_buttons=QHBoxLayout(); tracking_buttons.setContentsMargins(0,0,0,0); tracking_buttons.addWidget(self.track_motion_button,1); tracking_buttons.addWidget(self.clear_tracking_button,1)
+        tracking_buttons.addWidget(self.mask_track_button,1)
         auto_reframe_buttons=QHBoxLayout(); auto_reframe_buttons.setContentsMargins(0,0,0,0); auto_reframe_buttons.addWidget(self.auto_reframe_button,1); auto_reframe_buttons.addWidget(self.auto_reframe_clear_button,1)
         ai_form.addRow('Hintergrund',background_buttons); ai_form.addRow('',self.background_removal_enabled); ai_form.addRow('',self.background_remove_status)
         ai_form.addRow('Tracking',tracking_buttons); ai_form.addRow('',self.tracking_status); ai_form.addRow('Objekt entfernen',self.object_removal_enabled)
@@ -1303,6 +1319,13 @@ class Editor(QMainWindow):
         more_menu.addSeparator()
         more_menu.addAction('Gruppieren · Strg+G',self.group_selection)
         more_menu.addAction('Gruppe lösen · Strg+Shift+G',self.ungroup_selection)
+        more_menu.addAction('Compound-Clip erstellen',self.create_compound)
+        more_menu.addAction('Compound-Clip auflösen',self.dissolve_compound)
+        more_menu.addSeparator()
+        more_menu.addAction('Multi-Kamera synchronisieren',self.sync_multicam)
+        more_menu.addAction('Aktive Kamera wechseln',self.switch_multicam_angle)
+        more_menu.addAction('Textschnitt · Pausen/Füllwörter',self.start_text_based_cut)
+        more_menu.addAction('Beat-/Szenen-Auto-Cut',self.start_auto_cut)
         more_button=timeline_menu_button('⋯','Weitere Timeline-Aktionen',more_menu,'view-more')
 
         bar.addWidget(timeline_tool_group('VERLAUF',[undo_button,redo_button]))
@@ -1481,6 +1504,10 @@ class Editor(QMainWindow):
                 menu.addAction('Gruppieren',self.group_selection)
             if any(value.group_id for value in self.selected_clips()):
                 menu.addAction('Gruppe lösen',self.ungroup_selection)
+            if len(self.selected_clips()) >= 2:
+                menu.addAction('Compound-Clip erstellen',self.create_compound)
+            if any(value.compound_id for value in self.selected_clips()):
+                menu.addAction('Compound-Clip auflösen',self.dissolve_compound)
             menu.addSeparator()
             if clip.kind!='text' and clip.source_type!='adjustment':
                 menu.addAction('▶ Clip ansehen',self.source_preview)
@@ -1512,6 +1539,8 @@ class Editor(QMainWindow):
                     ai_menu.addAction('Freistellung deaktivieren',self.clear_background_removal)
                 ai_menu.addSeparator()
                 ai_menu.addAction('Motion-Tracking starten',self.start_motion_tracking).setEnabled(clip.source_type=='video')
+                ai_menu.addAction('Bezier-Maske automatisch verfolgen',self.start_mask_tracking).setEnabled(
+                    clip.source_type=='video' and clip.mask_type=='bezier' and len(clip.mask_points)>=3)
                 if clip.tracking_keyframes:
                     ai_menu.addAction('Tracking löschen',self.clear_motion_tracking)
                 ai_menu.addAction('Auto-Reframe analysieren',self.start_auto_reframe).setEnabled(clip.source_type=='video')
@@ -1521,8 +1550,13 @@ class Editor(QMainWindow):
             if clip.kind in ('video','audio') and clip.has_audio and clip.source_type != 'adjustment':
                 beat_menu=menu.addMenu('Beat-Sync')
                 beat_menu.addAction('Beats analysieren',self.start_beat_analysis)
+                beat_menu.addAction('Textbasierter Schnitt · Pausen/Füllwörter',self.start_text_based_cut)
+                if clip.kind == 'video' and clip.source_type == 'video':
+                    beat_menu.addAction('Beat-/Szenen-Auto-Cut',self.start_auto_cut)
                 if any(marker.get('kind') == 'beat' for marker in self.markers):
                     beat_menu.addAction('Beat-Marker löschen',self.clear_beat_markers)
+            if clip.multicam_group:
+                menu.addAction('Als aktive Kamera verwenden',self.switch_multicam_angle)
             speed_menu=None
             if clip.kind in ('video','audio') and clip.source_type!='adjustment':
                 speed_menu=menu.addMenu('Geschwindigkeit')
@@ -1688,8 +1722,10 @@ class Editor(QMainWindow):
                 result.append(uid)
         if expand_groups:
             groups = {available[uid].group_id for uid in result if available[uid].group_id}
+            compounds = {available[uid].compound_id for uid in result if available[uid].compound_id}
             for clip in self.clips:
-                if clip.group_id in groups and clip.uid not in result:
+                if ((clip.group_id in groups and clip.group_id)
+                        or (clip.compound_id in compounds and clip.compound_id)) and clip.uid not in result:
                     result.append(clip.uid)
         self.selection = result
         self.current = anchor if anchor in result else (result[-1] if result else None)
@@ -1729,7 +1765,7 @@ class Editor(QMainWindow):
                 self.saturation,self.filter_preset,self.effect_preset,self.effect_preset_apply_button,self.lut_path,self.lut_browse_button,self.opacity,self.blur,self.sharpen,self.stabilization,
                 self.chroma_key_enabled,self.chroma_key_color,self.chroma_key_similarity,self.chroma_key_blend,
                 self.background_removal_enabled,self.background_remove_button,self.background_clear_button,
-                self.track_motion_button,self.clear_tracking_button,self.object_removal_enabled,
+                self.track_motion_button,self.mask_track_button,self.clear_tracking_button,self.object_removal_enabled,
                 self.auto_reframe_enabled,self.auto_reframe_format,self.auto_reframe_button,self.auto_reframe_clear_button,
                 self.mask_type,self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather,self.mask_points,
                 self.mask_points_apply,self.mask_path_time,self.mask_path_list,self.mask_path_set_button,self.mask_path_remove_button,
@@ -1737,6 +1773,7 @@ class Editor(QMainWindow):
                 *self.color_wheel_spins.values(),
                 self.keyframe_graph_property,self.keyframe_graph,
                 self.beat_analyze_button,self.beat_clear_button,
+                self.text_cut_button,self.auto_cut_button,self.multicam_sync_button,self.multicam_switch_button,
                 self.transition_type,self.transition_duration,
                 self.keyframe_time,self.keyframe_curve,self.keyframe_list,self.keyframe_set_button,self.keyframe_remove_button,
                 self.volume_keyframe_time,self.volume_keyframe_curve,self.volume_keyframe_list,self.volume_keyframe_set_button,
@@ -1755,6 +1792,8 @@ class Editor(QMainWindow):
             return []
         minimum = min(clip.position for clip in self.clipboard)
         group_map = {}
+        compound_map = {}
+        multicam_map = {}
         candidates = []
         for clip in self.clipboard:
             track = clip.track
@@ -1768,7 +1807,14 @@ class Editor(QMainWindow):
             group_id = ''
             if clip.group_id:
                 group_id = group_map.setdefault(clip.group_id, uuid.uuid4().hex)
-            candidates.append(self._clone_clip(clip, group_id=group_id))
+            value = self._clone_clip(clip, group_id=group_id)
+            compound_id = ''
+            if clip.compound_id:
+                compound_id = compound_map.setdefault(clip.compound_id, uuid.uuid4().hex)
+            multicam_group = ''
+            if clip.multicam_group:
+                multicam_group = multicam_map.setdefault(clip.multicam_group, uuid.uuid4().hex)
+            candidates.append(replace(value,compound_id=compound_id,multicam_group=multicam_group))
             candidates[-1] = replace(candidates[-1], position=max(0.0, anchor + clip.position - minimum), track=track)
         return candidates
 
@@ -1862,6 +1908,93 @@ class Editor(QMainWindow):
         selected = {clip.uid for clip in grouped}
         self.checkpoint(); self.clips = [replace(clip, group_id='') if clip.uid in selected else clip for clip in self.clips]
         self.changed(); self.statusBar().showMessage('Gruppe gelöst.',3000)
+
+    def create_compound(self):
+        clips=self.selected_clips()
+        if len(clips)<2:
+            return self.statusBar().showMessage('Wähle mindestens zwei Clips für einen Compound-Clip.',3000)
+        if self.selection_locked():
+            return self.statusBar().showMessage('Eine ausgewählte Spur ist gesperrt.',3000)
+        name,ok=QInputDialog.getText(self,'Compound-Clip erstellen','Name:',text='Compound Clip')
+        if not ok or not name.strip():
+            return
+        compound_id=uuid.uuid4().hex; selected={clip.uid for clip in clips}; name=name.strip()[:48]
+        self.checkpoint()
+        self.clips=[replace(clip,compound_id=compound_id,compound_name=name) if clip.uid in selected else clip for clip in self.clips]
+        self.changed(); self.statusBar().showMessage(f'Compound-Clip „{name}“ · {len(clips)} Clips gebündelt.',4000)
+
+    def dissolve_compound(self):
+        clips=self.selected_clips()
+        compounds={clip.compound_id for clip in clips if clip.compound_id}
+        if not compounds:
+            return self.statusBar().showMessage('Die Auswahl enthält keinen Compound-Clip.',3000)
+        if self.selection_locked():
+            return self.statusBar().showMessage('Eine ausgewählte Spur ist gesperrt.',3000)
+        self.checkpoint()
+        self.clips=[replace(clip,compound_id='',compound_name='') if clip.compound_id in compounds else clip for clip in self.clips]
+        self.changed(); self.statusBar().showMessage('Compound-Clip gelöst · Einzelclips bleiben erhalten.',4000)
+
+    def sync_multicam(self):
+        clips=self.selected_clips()
+        if len(clips)<2 or any(clip.kind!='video' or clip.source_type!='video' for clip in clips):
+            return self.error('Wähle mindestens zwei normale Videoclips für Multi-Kamera.')
+        if any(not clip.has_audio for clip in clips):
+            return self.error('Für die Multi-Kamera-Synchronisation braucht jeder Winkel eine Audiospur.')
+        if len({clip.track for clip in clips}) != len(clips):
+            return self.error('Lege jeden Kamera-Winkel auf eine eigene Videospur.')
+        if any(self.track_locked(clip.track) for clip in clips):
+            return self.error('Eine ausgewählte Kamera-Spur ist gesperrt.')
+        selected=[replace(clip) for clip in clips]; group_id=uuid.uuid4().hex
+        def operation(progress,cancel):
+            offsets={}
+            for index,clip in enumerate(selected):
+                if cancel.is_set():
+                    raise ExportCancelled()
+                value=detect_audio_onset(clip.path,clip.start,clip.end,
+                                         lambda item,base=index:progress(int((base+item/100)/len(selected)*100)),cancel)
+                offsets[clip.uid]=float(value)
+            target=max(clip.position+offsets[clip.uid] for clip in selected)
+            return {'offsets':offsets,'target':target}
+        self.start_job('Multi-Kamera wird per Audio synchronisiert …',operation,
+                       lambda result:self.multicam_sync_done(result,selected,group_id))
+
+    def multicam_sync_done(self,result,selected,group_id):
+        if not result['ok']:
+            return self.job_error(result)
+        current={clip.uid:clip for clip in self.clips}
+        if any(clip.uid not in current for clip in selected):
+            return self.statusBar().showMessage('Eine Kamera wurde während der Analyse entfernt.',5000)
+        offsets=result['value']['offsets']; target=float(result['value']['target'])
+        try:
+            proposed=[]
+            for value in self.clips:
+                match=next((clip for clip in selected if clip.uid==value.uid),None)
+                if match is None:
+                    proposed.append(value); continue
+                position=max(0.0,round(target-float(offsets.get(value.uid,0.0)),6))
+                angle=f'Angle {selected.index(match)+1}'
+                proposed.append(replace(value,position=position,multicam_group=group_id,
+                                        camera_angle=angle,multicam_active=selected.index(match)==0))
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.selection=[clip.uid for clip in selected]; self.current=selected[0].uid; self.changed()
+            self.statusBar().showMessage(f'Multi-Kamera synchronisiert · {len(selected)} Winkel · {target:.2f} s Referenz.',6000)
+        except Exception as exc:
+            self.error(exc)
+
+    def switch_multicam_angle(self):
+        c=self.current_clip()
+        if not c or not c.multicam_group:
+            return self.error('Wähle einen Clip aus einer Multi-Kamera-Gruppe.')
+        members=[value for value in self.clips if value.multicam_group==c.multicam_group]
+        if any(self.track_locked(value.track) for value in members):
+            return self.error('Eine Kamera-Spur ist gesperrt.')
+        proposed=[replace(value,multicam_active=(value.uid==c.uid)) if value.multicam_group==c.multicam_group else value for value in self.clips]
+        try:
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
+            self.statusBar().showMessage(f'{c.camera_angle or "Kamera"} ist jetzt aktiv.',4000)
+        except Exception as exc:
+            self.error(exc)
 
     def _insert_candidates_ripple(self, candidates):
         if not candidates:
@@ -2026,14 +2159,21 @@ class Editor(QMainWindow):
             ('Textclip hinzufügen', '+ Text', self.add_text),
             ('Adjustment-Layer hinzufügen', '+ Adjustment-Layer', self.add_adjustment_layer),
             ('Automatische Untertitel erstellen', '—', self.automatic_subtitle_dialog),
+            ('Textbasierter Schnitt · Pausen und Füllwörter entfernen', '—', self.start_text_based_cut),
             ('KI-Hintergrund entfernen', '—', self.start_background_removal),
             ('Motion-Tracking starten', '—', self.start_motion_tracking),
+            ('Bezier-Maske automatisch verfolgen', '—', self.start_mask_tracking),
             ('Tracking löschen', '—', self.clear_motion_tracking),
             ('KI-Auto-Reframe analysieren', '—', self.start_auto_reframe),
             ('Auto-Reframe löschen', '—', self.clear_auto_reframe),
             ('Beat-Sync analysieren', '—', self.start_beat_analysis),
+            ('Beat-/Szenen-Auto-Cut', '—', self.start_auto_cut),
             ('Beat-Marker löschen', '—', self.clear_beat_markers),
             ('Objektentfernung aktivieren', '—', lambda: self.set_object_removal_enabled(True)),
+            ('Compound-Clip erstellen', '—', self.create_compound),
+            ('Compound-Clip auflösen', '—', self.dissolve_compound),
+            ('Multi-Kamera synchronisieren', '—', self.sync_multicam),
+            ('Als aktive Kamera verwenden', '—', self.switch_multicam_angle),
             ('Audio-Mixer öffnen', '—', self.open_mixer),
             ('Render-Queue öffnen', '—', self.show_render_queue),
             ('Timeline einpassen', '—', self.fit_timeline),
@@ -2288,6 +2428,8 @@ class Editor(QMainWindow):
 
     def mask_type_changed(self, *_):
         enabled=self.mask_type.currentData() == 'bezier' and bool(self.current_clip() and self.current_clip().kind == 'video')
+        clip=self.current_clip()
+        self.mask_track_button.setEnabled(enabled and bool(clip and clip.source_type == 'video') and not self.worker)
         for field in (self.mask_points,self.mask_points_apply,self.mask_path_time,self.mask_path_list,
                       self.mask_path_set_button,self.mask_path_remove_button):
             field.setEnabled(enabled and not self.worker)
@@ -2556,6 +2698,7 @@ class Editor(QMainWindow):
         self.background_clear_button.setEnabled(background_source and bool(c.background_removed_path))
         self.background_removal_enabled.setEnabled(background_source and bool(c.background_removed_path))
         self.track_motion_button.setEnabled(tracking_source)
+        self.mask_track_button.setEnabled(tracking_source and c.mask_type == 'bezier' and len(c.mask_points) >= 3)
         self.clear_tracking_button.setEnabled(tracking_source and bool(c.tracking_keyframes))
         auto_reframe_source = tracking_source
         self.auto_reframe_enabled.setEnabled(auto_reframe_source)
@@ -2563,6 +2706,10 @@ class Editor(QMainWindow):
         self.auto_reframe_button.setEnabled(auto_reframe_source)
         self.auto_reframe_clear_button.setEnabled(auto_reframe_source and bool(c.auto_reframe_keyframes))
         self.object_removal_enabled.setEnabled(is_video and not is_adjustment)
+        self.text_cut_button.setEnabled(is_audioable and c.source_type in ('video','audio') and not self.worker)
+        self.auto_cut_button.setEnabled(is_video and c.source_type == 'video' and not self.worker)
+        self.multicam_sync_button.setEnabled(False)
+        self.multicam_switch_button.setEnabled(is_video and bool(c.multicam_group) and not self.worker)
         for field in (self.keyframe_time,self.keyframe_curve,self.keyframe_list,self.keyframe_set_button,self.keyframe_remove_button,
                       self.keyframe_graph_property,self.keyframe_graph): field.setEnabled(is_video and not is_adjustment)
         for field in (self.volume_keyframe_time,self.volume_keyframe_curve,self.volume_keyframe_list,self.volume_keyframe_set_button,self.volume_keyframe_remove_button): field.setEnabled(is_audioable)
@@ -2675,6 +2822,16 @@ class Editor(QMainWindow):
         self.beat_analyze_button.setEnabled(is_audioable and not self.worker)
         self.beat_clear_button.setEnabled(beat_count > 0 and not self.worker)
         self.beat_status.setText(f'{beat_count} Beat-Marker vorhanden.' if beat_count else 'Keine Beat-Marker vorhanden.')
+        self.text_cut_status.setText('Pausen und Füllwörter werden lokal entfernt.' if is_audioable else 'Wähle ein Video oder Audio mit Ton.')
+        self.auto_cut_status.setText('Beat- und Szenenpunkte werden lokal erkannt.' if is_video else 'Wähle einen normalen Videoclip.')
+        if c.multicam_group:
+            members=[value for value in self.clips if value.multicam_group == c.multicam_group]
+            active=next((value for value in members if value.multicam_active), None)
+            self.multicam_status.setText(
+                f'{len(members)} Winkel · aktiv: {active.camera_angle or "unbenannt"}' if active
+                else f'{len(members)} Winkel · kein aktiver Winkel')
+        else:
+            self.multicam_status.setText('Keine Multi-Kamera-Gruppe.')
 
     def select_clip(self,uid):
         if uid!=self.current and self.mode=='source':
@@ -3267,6 +3424,13 @@ class Editor(QMainWindow):
         self.start_job('Lokales Motion-Tracking wird berechnet …',operation,
                        lambda result:self.motion_tracking_done(result,uid))
 
+    def start_mask_tracking(self):
+        """Track a Bezier mask through the same local object tracker."""
+        c=self.current_clip()
+        if not c or c.kind!='video' or c.source_type!='video' or c.mask_type!='bezier' or len(c.mask_points)<3:
+            return self.error('Wähle eine Bezier-Maske mit mindestens drei Punkten.')
+        self.start_motion_tracking()
+
     def motion_tracking_done(self,result,uid):
         if not result['ok']:
             return self.job_error(result)
@@ -3291,10 +3455,13 @@ class Editor(QMainWindow):
                 unique.append(point)
         try:
             candidate=replace(c,tracking_keyframes=unique)
+            if c.mask_type == 'bezier' and len(c.mask_points) >= 3:
+                candidate=replace(candidate,mask_path_keyframes=mask_path_keyframes_from_tracking(candidate))
             proposed=[candidate if value.uid==uid else value for value in self.clips]
             validate_timeline(proposed,self.tracks)
             self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
-            self.statusBar().showMessage(f'Motion-Tracking fertig · {len(unique)} Punkte gespeichert.',6000)
+            extra=' · Bezier-Maske animiert' if candidate.mask_path_keyframes else ''
+            self.statusBar().showMessage(f'Motion-Tracking fertig · {len(unique)} Punkte gespeichert.{extra}',6000)
         except Exception as exc:
             self.error(exc)
 
@@ -3400,6 +3567,104 @@ class Editor(QMainWindow):
         except Exception as exc:
             self.error(exc)
 
+    def start_text_based_cut(self):
+        """Transcribe one clip locally and remove pauses/filler words."""
+        c=self.current_clip()
+        if not c or c.kind not in ('video','audio') or c.source_type not in ('video','audio') or not c.has_audio:
+            return self.error('Wähle ein Video oder Audio mit Ton für den Textschnitt.')
+        if self.worker or not self.require_unlocked(c):
+            return
+        source=Path(c.path).expanduser().resolve(); uid=c.uid
+        if not source.is_file():
+            return self.error(f'Die Quelldatei wurde nicht gefunden:\n{source}')
+        divisor=max(.25,float(c.speed))
+
+        def operation(progress,cancel):
+            payload=transcribe_media(source,model_size='base',language='auto',
+                                     cache_dir=self.state_dir/'whisper-models',
+                                     progress=progress,cancel=cancel)
+            mapped=[]
+            for cue in payload.get('cues',[]):
+                try:
+                    source_start=float(cue['start']); source_end=float(cue['end'])
+                except (KeyError,TypeError,ValueError):
+                    continue
+                if source_end <= c.start+1e-7 or source_start >= c.end-1e-7:
+                    continue
+                local_start=max(c.start,source_start)-c.start
+                local_end=min(c.end,source_end)-c.start
+                item=dict(cue,start=round(local_start/divisor,6),end=round(local_end/divisor,6))
+                words=[]
+                for word in cue.get('words',[]):
+                    try:
+                        word_start=max(c.start,float(word['start']))-c.start
+                        word_end=min(c.end,float(word['end']))-c.start
+                    except (KeyError,TypeError,ValueError):
+                        continue
+                    if word_end > 0 and word_start < c.end-c.start:
+                        words.append(dict(word,start=round(max(0,word_start)/divisor,6),
+                                          end=round(max(0,word_end)/divisor,6)))
+                if words: item['words']=words
+                mapped.append(item)
+            plan=build_text_edit_plan(mapped,c.length)
+            plan['language']=payload.get('language','auto')
+            plan['cue_count']=len(mapped)
+            return plan
+        self.start_job('Textbasierter Schnitt wird lokal analysiert …',operation,
+                       lambda result:self.text_based_cut_done(result,uid))
+
+    def text_based_cut_done(self,result,uid):
+        if not result['ok']:
+            return self.job_error(result)
+        c=next((value for value in self.clips if value.uid==uid),None)
+        if not c:
+            return self.statusBar().showMessage('Clip wurde während der Textanalyse entfernt.',5000)
+        plan=result['value']
+        removed=float(plan.get('removed_seconds',0.0))
+        if removed < .06:
+            return self.error('Keine längeren Pausen oder Füllwörter erkannt.')
+        try:
+            segments=cut_clip_ranges(c,plan.get('keep_ranges',[]))
+            old_finish=c.finish
+            actual_removed=max(0.0,c.length-sum(value.length for value in segments))
+            if actual_removed < .01:
+                return self.error('Der Textschnitt hat keine verwertbare Änderung gefunden.')
+            removed_ranges=[(float(start),float(end)) for start,end in plan.get('removed_ranges',[])]
+
+            def compact_marker_time(time):
+                time=float(time)
+                if time < c.position-1e-7:
+                    return time
+                if time > old_finish+1e-7:
+                    return max(0.0,time-actual_removed)
+                local=max(0.0,min(c.length,time-c.position)); shift=0.0
+                for start,end in removed_ranges:
+                    if local >= end:
+                        shift += end-start
+                    elif local > start:
+                        local=start; break
+                return c.position+max(0.0,local-shift)
+
+            proposed=[]
+            for value in self.clips:
+                if value.uid==uid:
+                    continue
+                if value.track==c.track and value.position >= old_finish-1e-6:
+                    proposed.append(replace(value,position=max(0.0,value.position-actual_removed)))
+                else:
+                    proposed.append(value)
+            proposed.extend(segments)
+            markers=[dict(marker,time=round(compact_marker_time(marker['time']),6)) for marker in self.markers]
+            normalized_markers=normalize_markers(markers,length(proposed))
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.markers=normalized_markers
+            self.selection=[value.uid for value in segments]; self.current=segments[-1].uid; self.changed()
+            self.statusBar().showMessage(
+                f'Textschnitt fertig · {actual_removed:.2f} s entfernt · '
+                f'{plan.get("filler_segments",0)} Füllwort-Segmente · {len(segments)} Teile',7000)
+        except Exception as exc:
+            self.error(exc)
+
     def clear_beat_markers(self):
         if self.worker:
             return
@@ -3407,6 +3672,57 @@ class Editor(QMainWindow):
         if len(markers) == len(self.markers):
             return
         self.checkpoint(); self.markers=normalize_markers(markers,length(self.clips)); self.changed()
+
+    def start_auto_cut(self):
+        """Find beats and hard scene changes, then split at useful points."""
+        c=self.current_clip()
+        if not c or c.kind!='video' or c.source_type!='video':
+            return self.error('Wähle einen normalen Videoclip für Beat-/Szenen-Auto-Cut.')
+        if self.worker or not self.require_unlocked(c):
+            return
+        uid=c.uid; divisor=max(.25,float(c.speed))
+        def operation(progress,cancel):
+            try:
+                if c.has_audio:
+                    beat_data=analyze_beats(c.path,c.start,c.end,
+                                            lambda value:progress(int(value*.45)),cancel)
+                else:
+                    beat_data={'beats':[],'bpm':0.0}
+                    progress(45)
+                scenes=detect_scene_changes(c.path,c.start,c.end,
+                                            lambda value:progress(45+int(value*.55)),cancel)
+                points=build_auto_cut_points(beat_data,scenes,c.length)
+                return {'points':[round(float(value)/divisor,6) for value in points],
+                        'beats':len(beat_data.get('beats',[])), 'scenes':len(scenes),
+                        'bpm':beat_data.get('bpm',0.0)}
+            except AIToolError:
+                if cancel.is_set():
+                    raise ExportCancelled()
+                raise
+        self.start_job('Beats und Szenen werden lokal analysiert …',operation,
+                       lambda result:self.auto_cut_done(result,uid))
+
+    def auto_cut_done(self,result,uid):
+        if not result['ok']:
+            return self.job_error(result)
+        c=next((value for value in self.clips if value.uid==uid),None)
+        if not c:
+            return self.statusBar().showMessage('Clip wurde während des Auto-Cuts entfernt.',5000)
+        payload=result['value']; points=payload.get('points',[])
+        if not points:
+            return self.error('Keine stabilen Beat- oder Szenen-Schnittpunkte erkannt.')
+        try:
+            segments=split_clip_at_times(c,points)
+            if len(segments)<2:
+                return self.error('Die erkannten Punkte liegen zu dicht für einen sichtbaren Schnitt.')
+            proposed=[value for value in self.clips if value.uid!=uid]+segments
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.selection=[value.uid for value in segments]; self.current=segments[-1].uid; self.changed()
+            self.statusBar().showMessage(
+                f'Beat-/Szenen-Auto-Cut fertig · {len(segments)-1} Schnitte · '
+                f'{payload.get("beats",0)} Beats · {payload.get("scenes",0)} Szenen',7000)
+        except Exception as exc:
+            self.error(exc)
 
     def clear_motion_tracking(self):
         c=self.current_clip()
@@ -4601,7 +4917,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.18.0-Fenster.');return 1
+                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.19.0-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

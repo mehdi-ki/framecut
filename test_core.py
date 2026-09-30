@@ -13,7 +13,8 @@ from core import (Clip,import_clip,import_image_sequence,parse_subtitle_file,sub
                   audio_effect_filters,tracking_expression,auto_reframe_expression,auto_reframe_aspect,normalize_export_settings,resolve_export_encoder,
                   relink_project_media,archive_project,extract_project_archive,create_proxy_files,
                   PROXY_PROFILES,proxy_path_for,cache_size,prune_cache,preview_acceleration_info,normalize_markers,
-                  normalize_master_mixer,master_audio_filters,EFFECT_PRESETS,TRANSITION_TYPES,KEYFRAME_CURVES,color_grading_filters)
+                  normalize_master_mixer,master_audio_filters,EFFECT_PRESETS,TRANSITION_TYPES,KEYFRAME_CURVES,color_grading_filters,
+                  cut_clip_ranges,split_clip_at_times,build_auto_cut_points,mask_path_keyframes_from_tracking)
 from ai_tools import analyze_beats
 
 
@@ -672,6 +673,44 @@ class EditorCoreTest(unittest.TestCase):
         finally:timer.cancel()
         self.assertEqual(target.read_bytes(),b'keep-me')
         self.assertFalse(list(self.root.glob('.framecut-render-*')))
+
+    def test_step11_text_cut_auto_cut_tracking_mask_and_roundtrip(self):
+        clip=replace(import_clip(self.blue),end=3,position=2,track=1)
+        segments=cut_clip_ranges(clip,[(0,.8),(1.35,2.25)])
+        self.assertEqual(len(segments),2)
+        self.assertAlmostEqual(segments[0].position,2)
+        self.assertAlmostEqual(segments[1].position,2+segments[0].length,places=5)
+        validate_timeline(segments,self.tracks)
+        auto=split_clip_at_times(replace(clip,position=0),[.8,1.6])
+        self.assertEqual(len(auto),3)
+        self.assertAlmostEqual(sum(value.length for value in auto),clip.length,places=5)
+        points=build_auto_cut_points({'beats':[.4,.8,1.2,1.6]},[.82,2.1],3,min_gap=.35)
+        self.assertEqual(points,[.4,.8,1.2,1.6,2.1])
+
+        mask_points=[{'x':.1,'y':.1},{'x':.6,'y':.1},{'x':.9,'y':.8}]
+        tracked=replace(clip,mask_type='bezier',mask_points=mask_points,
+                        mask_x=.1,mask_y=.1,mask_width=.8,mask_height=.7,
+                        tracking_keyframes=[{'time':0,'x':.1,'y':.1,'width':.8,'height':.7},
+                                            {'time':1,'x':.2,'y':.15,'width':.8,'height':.7}])
+        path=mask_path_keyframes_from_tracking(tracked)
+        self.assertEqual(len(path),2)
+        self.assertGreater(path[1]['points'][0]['x'],path[0]['points'][0]['x'])
+        validate_timeline([tracked],self.tracks)
+
+    def test_step11_compound_and_multicam_roundtrip_and_render(self):
+        first=replace(import_clip(self.blue),end=1.5,track=1,compound_id='compound-a',compound_name='Interview',
+                      multicam_group='camera-a',camera_angle='Angle 1',multicam_active=False)
+        second=replace(import_clip(self.red),end=.8,track=2,compound_id='compound-a',compound_name='Interview',
+                       multicam_group='camera-a',camera_angle='Angle 2',multicam_active=True)
+        validate_timeline([first,second],self.tracks)
+        target=self.root/'step11-multicam.mp4';render([first,second],self.tracks,target,(320,180))
+        self.assertTrue(probe(target)[1]);ff('-i',target,'-f','null','-')
+        project=self.root/'step11-compound-multicam.framecut'
+        save_project(project,[first,second],'720p · 16:9',self.tracks)
+        loaded=load_project(project)['clips']
+        self.assertEqual({value.compound_name for value in loaded},{'Interview'})
+        self.assertEqual(sum(value.multicam_active for value in loaded),1)
+        self.assertEqual({value.camera_angle for value in loaded},{'Angle 1','Angle 2'})
 
 
 if __name__=='__main__':unittest.main()

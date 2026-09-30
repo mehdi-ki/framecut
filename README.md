@@ -1,4 +1,4 @@
-# Framecut 3.18.0 — Bezier-Masken, Color-Grading, Keyframe-Kurven und Beat-Sync
+# Framecut 3.19.0 — Textschnitt, Multi-Kamera, Compound-Clips und Auto-Cut
 
 Native Linux-Videoschnitt-App mit einer CapCut-ähnlichen Anordnung. Eigener Code,
 keine CapCut-Kopie. Python/PySide6 mit lokalem FFmpeg-Export und optionaler lokaler
@@ -8,7 +8,7 @@ Whisper-Spracherkennung für automatische Untertitel.
 
 1. Framecut 0.1 schließen und die bisherigen Projekte speichern.
 2. Dieses ZIP in einen **neuen Ordner** entpacken. Version 0.1 als Rückfall behalten.
-3. Den Ordner `Framecut-3.18.0` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
+3. Den Ordner `Framecut-3.19.0` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
 4. Rechtsklick auf eine freie Stelle → „Im Terminal öffnen“.
 5. Ausführen:
 
@@ -17,14 +17,14 @@ Whisper-Spracherkennung für automatische Untertitel.
    ```
 
 Für eine Desktop-Installation kannst du stattdessen `bash install.sh` ausführen.
-Der Installer legt Framecut unter `~/.local/share/framecut/3.18.0` ab und erstellt
+Der Installer legt Framecut unter `~/.local/share/framecut/3.19.0` ab und erstellt
 den Starter `~/.local/bin/framecut` sowie einen Eintrag im Anwendungsmenü.
 
-## Linux-Auslieferung 3.18.0
+## Linux-Auslieferung 3.19.0
 
 Das Quellpaket enthält jetzt drei reproduzierbare Auslieferungswege:
 
-- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.18.0_amd64.deb`. Installation mit `sudo apt install ./framecut_3.18.0_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.18.0/.venv` an; FFmpeg und Python bleiben systemweit.
+- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.19.0_amd64.deb`. Installation mit `sudo apt install ./framecut_3.19.0_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.19.0/.venv` an; FFmpeg und Python bleiben systemweit.
 - **AppImage:** `bash build_appimage.sh` erzeugt aus der vorbereiteten `Framecut.AppDir` ein echtes Type-2-AppImage, sobald das offizielle `appimagetool` über `PATH` oder `APPIMAGETOOL=/pfad/appimagetool` verfügbar ist. Der Builder bricht ohne dieses Werkzeug bewusst ab und erzeugt keine Datei, die nur fälschlich `.AppImage` heißt.
 - **Komplettes Release:** `bash build_release.sh` erstellt das Linux-ZIP, das `.deb`, Prüfsummen und – falls `appimagetool` vorhanden ist – das AppImage. Ohne Tool bleibt eine kurze Build-Hinweisdatei neben den übrigen Artefakten.
 
@@ -63,7 +63,7 @@ neu gestartet werden. Die Manifest-Datei selbst wird nie automatisch verändert.
 
 ### GitHub-Release-Automation
 
-`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.18.0` automatisch
+`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.19.0` automatisch
 die getesteten ZIP-, `.deb`- und AppImage-Dateien sowie `updates.json`. Die Version
 kommt aus der Datei `VERSION`; Tag und Versionsdatei müssen übereinstimmen. Dadurch
 werden Prüfsummen und Download-Adressen für den Update-Checker bei jedem Release
@@ -133,6 +133,7 @@ Danach arbeitet die App lokal und lädt deine Videos nicht hoch.
 - **Source-Monitor 3.13**: **Clip ansehen** öffnet die ausgewählte Video- oder Audioquelle unabhängig vom Timeline-Mix. Mit **I** und **O** setzt du Quell-In und Quell-Out; der markierte Bereich lässt sich direkt als **Insert** einfügen oder als **Overwrite** verwenden. Die Marken sind temporär, werden beim Clipwechsel zurückgesetzt und alle Schnitte bleiben vollständig undo-/redo-fähig.
 - **Lokale KI-Werkzeuge 3.17.1**: **Hintergrund entfernen** erzeugt mit rembg/ONNX eine transparente lokale Video- oder Bildableitung, **Motion-Tracking** verfolgt den Rechteckbereich per OpenCV, **Auto-Reframe** erkennt Gesichter lokal und folgt dem Fokus für Projektformat, 16:9, 9:16 oder 1:1, und **Objekt entfernen** füllt das getrackte Gebiet lokal per FFmpeg. **Sprachisolierung** hebt Dialoge mit einer portablen FFmpeg-Kette hervor und reduziert Hintergrundgeräusche. Kein Video muss dafür einen Cloud-Dienst verlassen; die optionalen Zusatzpakete werden beim Start automatisch nachinstalliert.
 - **Feature-Batch 3.18.0**: **Bezier-/Freiformmasken** unterstützen polygonale Rotoskopie, Pfad-Keyframes und weiche Kanten. **3-Wege-Color-Grading** bietet Belichtung, Temperatur, Tönung, Vibrance sowie Lift-, Gamma- und Gain-Räder. Der **grafische Keyframe-Editor** zeigt Animationskurven direkt im Inspector und erlaubt Ziehen sowie Hinzufügen von Punkten. Die lokale **Beat-Erkennung** setzt Beat-Marker, an denen die Timeline einrastet und Musik-Schnitte synchronisiert werden können; alle Werte bleiben in Vorschau, Export und `.framecut`-Projekt erhalten.
+- **Feature-Batch 3.19.0**: **Textbasierter Schnitt** transkribiert Video-/Audioclips lokal und entfernt lange Pausen sowie erkannte Füllwörter. **Objekt-Tracking für Bezier-Masken** überträgt den lokalen Motion-Track direkt auf Rotoskopie-Pfade. **Beat-/Szenen-Auto-Cut** setzt echte Schnitte an stabilen Musik- und Bildwechseln. **Compound-Clips** bündeln ausgewählte Timeline-Clips als benannten, gemeinsam verschiebbaren Container. **Multi-Kamera** synchronisiert mehrere Videowinkel über ihre Audiospuren, schaltet Winkel um und rendert nur die aktive Kamera; alle Werte bleiben in Vorschau, Export und `.framecut`-Projekt erhalten.
 - **Videoeffekte** stehen pro Videoclip zur Verfügung: Deckkraft für Overlays/Picture-in-Picture, Unschärfe, Schärfe, Stabilisierung, Greenscreen-Keying und weiche Rechteck-/Ellipsenmasken. Deckkraft und Unschärfe lassen sich zusätzlich per Keyframe animieren.
 - **Speed-Ramping, Freeze-Frame und Reverse**: Mehrere lokale Geschwindigkeitspunkte werden interpoliert; ein Freeze-Frame hält das letzte Bild für eine einstellbare Dauer und Reverse dreht Bild und Originalton um.
 - **Übergänge**: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Dip to Black, Fade to White, Blur In, Pixelize, Circle Open/Close und Radial können zwischen direkt angrenzenden Video- oder Audioclips derselben Spur gewählt werden. Bild und Ton werden passend zur eingestellten Dauer behandelt.

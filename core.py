@@ -427,6 +427,15 @@ class Clip:
     # Editing workflow metadata. These fields were added after the first
     # project format and deliberately keep defaults for older .framecut files.
     group_id: str = ""
+    # Compound clips keep a named, selectable container identity while the
+    # original child clips remain editable on their source tracks.
+    compound_id: str = ""
+    compound_name: str = ""
+    # Multi-camera groups share a timeline sync point. Only the active angle
+    # is rendered; all angles stay available for instant switching.
+    multicam_group: str = ""
+    camera_angle: str = ""
+    multicam_active: bool = True
     source_type: str = "video"  # video, audio, image, image_sequence, text, adjustment
     source_paths: list = field(default_factory=list)
     source_fps: float = 24.0
@@ -538,6 +547,12 @@ class Clip:
             previous_volume_time = time
         if not isinstance(self.group_id, str):
             raise ValueError("Ungültige Clip-Gruppe.")
+        if not isinstance(self.compound_id, str) or not isinstance(self.compound_name, str):
+            raise ValueError("Ungültige Compound-Clip-Daten.")
+        if not isinstance(self.multicam_group, str) or not isinstance(self.camera_angle, str):
+            raise ValueError("Ungültige Multi-Kamera-Daten.")
+        if type(self.multicam_active) is not bool:
+            raise ValueError("Ungültiger Multi-Kamera-Status.")
         if self.source_type not in ("video", "audio", "image", "image_sequence", "text", "adjustment"):
             raise ValueError("Ungültiger Quellentyp.")
         if not isinstance(self.source_paths, list) or any(not isinstance(path, str) or not path for path in self.source_paths):
@@ -1073,10 +1088,12 @@ def transition_pairs(clips):
     pairs = {}
     for incoming in clips:
         if (incoming.kind not in ("video", "audio") or incoming.source_type == "adjustment"
+                or (incoming.multicam_group and not incoming.multicam_active)
                 or incoming.transition_type == "none" or incoming.transition_duration <= 0):
             continue
         previous = max((candidate for candidate in clips
                         if candidate.uid != incoming.uid and candidate.track == incoming.track
+                        and not (candidate.multicam_group and not candidate.multicam_active)
                         and candidate.kind == incoming.kind and candidate.finish <= incoming.position + 1e-6),
                        key=lambda candidate: candidate.finish, default=None)
         if previous is None or abs(previous.finish-incoming.position) > 1e-5:
@@ -1113,6 +1130,86 @@ def split_clip(clip, timeline_time):
                      auto_reframe_keyframes=retime_auto_reframe_keyframes(clip,split_source_time,clip.end,clip.speed),
                      mask_path_keyframes=retime_mask_path_keyframes(clip,split_source_time,clip.end,clip.speed))
     return first, second
+
+
+def _source_segment(clip, source_start, source_end, position, uid=None):
+    """Create one editable segment while preserving all local automation."""
+    source_start = float(source_start)
+    source_end = float(source_end)
+    if source_end-source_start < MIN_CLIP-1e-7:
+        raise ValueError("Der erzeugte Clipbereich ist zu kurz.")
+    value = replace(
+        clip,
+        uid=uid or uuid.uuid4().hex,
+        start=source_start,
+        end=source_end,
+        position=max(0.0, float(position)),
+        freeze_frame=False,
+        freeze_duration=0.0,
+        transition_type="none",
+        transition_duration=0.0,
+        keyframes=retime_keyframes(clip, source_start, source_end, clip.speed),
+        volume_keyframes=retime_volume_keyframes(clip, source_start, source_end, clip.speed),
+        speed_keyframes=retime_speed_keyframes(clip, source_start, source_end),
+        tracking_keyframes=retime_tracking_keyframes(clip, source_start, source_end, clip.speed),
+        auto_reframe_keyframes=retime_auto_reframe_keyframes(clip, source_start, source_end, clip.speed),
+        mask_path_keyframes=retime_mask_path_keyframes(clip, source_start, source_end, clip.speed),
+    )
+    return value
+
+
+def split_clip_at_times(clip, cut_times):
+    """Split a media clip at local playback times without changing duration."""
+    if clip.kind not in ("video", "audio") or clip.source_type not in ("video", "audio"):
+        raise ValueError("Automatische Schnitte sind nur für Video- und Audiomedien verfügbar.")
+    if clip.freeze_frame:
+        raise ValueError("Ein Clip mit Freeze-Frame kann nicht automatisch geteilt werden.")
+    duration = float(clip.length)
+    points = sorted({round(max(MIN_CLIP, min(duration-MIN_CLIP, float(value))), 6)
+                     for value in (cut_times or [])
+                     if MIN_CLIP < float(value) < duration-MIN_CLIP})
+    boundaries = [0.0, *points, duration]
+    segments = []
+    for index, (local_start, local_end) in enumerate(zip(boundaries, boundaries[1:])):
+        source_start = clip.start + speed_ramp_source_offset(
+            clip.end-clip.start, clip.speed, clip.speed_keyframes, local_start)
+        source_end = clip.start + speed_ramp_source_offset(
+            clip.end-clip.start, clip.speed, clip.speed_keyframes, local_end)
+        segments.append(_source_segment(
+            clip, source_start, source_end, clip.position+local_start,
+            uid=clip.uid if index == 0 else None))
+    return segments
+
+
+def cut_clip_ranges(clip, keep_ranges):
+    """Keep selected local playback ranges and close the removed gaps."""
+    if clip.kind not in ("video", "audio") or clip.source_type not in ("video", "audio"):
+        raise ValueError("Textschnitt ist nur für Video- und Audiomedien verfügbar.")
+    if clip.freeze_frame:
+        raise ValueError("Ein Clip mit Freeze-Frame kann nicht automatisch geschnitten werden.")
+    duration = float(clip.length)
+    normalized = []
+    for start, end in keep_ranges or []:
+        start, end = max(0.0, float(start)), min(duration, float(end))
+        if end-start >= MIN_CLIP-1e-7:
+            if normalized and start <= normalized[-1][1]+1e-7:
+                normalized[-1] = (normalized[-1][0], max(normalized[-1][1], end))
+            else:
+                normalized.append((start, end))
+    if not normalized:
+        raise ValueError("Der Textschnitt würde den gesamten Clip entfernen.")
+    segments = []
+    cursor = 0.0
+    for index, (local_start, local_end) in enumerate(normalized):
+        source_start = clip.start + speed_ramp_source_offset(
+            clip.end-clip.start, clip.speed, clip.speed_keyframes, local_start)
+        source_end = clip.start + speed_ramp_source_offset(
+            clip.end-clip.start, clip.speed, clip.speed_keyframes, local_end)
+        segments.append(_source_segment(
+            clip, source_start, source_end, clip.position+cursor,
+            uid=clip.uid if index == 0 else None))
+        cursor += local_end-local_start
+    return segments
 
 
 def snap_time(time, targets, tolerance):
@@ -1700,6 +1797,58 @@ def mask_filters(clip):
     return filters
 
 
+def mask_path_keyframes_from_tracking(clip):
+    """Translate a tracked rectangle into an animated Bezier mask path."""
+    if clip.kind != "video" or clip.mask_type != "bezier" or len(clip.mask_points) < 3:
+        return []
+    if not clip.tracking_keyframes:
+        return []
+    base_x = float(clip.mask_x) + float(clip.mask_width) / 2.0
+    base_y = float(clip.mask_y) + float(clip.mask_height) / 2.0
+    frames = []
+    for tracking in clip.tracking_keyframes:
+        center_x = float(tracking["x"]) + float(tracking["width"]) / 2.0
+        center_y = float(tracking["y"]) + float(tracking["height"]) / 2.0
+        dx, dy = center_x-base_x, center_y-base_y
+        points = []
+        for point in clip.mask_points:
+            moved = dict(point)
+            for axis, delta in (("x", dx), ("in_x", dx), ("out_x", dx)):
+                if axis in moved:
+                    moved[axis] = round(max(0.0, min(1.0, float(moved[axis])+delta)), 6)
+            for axis, delta in (("y", dy), ("in_y", dy), ("out_y", dy)):
+                if axis in moved:
+                    moved[axis] = round(max(0.0, min(1.0, float(moved[axis])+delta)), 6)
+            points.append(moved)
+        frames.append({'time': round(float(tracking['time']), 6), 'points': points})
+    return frames
+
+
+def build_auto_cut_points(beat_data, scene_times, duration, min_gap=0.4):
+    """Merge beat and scene candidates into usable local split positions."""
+    try:
+        duration = max(0.0, float(duration))
+        min_gap = max(0.08, float(min_gap))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Ungültige Auto-Cut-Zeitdaten.") from exc
+    raw_beats = beat_data.get('beats', []) if isinstance(beat_data, dict) else (beat_data or [])
+    candidates = []
+    for value in list(raw_beats or []) + list(scene_times or []):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and min_gap*0.5 < value < duration-min_gap*0.5:
+            candidates.append(value)
+    points = []
+    for value in sorted(set(round(item, 6) for item in candidates)):
+        if not points or value-points[-1] >= min_gap-1e-7:
+            points.append(value)
+        # Keep the list usable on dense music: candidates are merged in a
+        # deterministic time order and never create near-zero segments.
+    return points
+
+
 def retime_keyframes(clip, start, end, speed):
     """Map existing keyframes onto a changed source range/speed."""
     if clip.kind != "video" or not clip.keyframes:
@@ -1956,6 +2105,11 @@ def load_project(path, allow_missing=False):
     def decode(item):
         values = dict(item)
         values.setdefault("group_id", "")
+        values.setdefault("compound_id", "")
+        values.setdefault("compound_name", "")
+        values.setdefault("multicam_group", "")
+        values.setdefault("camera_angle", "")
+        values.setdefault("multicam_active", True)
         values.setdefault("source_paths", [])
         values.setdefault("source_fps", 24.0)
         values.setdefault("source_type", "text" if values.get("kind") == "text" else "audio" if values.get("kind") == "audio" else "video")
@@ -2445,6 +2599,9 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
     for i, c in enumerate(clips):
         if cancel.is_set():
             raise ExportCancelled()
+        if c.multicam_group and not c.multicam_active:
+            infos.append((False, False))
+            continue
         if c.kind == "text":
             infos.append((False, False))
             continue
@@ -2499,6 +2656,8 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
     for i in sorted(range(len(clips)), key=lambda i: (clips[i].track, clips[i].position)):
         c = clips[i]
         if c.kind != "video":
+            continue
+        if c.multicam_group and not c.multicam_active:
             continue
         if c.source_type == "adjustment":
             enabled = f"between(t,{c.position:.6f},{c.finish:.6f})"

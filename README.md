@@ -1,4 +1,4 @@
-# Framecut 3.7 — Linux-Auslieferung, Updates, Effekte und professionelle Timeline
+# Framecut 3.8 — Linux-Auslieferung, Updates, Effekte und professionelle Timeline
 
 Native Linux-Videoschnitt-App mit einer CapCut-ähnlichen Anordnung. Eigener Code,
 keine CapCut-Kopie und keine KI. Python/PySide6 mit lokalem FFmpeg-Export.
@@ -7,7 +7,7 @@ keine CapCut-Kopie und keine KI. Python/PySide6 mit lokalem FFmpeg-Export.
 
 1. Framecut 0.1 schließen und die bisherigen Projekte speichern.
 2. Dieses ZIP in einen **neuen Ordner** entpacken. Version 0.1 als Rückfall behalten.
-3. Den Ordner `Framecut-3.7` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
+3. Den Ordner `Framecut-3.8` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
 4. Rechtsklick auf eine freie Stelle → „Im Terminal öffnen“.
 5. Ausführen:
 
@@ -16,14 +16,14 @@ keine CapCut-Kopie und keine KI. Python/PySide6 mit lokalem FFmpeg-Export.
    ```
 
 Für eine Desktop-Installation kannst du stattdessen `bash install.sh` ausführen.
-Der Installer legt Framecut unter `~/.local/share/framecut/3.7` ab und erstellt
+Der Installer legt Framecut unter `~/.local/share/framecut/3.8` ab und erstellt
 den Starter `~/.local/bin/framecut` sowie einen Eintrag im Anwendungsmenü.
 
-## Linux-Auslieferung 3.7
+## Linux-Auslieferung 3.8
 
 Das Quellpaket enthält jetzt drei reproduzierbare Auslieferungswege:
 
-- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.7_amd64.deb`. Installation mit `sudo apt install ./framecut_3.7_amd64.deb`. Die Anwendung legt ihre PySide6-Umgebung pro Benutzer unter `~/.local/share/framecut/3.7/.venv` an; FFmpeg und Python bleiben systemweit.
+- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.8_amd64.deb`. Installation mit `sudo apt install ./framecut_3.8_amd64.deb`. Die Anwendung legt ihre PySide6-Umgebung pro Benutzer unter `~/.local/share/framecut/3.8/.venv` an; FFmpeg und Python bleiben systemweit.
 - **AppImage:** `bash build_appimage.sh` erzeugt aus der vorbereiteten `Framecut.AppDir` ein echtes Type-2-AppImage, sobald das offizielle `appimagetool` über `PATH` oder `APPIMAGETOOL=/pfad/appimagetool` verfügbar ist. Der Builder bricht ohne dieses Werkzeug bewusst ab und erzeugt keine Datei, die nur fälschlich `.AppImage` heißt.
 - **Komplettes Release:** `bash build_release.sh` erstellt das Linux-ZIP, das `.deb`, Prüfsummen und – falls `appimagetool` vorhanden ist – das AppImage. Ohne Tool bleibt eine kurze Build-Hinweisdatei neben den übrigen Artefakten.
 
@@ -62,7 +62,7 @@ neu gestartet werden. Die Manifest-Datei selbst wird nie automatisch verändert.
 
 ### GitHub-Release-Automation
 
-`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.7` automatisch
+`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.8` automatisch
 die getesteten ZIP-, `.deb`- und AppImage-Dateien sowie `updates.json`. Die Version
 kommt aus der Datei `VERSION`; Tag und Versionsdatei müssen übereinstimmen. Dadurch
 werden Prüfsummen und Download-Adressen für den Update-Checker bei jedem Release
@@ -122,6 +122,7 @@ Danach arbeitet die App lokal und lädt deine Videos nicht hoch.
 - **Adjustment-Layer 3.5**: Über **+ Adjustment-Layer** wird eine leere Videospur über der Timeline angelegt. Farbkorrektur, Filter, Blur und Schärfe wirken damit gemeinsam auf die darunterliegende Komposition und bleiben unabhängig von den Quellclips.
 - **Keyframe-Kurven 3.5**: Transform-, Deckkraft-, Blur- und Lautstärke-Keyframes unterstützen **Linear**, **Ease in**, **Ease out** und **Ease in/out**. Die Kurve wird mit dem Marker gespeichert und in Vorschau, Export, Split und Trim berücksichtigt.
 - **Linux-Auslieferung 3.7**: echtes `.deb`, vorbereiteter Type-2-AppImage-Build, eigenes SVG-App-Symbol, MIME-/Dateiverknüpfung für `.framecut`, SHA-256-Prüfung und automatischer GitHub-Updatequelle.
+- **Design & Workflow 3.8**: Cinema-Vollbildvorschau mit Esc/F11 und eine durchsuchbare Befehls-Palette mit den wichtigsten Schnitt-, Projekt- und Exportaktionen über Strg+K.
 - **Videoeffekte** stehen pro Videoclip zur Verfügung: Deckkraft für Overlays/Picture-in-Picture, Unschärfe, Schärfe, Stabilisierung, Greenscreen-Keying und weiche Rechteck-/Ellipsenmasken. Deckkraft und Unschärfe lassen sich zusätzlich per Keyframe animieren.
 - **Speed-Ramping, Freeze-Frame und Reverse**: Mehrere lokale Geschwindigkeitspunkte werden interpoliert; ein Freeze-Frame hält das letzte Bild für eine einstellbare Dauer und Reverse dreht Bild und Originalton um.
 - **Übergänge**: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Dip to Black, Fade to White, Blur In, Pixelize, Circle Open/Close und Radial können zwischen direkt angrenzenden Video- oder Audioclips derselben Spur gewählt werden. Bild und Ton werden passend zur eingestellten Dauer behandelt.

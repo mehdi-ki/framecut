@@ -1,4 +1,4 @@
-"""Framecut 3.17.1 — native Linux multitrack editor."""
+"""Framecut 3.18.0 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -11,31 +11,31 @@ from pathlib import Path
 from dataclasses import replace
 
 from PySide6.QtCore import Qt, QUrl, QThread, Signal, QTimer, QLockFile, QSize
-from PySide6.QtGui import QAction, QImage, QColor, QFont, QPainter, QIcon, QPixmap
+from PySide6.QtGui import QAction, QImage, QColor, QFont, QPainter, QPen, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,
     QPushButton,QToolButton,QListWidgetItem,QFileDialog,QMessageBox,QSplitter,QDoubleSpinBox,QFormLayout,
-    QComboBox,QSlider,QScrollArea,QProgressDialog,QFrame,QCheckBox,QStackedWidget,QSpinBox,QLineEdit,QInputDialog,QSizePolicy,QMenu,QColorDialog,QListWidget,QFontComboBox,QDialog,QDialogButtonBox,QGridLayout)
+    QComboBox,QSlider,QScrollArea,QProgressDialog,QFrame,QCheckBox,QStackedWidget,QSpinBox,QLineEdit,QInputDialog,QSizePolicy,QMenu,QColorDialog,QListWidget,QFontComboBox,QDialog,QDialogButtonBox,QGridLayout,QPlainTextEdit)
 from PySide6.QtMultimedia import (QMediaPlayer,QAudioOutput,QMediaCaptureSession,QAudioInput,
                                   QMediaRecorder,QMediaFormat)
 from preview import VideoView
-from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_MODES,TEXT_STYLE_PRESETS,EFFECT_PRESETS,KEYFRAME_CURVES,KEYFRAME_CURVE_LABELS,EXPORT_FORMATS,EXPORT_CODEC_LABELS,EXPORT_ENCODER_LABELS,PROXY_PROFILES,
+from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_MODES,TEXT_STYLE_PRESETS,EFFECT_PRESETS,KEYFRAME_CURVES,KEYFRAME_CURVE_LABELS,EXPORT_FORMATS,EXPORT_CODEC_LABELS,EXPORT_ENCODER_LABELS,PROXY_PROFILES,AUTO_REFRAME_FORMATS,AUTO_REFRAME_FORMAT_LABELS,auto_reframe_aspect,curve_progress,
                   normalize_export_settings,import_clip,import_image_sequence,parse_subtitle_file,subtitle_cues_from_clips,write_subtitle_file,save_project,load_project,split_clip,render,
                   archive_project,extract_project_archive,find_relink_candidates,relink_project_media,missing_project_media,create_proxy_files,
                   preview_acceleration_info,cache_size,prune_cache,
                   ExportCancelled,validate_timeline,length,normalize_markers,edited_clip,retime_keyframes,retime_volume_keyframes,retime_speed_keyframes,
-                  normalize_track_states,normalize_track_names,normalize_master_mixer,slip_clip,roll_edit,slide_edit,retime_tracking_keyframes)
+                  normalize_track_states,normalize_track_names,normalize_master_mixer,slip_clip,roll_edit,slide_edit,retime_tracking_keyframes,retime_auto_reframe_keyframes,retime_mask_path_keyframes)
 from timeline import Timeline,MediaList
 from style import STYLE
 from update_system import (configured_manifest_url,download_verified,fetch_manifest,
                            install_downloaded,preferred_kinds,select_artifact,update_cache_directory,
                            update_checks_disabled)
 from transcription import transcribe_media
-from ai_tools import AIToolError, remove_background_media, track_motion
+from ai_tools import AIToolError, remove_background_media, track_motion, auto_reframe_video, analyze_beats
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.17.1'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.18.0'
 except OSError:
-    APP_VERSION = '3.17.1'
+    APP_VERSION = '3.18.0'
 
 
 def label(text,name=None):
@@ -136,6 +136,159 @@ def state_directory():
 
 def app_icon_path():
     return Path(__file__).with_name('framecut.svg')
+
+
+class KeyframeGraphWidget(QWidget):
+    """Compact draggable curve editor for the clip transform keyframes."""
+    point_moved = Signal(int, float, float)
+    point_added = Signal(float, float)
+    point_selected = Signal(int)
+    drag_started = Signal()
+    drag_finished = Signal()
+    RANGES = {
+        'scale': (.1, 4.0, 'Zoom'),
+        'x': (0.0, 1.0, 'Bild X'),
+        'y': (0.0, 1.0, 'Bild Y'),
+        'rotation': (-360.0, 360.0, 'Rotation'),
+        'opacity': (0.0, 1.0, 'Deckkraft'),
+        'blur': (0.0, 20.0, 'Unschärfe'),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(142)
+        self.setMaximumHeight(190)
+        self.setMouseTracking(True)
+        self.frames = []
+        self.duration = 1.0
+        self.field = 'scale'
+        self.default = 1.0
+        self.selected = -1
+        self.dragging = False
+
+    def set_data(self, frames, duration, field, default):
+        self.frames = [dict(frame) for frame in frames]
+        self.duration = max(.01, float(duration))
+        self.field = field if field in self.RANGES else 'scale'
+        self.default = float(default)
+        self.selected = min(self.selected, len(self.frames)-1)
+        self.dragging = False
+        self.update()
+
+    def _plot(self):
+        return self.rect().adjusted(30, 12, -12, -24)
+
+    def _range(self):
+        low, high, _ = self.RANGES[self.field]
+        return low, high
+
+    def _value(self, frame):
+        return float(frame.get(self.field, self.default))
+
+    def _map(self, time, value):
+        plot = self._plot(); low, high = self._range()
+        x = plot.left() + max(0.0, min(self.duration, float(time))) / self.duration * plot.width()
+        ratio = (float(value)-low) / max(1e-9, high-low)
+        y = plot.bottom() - max(0.0, min(1.0, ratio)) * plot.height()
+        return x, y
+
+    def _unmap(self, point):
+        plot = self._plot(); low, high = self._range()
+        time = (point.x()-plot.left()) / max(1, plot.width()) * self.duration
+        ratio = (plot.bottom()-point.y()) / max(1, plot.height())
+        return max(0.0, min(self.duration, time)), max(low, min(high, low+ratio*(high-low)))
+
+    def _value_at(self, time):
+        if not self.frames:
+            return self.default
+        frames = sorted(self.frames, key=lambda value: float(value.get('time', 0.0)))
+        if time <= float(frames[0].get('time', 0.0)):
+            return self.default if float(frames[0].get('time', 0.0)) > 1e-7 else self._value(frames[0])
+        for left, right in zip(frames, frames[1:]):
+            left_time, right_time = float(left.get('time', 0.0)), float(right.get('time', 0.0))
+            if time <= right_time:
+                ratio = (time-left_time) / max(1e-9, right_time-left_time)
+                ratio = curve_progress(ratio, left.get('curve', 'linear'))
+                return self._value(left) + (self._value(right)-self._value(left))*ratio
+        return self._value(frames[-1])
+
+    def _hit(self, point):
+        nearest = -1; distance = 9e9
+        for index, frame in enumerate(self.frames):
+            x, y = self._map(frame.get('time', 0.0), self._value(frame))
+            current = (x-point.x())**2 + (y-point.y())**2
+            if current < distance and current <= 12**2:
+                nearest, distance = index, current
+        return nearest
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor('#101722'))
+        plot = self._plot(); low, high = self._range(); title = self.RANGES[self.field][2]
+        painter.setPen(QPen(QColor('#667085'), 1))
+        painter.drawText(6, 15, title)
+        painter.setPen(QPen(QColor('#253246'), 1))
+        for step in range(5):
+            y = plot.top() + step * plot.height() / 4
+            painter.drawLine(plot.left(), int(y), plot.right(), int(y))
+        for step in range(5):
+            x = plot.left() + step * plot.width() / 4
+            painter.drawLine(int(x), plot.top(), int(x), plot.bottom())
+        painter.setPen(QPen(QColor('#7d8da6'), 1))
+        painter.drawText(plot.left(), self.height()-6, '0 s')
+        painter.drawText(plot.right()-34, self.height()-6, f'{self.duration:.1f} s')
+        if not self.frames:
+            painter.setPen(QPen(QColor('#8b98aa'), 1))
+            painter.drawText(plot.left()+8, plot.center().y(), 'Keyframes im Inspector setzen oder doppelt klicken')
+            return
+        curve_points = []
+        for index in range(81):
+            time = self.duration * index / 80
+            curve_points.append(self._map(time, self._value_at(time)))
+        painter.setPen(QPen(QColor('#63ead4'), 2))
+        for left, right in zip(curve_points, curve_points[1:]):
+            painter.drawLine(int(left[0]), int(left[1]), int(right[0]), int(right[1]))
+        for index, frame in enumerate(self.frames):
+            x, y = self._map(frame.get('time', 0.0), self._value(frame))
+            color = QColor('#f8c86f' if index == self.selected else '#63ead4')
+            painter.setPen(QPen(color, 2)); painter.setBrush(color)
+            painter.drawEllipse(int(x)-4, int(y)-4, 8, 8)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        point = event.position().toPoint()
+        self.selected = self._hit(point)
+        if self.selected >= 0:
+            self.dragging = True
+            self.drag_started.emit()
+            self.point_selected.emit(self.selected)
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if not self.dragging or self.selected < 0:
+            return
+        time, value = self._unmap(event.position().toPoint())
+        if self.selected > 0:
+            time = max(time, float(self.frames[self.selected-1].get('time', 0.0))+.01)
+        if self.selected + 1 < len(self.frames):
+            time = min(time, float(self.frames[self.selected+1].get('time', self.duration))-.01)
+        frame = self.frames[self.selected]
+        frame['time'] = round(max(0.0, min(self.duration, time)), 6)
+        frame[self.field] = round(value, 6)
+        self.point_moved.emit(self.selected, frame['time'], frame[self.field])
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self.dragging:
+            self.drag_finished.emit()
+        self.dragging = False
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        time, value = self._unmap(event.position().toPoint())
+        self.point_added.emit(round(time, 6), round(value, 6))
 
 
 class ExportDialog(QDialog):
@@ -932,6 +1085,16 @@ class Editor(QMainWindow):
         self.brightness=QDoubleSpinBox(); self.brightness.setRange(-1,1); self.brightness.setDecimals(2); self.brightness.setSingleStep(.05)
         self.contrast=QDoubleSpinBox(); self.contrast.setRange(0,3); self.contrast.setDecimals(2); self.contrast.setSingleStep(.1); self.contrast.setSuffix('×')
         self.saturation=QDoubleSpinBox(); self.saturation.setRange(0,3); self.saturation.setDecimals(2); self.saturation.setSingleStep(.1); self.saturation.setSuffix('×')
+        self.color_exposure=QDoubleSpinBox(); self.color_exposure.setRange(-3,3); self.color_exposure.setDecimals(2); self.color_exposure.setSingleStep(.1); self.color_exposure.setSuffix(' EV')
+        self.color_temperature=QDoubleSpinBox(); self.color_temperature.setRange(-100,100); self.color_temperature.setDecimals(0); self.color_temperature.setSingleStep(5); self.color_temperature.setSuffix(' %')
+        self.color_tint=QDoubleSpinBox(); self.color_tint.setRange(-100,100); self.color_tint.setDecimals(0); self.color_tint.setSingleStep(5); self.color_tint.setSuffix(' %')
+        self.color_vibrance=QDoubleSpinBox(); self.color_vibrance.setRange(-100,100); self.color_vibrance.setDecimals(0); self.color_vibrance.setSuffix(' %')
+        self.color_wheel_spins={}
+        for wheel in ('lift','gamma','gain'):
+            for channel in ('r','g','b'):
+                spin=QDoubleSpinBox(); spin.setRange(-100,100); spin.setDecimals(0); spin.setSingleStep(5); spin.setSuffix(' %')
+                self.color_wheel_spins[f'color_{wheel}_{channel}']=spin
+                setattr(self, f'color_{wheel}_{channel}', spin)
         self.filter_preset=QComboBox()
         for title,value in [('Kein Filter','none'),('Vivid','vivid'),('Warm','warm'),('Cool','cool'),('Cinematic','cinematic'),('Vintage','vintage'),('Noir','noir')]: self.filter_preset.addItem(title,value)
         self.lut_path=QLineEdit(); self.lut_path.setPlaceholderText('Optional: .cube / .3dl LUT')
@@ -952,16 +1115,32 @@ class Editor(QMainWindow):
         self.track_motion_button=button('Motion-Tracking starten',self.start_motion_tracking)
         self.clear_tracking_button=button('Tracking löschen',self.clear_motion_tracking)
         self.tracking_status=label('Kein Tracking vorhanden.','muted'); self.tracking_status.setWordWrap(True)
+        self.auto_reframe_enabled=QCheckBox('Auto-Reframe verwenden')
+        self.auto_reframe_format=QComboBox()
+        for value in AUTO_REFRAME_FORMATS:
+            self.auto_reframe_format.addItem(AUTO_REFRAME_FORMAT_LABELS[value],value)
+        self.auto_reframe_button=button('Auto-Reframe analysieren',self.start_auto_reframe)
+        self.auto_reframe_clear_button=button('Reframe löschen',self.clear_auto_reframe)
+        self.auto_reframe_status=label('Noch keine Auto-Reframe-Analyse.','muted'); self.auto_reframe_status.setWordWrap(True)
         self.object_removal_enabled=QCheckBox('Objekt im Bereich entfernen')
         self.chroma_key_enabled=QCheckBox('Greenscreen aktiv')
         self.chroma_key_color=QLineEdit('#00ff00'); self.chroma_key_color.setMaxLength(7); self.chroma_key_color.setPlaceholderText('#00ff00')
         self.chroma_key_similarity=QDoubleSpinBox(); self.chroma_key_similarity.setRange(0,100); self.chroma_key_similarity.setDecimals(0); self.chroma_key_similarity.setSuffix(' %')
         self.chroma_key_blend=QDoubleSpinBox(); self.chroma_key_blend.setRange(0,100); self.chroma_key_blend.setDecimals(0); self.chroma_key_blend.setSuffix(' %')
         self.mask_type=QComboBox()
-        for title,value in [('Keine Maske','none'),('Rechteck','rectangle'),('Ellipse','ellipse')]: self.mask_type.addItem(title,value)
+        for title,value in [('Keine Maske','none'),('Rechteck','rectangle'),('Ellipse','ellipse'),('Bezier / Freiform','bezier')]: self.mask_type.addItem(title,value)
+        self.mask_type.currentIndexChanged.connect(self.mask_type_changed)
         self.mask_x=QDoubleSpinBox(); self.mask_y=QDoubleSpinBox(); self.mask_width=QDoubleSpinBox(); self.mask_height=QDoubleSpinBox(); self.mask_feather=QDoubleSpinBox()
         for spin in (self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather): spin.setRange(0,100); spin.setDecimals(1); spin.setSuffix(' %')
         self.mask_width.setValue(100); self.mask_height.setValue(100)
+        self.mask_points=QLineEdit(); self.mask_points.setPlaceholderText('10,10; 90,10; 90,90; 10,90')
+        self.mask_points.setToolTip('Bezier-Anker als Prozentwerte eingeben: x,y; x,y; …')
+        self.mask_points_apply=button('Punkte übernehmen',self.apply_mask_points)
+        self.mask_path_time=QDoubleSpinBox(); self.mask_path_time.setRange(0,864000); self.mask_path_time.setDecimals(2); self.mask_path_time.setSingleStep(.1); self.mask_path_time.setSuffix(' s')
+        self.mask_path_list=QListWidget(); self.mask_path_list.setMaximumHeight(74); self.mask_path_list.setMinimumHeight(36)
+        self.mask_path_set_button=button('Rotoskopie-Punkt setzen',self.set_mask_path_keyframe)
+        self.mask_path_remove_button=button('Rotoskopie-Punkt löschen',self.remove_mask_path_keyframe)
+        self.mask_path_list.currentRowChanged.connect(self.mask_path_selected)
         self.transition_type=QComboBox()
         for title,value in [('Kein Übergang','none'),('Überblenden','dissolve'),('Slide links','slide_left'),('Slide rechts','slide_right'),('Slide oben','slide_up'),('Slide unten','slide_down'),('Wipe links','wipe_left'),('Wipe rechts','wipe_right'),('Wipe oben','wipe_up'),('Wipe unten','wipe_down'),('Zoom','zoom'),('Dip to Black','dip_to_black'),('Fade to White','fade_white'),('Blur In','blur_in'),('Circle Open','circle_open'),('Circle Close','circle_close'),('Radial','radial'),('Pixelize','pixelize'),('Smooth links','smooth_left'),('Smooth rechts','smooth_right'),('Smooth oben','smooth_up'),('Smooth unten','smooth_down'),('Cover links','cover_left'),('Cover rechts','cover_right'),('Cover oben','cover_up'),('Cover unten','cover_down')]: self.transition_type.addItem(title,value)
         self.transition_duration=QDoubleSpinBox(); self.transition_duration.setRange(0,30); self.transition_duration.setDecimals(2); self.transition_duration.setSingleStep(.1); self.transition_duration.setSuffix(' s')
@@ -972,6 +1151,16 @@ class Editor(QMainWindow):
         self.keyframe_set_button=button('Keyframe setzen / aktualisieren',self.set_keyframe)
         self.keyframe_remove_button=button('Keyframe löschen',self.remove_keyframe)
         self.keyframe_list.currentRowChanged.connect(self.keyframe_selected)
+        self.keyframe_graph_property=QComboBox()
+        for title,value in [('Zoom','scale'),('Bild X','x'),('Bild Y','y'),('Rotation','rotation'),('Deckkraft','opacity'),('Unschärfe','blur')]:
+            self.keyframe_graph_property.addItem(title,value)
+        self.keyframe_graph=KeyframeGraphWidget()
+        self.keyframe_graph_property.currentIndexChanged.connect(lambda *_: self.refresh_keyframe_graph(self.current_clip()))
+        self.keyframe_graph.point_moved.connect(self.graph_keyframe_moved)
+        self.keyframe_graph.point_added.connect(self.graph_keyframe_added)
+        self.keyframe_graph.point_selected.connect(self.graph_keyframe_selected)
+        self.keyframe_graph.drag_started.connect(self.graph_keyframe_drag_started)
+        self.keyframe_graph.drag_finished.connect(self.graph_keyframe_drag_finished)
         self.volume_keyframe_time=QDoubleSpinBox(); self.volume_keyframe_time.setRange(0,864000); self.volume_keyframe_time.setDecimals(2); self.volume_keyframe_time.setSingleStep(.1); self.volume_keyframe_time.setSuffix(' s')
         self.volume_keyframe_curve=QComboBox()
         for value in KEYFRAME_CURVES: self.volume_keyframe_curve.addItem(KEYFRAME_CURVE_LABELS[value],value)
@@ -985,6 +1174,9 @@ class Editor(QMainWindow):
         self.speed_ramp_set_button=button('Speed-Punkt setzen / aktualisieren',self.set_speed_ramp)
         self.speed_ramp_remove_button=button('Speed-Punkt löschen',self.remove_speed_ramp)
         self.speed_ramp_list.currentRowChanged.connect(self.speed_ramp_selected)
+        self.beat_analyze_button=button('Beats analysieren',self.start_beat_analysis)
+        self.beat_clear_button=button('Beats löschen',self.clear_beat_markers)
+        self.beat_status=label('Keine Beat-Marker vorhanden.','muted'); self.beat_status.setWordWrap(True)
         form.setVerticalSpacing(4)
         color_row=QHBoxLayout(); color_row.setContentsMargins(0,0,0,0); color_row.addWidget(self.text_color,1); color_row.addWidget(self.text_palette_button)
         for name,widget in [('Spur',self.track_combo),('Position',self.position),('Quellstart',self.start),('Quellende',self.end),('Geschwindigkeit',self.speed),('Freeze-Frame',self.freeze_enabled),('Freeze-Dauer',self.freeze_duration),('Reverse',self.reverse_clip),('Einblenden',self.fade_in),('Ausblenden',self.fade_out),('Lautstärke',self.volume),('Text',self.text_value),('Textgröße',self.text_size),('Schrift',self.text_font)]:form.addRow(name,widget)
@@ -1013,21 +1205,38 @@ class Editor(QMainWindow):
         audio_form.addRow('EQ Tiefen',self.audio_eq_low); audio_form.addRow('EQ Mitten',self.audio_eq_mid); audio_form.addRow('EQ Höhen',self.audio_eq_high)
         audio_form.addRow('Kompressor',self.audio_compressor_enabled); audio_form.addRow('Kompressor-Schwelle',self.audio_compressor_threshold); audio_form.addRow('Kompressor-Ratio',self.audio_compressor_ratio)
         audio_form.addRow('Audio-Ducking',self.audio_ducking); audio_form.addRow('Sprachisolierung',self.audio_voice_isolation); audio_form.addRow('Kanäle',self.audio_channel_mode); audio_form.addRow('Panorama',self.audio_pan)
+        beat_buttons=QHBoxLayout(); beat_buttons.setContentsMargins(0,0,0,0); beat_buttons.addWidget(self.beat_analyze_button,1); beat_buttons.addWidget(self.beat_clear_button,1)
+        audio_form.addRow('Beat-Sync',beat_buttons); audio_form.addRow('',self.beat_status)
         il.addWidget(label('AUDIO · MIX UND KANÄLE','heading')); il.addLayout(audio_form)
         il.addWidget(label('BILDTRANSFORMATION','heading')); il.addLayout(transform_form)
         color_form=QFormLayout(); color_form.addRow('Helligkeit',self.brightness); color_form.addRow('Kontrast',self.contrast); color_form.addRow('Sättigung',self.saturation); color_form.addRow('Filter',self.filter_preset)
         effect_preset_row=QHBoxLayout(); effect_preset_row.setContentsMargins(0,0,0,0); effect_preset_row.addWidget(self.effect_preset,1); effect_preset_row.addWidget(self.effect_preset_apply_button); color_form.addRow('Effekt-Preset',effect_preset_row)
         lut_row=QHBoxLayout(); lut_row.setContentsMargins(0,0,0,0); lut_row.addWidget(self.lut_path,1); lut_row.addWidget(self.lut_browse_button); color_form.addRow('LUT',lut_row)
         il.addWidget(label('FARBKORREKTUR','heading')); il.addLayout(color_form)
+        grading_form=QFormLayout(); grading_form.addRow('Belichtung',self.color_exposure); grading_form.addRow('Temperatur',self.color_temperature); grading_form.addRow('Tönung',self.color_tint); grading_form.addRow('Vibrance',self.color_vibrance)
+        for title,wheel in (('Lift / Schatten','lift'),('Gamma / Mitten','gamma'),('Gain / Lichter','gain')):
+            row=QHBoxLayout(); row.setContentsMargins(0,0,0,0)
+            for channel,title_channel in (('r','R'),('g','G'),('b','B')):
+                spin=self.color_wheel_spins[f'color_{wheel}_{channel}']; spin.setToolTip(f'{title} · {title_channel}')
+                row.addWidget(spin,1)
+            grading_form.addRow(title,row)
+        il.addWidget(label('COLOR GRADING · 3-WEGE-FARBWHEELS','heading')); il.addLayout(grading_form)
         effects_form=QFormLayout(); effects_form.addRow('Deckkraft',self.opacity); effects_form.addRow('Unschärfe',self.blur); effects_form.addRow('Schärfe',self.sharpen); effects_form.addRow('Stabilisierung',self.stabilization); effects_form.addRow('Greenscreen',self.chroma_key_enabled); effects_form.addRow('Key-Farbe',self.chroma_key_color); effects_form.addRow('Ähnlichkeit',self.chroma_key_similarity); effects_form.addRow('Weichheit',self.chroma_key_blend)
         il.addWidget(label('VIDEO-EFFEKTE','heading')); il.addLayout(effects_form)
         mask_form=QFormLayout(); mask_form.addRow('Maskentyp',self.mask_type); mask_form.addRow('Maske X',self.mask_x); mask_form.addRow('Maske Y',self.mask_y); mask_form.addRow('Maskenbreite',self.mask_width); mask_form.addRow('Maskenhöhe',self.mask_height); mask_form.addRow('Maskenweichheit',self.mask_feather)
+        mask_points_row=QHBoxLayout(); mask_points_row.setContentsMargins(0,0,0,0); mask_points_row.addWidget(self.mask_points,1); mask_points_row.addWidget(self.mask_points_apply); mask_form.addRow('Bezier-Punkte',mask_points_row)
         il.addWidget(label('MASKEN','heading')); il.addLayout(mask_form)
+        mask_path_form=QFormLayout(); mask_path_form.addRow('Rotoskopie-Zeit',self.mask_path_time)
+        mask_path_buttons=QHBoxLayout(); mask_path_buttons.setContentsMargins(0,0,0,0); mask_path_buttons.addWidget(self.mask_path_set_button,1); mask_path_buttons.addWidget(self.mask_path_remove_button,1)
+        il.addLayout(mask_path_form); il.addLayout(mask_path_buttons); il.addWidget(self.mask_path_list)
         ai_form=QFormLayout()
         background_buttons=QHBoxLayout(); background_buttons.setContentsMargins(0,0,0,0); background_buttons.addWidget(self.background_remove_button,1); background_buttons.addWidget(self.background_clear_button,1)
         tracking_buttons=QHBoxLayout(); tracking_buttons.setContentsMargins(0,0,0,0); tracking_buttons.addWidget(self.track_motion_button,1); tracking_buttons.addWidget(self.clear_tracking_button,1)
+        auto_reframe_buttons=QHBoxLayout(); auto_reframe_buttons.setContentsMargins(0,0,0,0); auto_reframe_buttons.addWidget(self.auto_reframe_button,1); auto_reframe_buttons.addWidget(self.auto_reframe_clear_button,1)
         ai_form.addRow('Hintergrund',background_buttons); ai_form.addRow('',self.background_removal_enabled); ai_form.addRow('',self.background_remove_status)
         ai_form.addRow('Tracking',tracking_buttons); ai_form.addRow('',self.tracking_status); ai_form.addRow('Objekt entfernen',self.object_removal_enabled)
+        ai_form.addRow('Auto-Reframe',self.auto_reframe_format); ai_form.addRow('',self.auto_reframe_enabled)
+        ai_form.addRow('',auto_reframe_buttons); ai_form.addRow('',self.auto_reframe_status)
         il.addWidget(label('KI-WERKZEUGE · LOKAL','heading')); il.addLayout(ai_form)
         transition_form=QFormLayout(); transition_form.addRow('Übergang',self.transition_type); transition_form.addRow('Dauer',self.transition_duration)
         il.addWidget(label('ÜBERGANG','heading')); il.addLayout(transition_form)
@@ -1035,6 +1244,7 @@ class Editor(QMainWindow):
         keyframe_form=QFormLayout(); keyframe_form.addRow('Zeit im Clip',self.keyframe_time); keyframe_form.addRow('Kurve',self.keyframe_curve); il.addLayout(keyframe_form)
         keyframe_buttons=QHBoxLayout(); keyframe_buttons.setContentsMargins(0,0,0,0); keyframe_buttons.addWidget(self.keyframe_set_button,1); keyframe_buttons.addWidget(self.keyframe_remove_button,1); il.addLayout(keyframe_buttons)
         il.addWidget(self.keyframe_list)
+        graph_form=QFormLayout(); graph_form.addRow('Kurve anzeigen',self.keyframe_graph_property); il.addLayout(graph_form); il.addWidget(self.keyframe_graph)
         il.addWidget(label('LAUTSTÄRKE-KURVE','heading'))
         volume_keyframe_form=QFormLayout(); volume_keyframe_form.addRow('Zeit im Clip',self.volume_keyframe_time); volume_keyframe_form.addRow('Kurve',self.volume_keyframe_curve); il.addLayout(volume_keyframe_form)
         volume_keyframe_buttons=QHBoxLayout(); volume_keyframe_buttons.setContentsMargins(0,0,0,0); volume_keyframe_buttons.addWidget(self.volume_keyframe_set_button,1); volume_keyframe_buttons.addWidget(self.volume_keyframe_remove_button,1); il.addLayout(volume_keyframe_buttons)
@@ -1044,7 +1254,7 @@ class Editor(QMainWindow):
         speed_ramp_buttons=QHBoxLayout(); speed_ramp_buttons.setContentsMargins(0,0,0,0); speed_ramp_buttons.addWidget(self.speed_ramp_set_button,1); speed_ramp_buttons.addWidget(self.speed_ramp_remove_button,1); il.addLayout(speed_ramp_buttons)
         il.addWidget(self.speed_ramp_list)
         il.addWidget(button('Bild zurücksetzen',self.reset_transform)); il.addWidget(button('Übernehmen',self.apply_properties,True)); il.addWidget(button('Audio aus Video extrahieren',self.extract_audio))
-        hint=label('Höhere Videospuren liegen vorne.\nTon aller Spuren wird gemischt.\n\nGleiche Spur: keine Überlappung.\nShift beim Ziehen: ohne Einrasten.\n\nSpurkopf: M = stumm schalten · L = Spur sperren.\nAudio: Rauschunterdrückung, 3-Band-EQ, Kompressor, Ducking, Sprachisolierung, Kanalmodus und Panorama.\nDucking auf einem Musikclip senkt ihn automatisch, sobald andere Audiospuren aktiv sind.\nBildtransformation: Zoom, Position, Crop, Rotation und Spiegeln.\nFarbkorrektur: Helligkeit, Kontrast, Sättigung, Presets und .cube/.3dl-LUTs.\nEffekt-Presets: Clean, Cinematic, Dream, Noir, Vivid und Soft Focus.\nAdjustment-Layer legt Effekte über die darunterliegende Komposition.\nVideoeffekte: Deckkraft, Unschärfe, Schärfe, Stabilisierung, Greenscreen und Masken.\nKI-Werkzeuge: lokale Hintergrundfreistellung, Motion-Tracking und Objektentfernung; kein Cloud-Upload.\nKeyframes animieren Zoom, Bildposition, Rotation, Deckkraft und Unschärfe; Kurven: Linear, Ease in, Ease out und Ease in/out.\nSpeed-Ramping: mehrere Geschwindigkeits-Punkte zwischen 0,25× und 4× setzen.\nFreeze-Frame hält das letzte Bild; Reverse spielt Bild und Ton rückwärts.\nÜbergänge: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Blur, Pixelize, Circle, Radial sowie Fade to White.\nEinblenden / Ausblenden sind weiche Übergänge für Bild und Ton.\nTextclips liegen automatisch über dem Video.\nTextstil: Schrift, Fett/Kursiv, Kontur, Schatten und Hintergrund.\nTextanimation: Ein-/Ausblenden oder Hereinschieben.\nSRT/VTT importiert Cue-Zeiten als Textclips auf eigenen Spuren.\nAudio extrahieren erstellt eine eigene Audiodatei.\n\nShortcuts: Leertaste = Play/Pause · J = rückwärts · K = Pause · L = vorwärts\nPfeile = 1 s bewegen · Entf = Clip löschen','muted'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
+        hint=label('Höhere Videospuren liegen vorne.\nTon aller Spuren wird gemischt.\n\nGleiche Spur: keine Überlappung.\nShift beim Ziehen: ohne Einrasten.\n\nSpurkopf: M = stumm schalten · L = Spur sperren.\nAudio: Rauschunterdrückung, 3-Band-EQ, Kompressor, Ducking, Sprachisolierung, Kanalmodus und Panorama.\nDucking auf einem Musikclip senkt ihn automatisch, sobald andere Audiospuren aktiv sind.\nBildtransformation: Zoom, Position, Crop, Rotation und Spiegeln.\nFarbkorrektur: Helligkeit, Kontrast, Sättigung, Presets und .cube/.3dl-LUTs.\nEffekt-Presets: Clean, Cinematic, Dream, Noir, Vivid und Soft Focus.\nAdjustment-Layer legt Effekte über die darunterliegende Komposition.\nVideoeffekte: Deckkraft, Unschärfe, Schärfe, Stabilisierung, Greenscreen und Masken.\nKI-Werkzeuge: lokale Hintergrundfreistellung, Motion-Tracking, Auto-Reframe und Objektentfernung; kein Cloud-Upload.\nAuto-Reframe erkennt Gesichter lokal und folgt dem Fokus in Projektformat, 16:9, 9:16 oder 1:1.\nKeyframes animieren Zoom, Bildposition, Rotation, Deckkraft und Unschärfe; Kurven: Linear, Ease in, Ease out und Ease in/out.\nSpeed-Ramping: mehrere Geschwindigkeits-Punkte zwischen 0,25× und 4× setzen.\nFreeze-Frame hält das letzte Bild; Reverse spielt Bild und Ton rückwärts.\nÜbergänge: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Blur, Pixelize, Circle, Radial sowie Fade to White.\nEinblenden / Ausblenden sind weiche Übergänge für Bild und Ton.\nTextclips liegen automatisch über dem Video.\nTextstil: Schrift, Fett/Kursiv, Kontur, Schatten und Hintergrund.\nTextanimation: Ein-/Ausblenden oder Hereinschieben.\nSRT/VTT importiert Cue-Zeiten als Textclips auf eigenen Spuren.\nAudio extrahieren erstellt eine eigene Audiodatei.\n\nShortcuts: Leertaste = Play/Pause · J = rückwärts · K = Pause · L = vorwärts\nPfeile = 1 s bewegen · Entf = Clip löschen','muted'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
         top.addWidget(inspector); top.setSizes([78,300,760,330]); vertical.addWidget(top)
         bottom,bl=panel(); bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
         bar=QHBoxLayout(); bar.setContentsMargins(10,5,10,5); bar.setSpacing(6)
@@ -1304,7 +1514,15 @@ class Editor(QMainWindow):
                 ai_menu.addAction('Motion-Tracking starten',self.start_motion_tracking).setEnabled(clip.source_type=='video')
                 if clip.tracking_keyframes:
                     ai_menu.addAction('Tracking löschen',self.clear_motion_tracking)
+                ai_menu.addAction('Auto-Reframe analysieren',self.start_auto_reframe).setEnabled(clip.source_type=='video')
+                if clip.auto_reframe_keyframes:
+                    ai_menu.addAction('Auto-Reframe löschen',self.clear_auto_reframe)
                 ai_menu.addAction('Objekt entfernen aktivieren',lambda:self.set_object_removal_enabled(True))
+            if clip.kind in ('video','audio') and clip.has_audio and clip.source_type != 'adjustment':
+                beat_menu=menu.addMenu('Beat-Sync')
+                beat_menu.addAction('Beats analysieren',self.start_beat_analysis)
+                if any(marker.get('kind') == 'beat' for marker in self.markers):
+                    beat_menu.addAction('Beat-Marker löschen',self.clear_beat_markers)
             speed_menu=None
             if clip.kind in ('video','audio') and clip.source_type!='adjustment':
                 speed_menu=menu.addMenu('Geschwindigkeit')
@@ -1455,6 +1673,10 @@ class Editor(QMainWindow):
                        volume_keyframes=[dict(frame) for frame in clip.volume_keyframes],
                        speed_keyframes=[dict(frame) for frame in clip.speed_keyframes],
                        tracking_keyframes=[dict(point) for point in clip.tracking_keyframes],
+                       auto_reframe_keyframes=[dict(point) for point in clip.auto_reframe_keyframes],
+                       mask_points=[dict(point) for point in clip.mask_points],
+                       mask_path_keyframes=[dict(frame, points=[dict(point) for point in frame.get('points', [])])
+                                            for frame in clip.mask_path_keyframes],
                        source_paths=list(clip.source_paths))
 
     def set_selection(self, uids, anchor=None, expand_groups=False):
@@ -1508,7 +1730,13 @@ class Editor(QMainWindow):
                 self.chroma_key_enabled,self.chroma_key_color,self.chroma_key_similarity,self.chroma_key_blend,
                 self.background_removal_enabled,self.background_remove_button,self.background_clear_button,
                 self.track_motion_button,self.clear_tracking_button,self.object_removal_enabled,
-                self.mask_type,self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather,
+                self.auto_reframe_enabled,self.auto_reframe_format,self.auto_reframe_button,self.auto_reframe_clear_button,
+                self.mask_type,self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather,self.mask_points,
+                self.mask_points_apply,self.mask_path_time,self.mask_path_list,self.mask_path_set_button,self.mask_path_remove_button,
+                self.color_exposure,self.color_temperature,self.color_tint,self.color_vibrance,
+                *self.color_wheel_spins.values(),
+                self.keyframe_graph_property,self.keyframe_graph,
+                self.beat_analyze_button,self.beat_clear_button,
                 self.transition_type,self.transition_duration,
                 self.keyframe_time,self.keyframe_curve,self.keyframe_list,self.keyframe_set_button,self.keyframe_remove_button,
                 self.volume_keyframe_time,self.volume_keyframe_curve,self.volume_keyframe_list,self.volume_keyframe_set_button,
@@ -1801,6 +2029,10 @@ class Editor(QMainWindow):
             ('KI-Hintergrund entfernen', '—', self.start_background_removal),
             ('Motion-Tracking starten', '—', self.start_motion_tracking),
             ('Tracking löschen', '—', self.clear_motion_tracking),
+            ('KI-Auto-Reframe analysieren', '—', self.start_auto_reframe),
+            ('Auto-Reframe löschen', '—', self.clear_auto_reframe),
+            ('Beat-Sync analysieren', '—', self.start_beat_analysis),
+            ('Beat-Marker löschen', '—', self.clear_beat_markers),
             ('Objektentfernung aktivieren', '—', lambda: self.set_object_removal_enabled(True)),
             ('Audio-Mixer öffnen', '—', self.open_mixer),
             ('Render-Queue öffnen', '—', self.show_render_queue),
@@ -1910,6 +2142,10 @@ class Editor(QMainWindow):
                                 volume_keyframes=[dict(frame) for frame in c.volume_keyframes],
                                 speed_keyframes=[dict(frame) for frame in c.speed_keyframes],
                                 tracking_keyframes=[dict(point) for point in c.tracking_keyframes],
+                                auto_reframe_keyframes=[dict(point) for point in c.auto_reframe_keyframes],
+                                mask_points=[dict(point) for point in c.mask_points],
+                                mask_path_keyframes=[dict(frame, points=[dict(point) for point in frame.get('points', [])])
+                                                     for frame in c.mask_path_keyframes],
                                 source_paths=list(c.source_paths))
         return ([clone(c) for c in self.clips],
                 list(self.tracks),self.current,
@@ -1977,6 +2213,141 @@ class Editor(QMainWindow):
         self.keyframe_list.clearSelection()
         self.keyframe_list.setCurrentRow(-1)
         self.keyframe_list.blockSignals(False)
+
+    def refresh_keyframe_graph(self, clip):
+        if not clip or clip.kind != 'video':
+            self.keyframe_graph.set_data([], 1.0, 'scale', 1.0)
+            return
+        field=self.keyframe_graph_property.currentData() or 'scale'
+        defaults={'scale':clip.video_scale,'x':clip.video_x,'y':clip.video_y,
+                  'rotation':clip.rotation,'opacity':clip.opacity,'blur':clip.blur}
+        self.keyframe_graph.set_data(clip.keyframes,clip.length,field,defaults[field])
+
+    def graph_keyframe_drag_started(self):
+        c=self.current_clip()
+        if c and c.kind=='video' and not self.worker and self.require_unlocked(c):
+            self.checkpoint()
+
+    def graph_keyframe_moved(self,index,time,value):
+        c=self.current_clip()
+        if not c or c.kind!='video' or self.worker or index < 0 or index >= len(c.keyframes) or not self.require_unlocked(c):
+            return
+        field=self.keyframe_graph_property.currentData() or 'scale'
+        frames=[dict(frame) for frame in c.keyframes]
+        frames[index]['time']=round(max(0.0,min(c.length,float(time))),6)
+        frames[index][field]=round(float(value),6)
+        frames.sort(key=lambda frame:float(frame.get('time',0.0)))
+        candidate=replace(c,keyframes=frames)
+        try:
+            validate_timeline([candidate if item.uid==c.uid else item for item in self.clips],self.tracks)
+            self.clips=[candidate if item.uid==c.uid else item for item in self.clips]
+            self.dirty=True; self.revision+=1; self.preview_revision=-1; self.preview_signature=None; self.preview_queued=True
+            self.timeline.refresh(self.clips,self.tracks,self.current,self.track_states,self.track_names,self.selection,self.markers)
+        except Exception:
+            self.keyframe_graph.set_data(c.keyframes,c.length,field,getattr(c,{'scale':'video_scale','x':'video_x','y':'video_y','rotation':'rotation','opacity':'opacity','blur':'blur'}[field]))
+
+    def graph_keyframe_drag_finished(self):
+        if self.current_clip() and not self.worker:
+            self.changed()
+
+    def graph_keyframe_selected(self,index):
+        if 0 <= index < self.keyframe_list.count():
+            self.keyframe_list.setCurrentRow(index)
+
+    def graph_keyframe_added(self,time,value):
+        c=self.current_clip()
+        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):
+            return
+        field=self.keyframe_graph_property.currentData() or 'scale'
+        self.keyframe_time.setValue(time)
+        controls={'scale':self.transform_scale,'x':self.transform_x,'y':self.transform_y,
+                  'rotation':self.rotation,'opacity':self.opacity,'blur':self.blur}
+        control=controls[field]
+        control.setValue(value*100 if field in ('x','y','opacity') else value)
+        self.set_keyframe()
+
+    def parse_mask_points(self, text):
+        points=[]
+        for token in str(text).replace('\n',';').split(';'):
+            token=token.strip()
+            if not token:
+                continue
+            values=[value.strip() for value in token.split(',')]
+            if len(values) != 2:
+                raise ValueError('Bezier-Punkte müssen als x,y; x,y eingegeben werden.')
+            try:
+                x,y=(float(values[0])/100,float(values[1])/100)
+            except ValueError as exc:
+                raise ValueError('Bezier-Punkte enthalten keine gültigen Zahlen.') from exc
+            if not 0 <= x <= 1 or not 0 <= y <= 1:
+                raise ValueError('Bezier-Punkte müssen zwischen 0 und 100 % liegen.')
+            points.append({'x':round(x,6),'y':round(y,6)})
+        if len(points) < 3:
+            raise ValueError('Eine Bezier-Maske braucht mindestens drei Punkte.')
+        return points
+
+    def mask_type_changed(self, *_):
+        enabled=self.mask_type.currentData() == 'bezier' and bool(self.current_clip() and self.current_clip().kind == 'video')
+        for field in (self.mask_points,self.mask_points_apply,self.mask_path_time,self.mask_path_list,
+                      self.mask_path_set_button,self.mask_path_remove_button):
+            field.setEnabled(enabled and not self.worker)
+
+    def apply_mask_points(self):
+        c=self.current_clip()
+        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):
+            return
+        try:
+            points=self.parse_mask_points(self.mask_points.text())
+            candidate=replace(c,mask_type='bezier',mask_points=points)
+            validate_timeline([candidate if item.uid==c.uid else item for item in self.clips],self.tracks)
+            self.checkpoint(); self.clips=[candidate if item.uid==c.uid else item for item in self.clips]; self.changed()
+        except Exception as exc:
+            self.error(exc)
+
+    def refresh_mask_path_list(self, clip):
+        self.mask_path_list.blockSignals(True); self.mask_path_list.clear()
+        if clip:
+            self.mask_path_time.setMaximum(max(.01,clip.length))
+            for frame in clip.mask_path_keyframes:
+                item=QListWidgetItem(f"{float(frame['time']):.2f} s · {len(frame.get('points',[]))} Punkte")
+                item.setData(Qt.UserRole,float(frame['time'])); self.mask_path_list.addItem(item)
+        self.mask_path_list.setCurrentRow(-1); self.mask_path_list.blockSignals(False)
+
+    def mask_path_selected(self,row):
+        c=self.current_clip()
+        if not c or row<0 or row>=len(c.mask_path_keyframes):
+            return
+        frame=c.mask_path_keyframes[row]; self.mask_path_time.setValue(float(frame['time']))
+        self.mask_points.setText('; '.join(f"{float(point['x'])*100:.1f},{float(point['y'])*100:.1f}" for point in frame.get('points',[])))
+
+    def set_mask_path_keyframe(self):
+        c=self.current_clip()
+        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):
+            return
+        try:
+            points=self.parse_mask_points(self.mask_points.text())
+            time=round(max(0.0,min(c.length,self.mask_path_time.value())),6)
+            frame={'time':time,'points':points}
+            frames=[dict(item,points=[dict(point) for point in item.get('points',[])]) for item in c.mask_path_keyframes]
+            replaced=False
+            for index,item in enumerate(frames):
+                if abs(float(item['time'])-time) <= .01:
+                    frames[index]=frame; replaced=True; break
+            if not replaced: frames.append(frame)
+            frames.sort(key=lambda item:float(item['time']))
+            candidate=replace(c,mask_type='bezier',mask_points=points,mask_path_keyframes=frames)
+            validate_timeline([candidate if item.uid==c.uid else item for item in self.clips],self.tracks)
+            self.checkpoint(); self.clips=[candidate if item.uid==c.uid else item for item in self.clips]; self.changed()
+        except Exception as exc:
+            self.error(exc)
+
+    def remove_mask_path_keyframe(self):
+        c=self.current_clip(); row=self.mask_path_list.currentRow()
+        if not c or c.kind!='video' or self.worker or row<0 or row>=len(c.mask_path_keyframes) or not self.require_unlocked(c):
+            return
+        frames=[dict(item,points=[dict(point) for point in item.get('points',[])]) for index,item in enumerate(c.mask_path_keyframes) if index != row]
+        candidate=replace(c,mask_path_keyframes=frames)
+        self.checkpoint(); self.clips=[candidate if item.uid==c.uid else item for item in self.clips]; self.changed()
 
     def keyframe_selected(self,row):
         c=self.current_clip()
@@ -2138,11 +2509,13 @@ class Editor(QMainWindow):
             self.clip_name.setText(f'{len(self.selection)} Clips ausgewählt')
             for field in self._inspector_controls():
                 field.setEnabled(False)
+            self.auto_reframe_status.setText('Auto-Reframe ist bei Mehrfachauswahl deaktiviert.')
             self.keyframe_list.clear(); self.volume_keyframe_list.clear(); self.speed_ramp_list.clear()
             return
         if not c:
             self.clip_name.setText('Kein Clip ausgewählt')
             for field in self._inspector_controls(): field.setEnabled(False)
+            self.auto_reframe_status.setText('Kein Clip ausgewählt.')
             self.keyframe_list.clear()
             self.volume_keyframe_list.clear(); self.speed_ramp_list.clear()
             return
@@ -2166,11 +2539,17 @@ class Editor(QMainWindow):
         for field in (self.transform_scale,self.transform_x,self.transform_y,self.rotation,self.crop_left,self.crop_top,self.crop_right,self.crop_bottom,self.flip_horizontal,self.flip_vertical): field.setEnabled(is_video and not is_adjustment)
         for field in (self.brightness,self.contrast,self.saturation,self.filter_preset,self.effect_preset,self.effect_preset_apply_button,
                       self.opacity,self.blur,self.sharpen): field.setEnabled(is_video)
+        for field in (self.color_exposure,self.color_temperature,self.color_tint,self.color_vibrance,*self.color_wheel_spins.values()):
+            field.setEnabled(is_video and not is_adjustment)
         for field in (self.lut_path,self.lut_browse_button,
                       self.opacity,self.blur,self.sharpen,self.chroma_key_enabled,self.chroma_key_color,self.chroma_key_similarity,
                       self.chroma_key_blend,self.mask_type,self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather): field.setEnabled(is_video and not is_adjustment)
         self.opacity.setEnabled(is_video); self.blur.setEnabled(is_video); self.sharpen.setEnabled(is_video)
         self.stabilization.setEnabled(is_video and not is_adjustment)
+        for field in (self.mask_points,self.mask_points_apply,self.mask_path_time,self.mask_path_list,
+                      self.mask_path_set_button,self.mask_path_remove_button):
+            field.setEnabled(is_video and not is_adjustment and c.mask_type == 'bezier')
+        self.mask_type.setEnabled(is_video and not is_adjustment)
         background_source = is_video and not is_adjustment and c.source_type in ('video','image')
         tracking_source = is_video and not is_adjustment and c.source_type == 'video'
         self.background_remove_button.setEnabled(background_source)
@@ -2178,8 +2557,14 @@ class Editor(QMainWindow):
         self.background_removal_enabled.setEnabled(background_source and bool(c.background_removed_path))
         self.track_motion_button.setEnabled(tracking_source)
         self.clear_tracking_button.setEnabled(tracking_source and bool(c.tracking_keyframes))
+        auto_reframe_source = tracking_source
+        self.auto_reframe_enabled.setEnabled(auto_reframe_source)
+        self.auto_reframe_format.setEnabled(auto_reframe_source)
+        self.auto_reframe_button.setEnabled(auto_reframe_source)
+        self.auto_reframe_clear_button.setEnabled(auto_reframe_source and bool(c.auto_reframe_keyframes))
         self.object_removal_enabled.setEnabled(is_video and not is_adjustment)
-        for field in (self.keyframe_time,self.keyframe_curve,self.keyframe_list,self.keyframe_set_button,self.keyframe_remove_button): field.setEnabled(is_video and not is_adjustment)
+        for field in (self.keyframe_time,self.keyframe_curve,self.keyframe_list,self.keyframe_set_button,self.keyframe_remove_button,
+                      self.keyframe_graph_property,self.keyframe_graph): field.setEnabled(is_video and not is_adjustment)
         for field in (self.volume_keyframe_time,self.volume_keyframe_curve,self.volume_keyframe_list,self.volume_keyframe_set_button,self.volume_keyframe_remove_button): field.setEnabled(is_audioable)
         for field in (self.audio_noise_reduction,self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high,self.audio_compressor_enabled,
                       self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_voice_isolation,self.audio_channel_mode,self.audio_pan): field.setEnabled(is_audioable)
@@ -2218,7 +2603,26 @@ class Editor(QMainWindow):
         self.tracking_status.setText(
             f'{len(c.tracking_keyframes)} Tracking-Punkte vorhanden.' if c.tracking_keyframes
             else 'Kein Tracking vorhanden.')
+        auto_format_index=self.auto_reframe_format.findData(c.auto_reframe_format if auto_reframe_source else 'project')
+        self.auto_reframe_format.setCurrentIndex(auto_format_index if auto_format_index >= 0 else 0)
+        if c.auto_reframe_keyframes:
+            detected=sum(1 for point in c.auto_reframe_keyframes if float(point.get('score', 0.0)) > 0)
+            self.auto_reframe_status.setText(
+                f'{len(c.auto_reframe_keyframes)} Fokus-Punkte vorhanden · '
+                f'{detected} mit Gesichtserkennung.')
+        else:
+            self.auto_reframe_status.setText('Noch keine Auto-Reframe-Analyse.')
+        self.auto_reframe_enabled.setChecked(c.auto_reframe_enabled if auto_reframe_source else False)
         self.object_removal_enabled.setChecked(c.object_removal_enabled if is_video else False)
+        self.color_exposure.setValue(c.color_exposure if is_video else 0)
+        self.color_temperature.setValue(c.color_temperature*100 if is_video else 0)
+        self.color_tint.setValue(c.color_tint*100 if is_video else 0)
+        self.color_vibrance.setValue(c.color_vibrance*100 if is_video else 0)
+        for key, spin in self.color_wheel_spins.items():
+            spin.setValue(getattr(c,key)*100 if is_video else 0)
+        mask_title_points='; '.join(f"{float(point['x'])*100:.1f},{float(point['y'])*100:.1f}" for point in c.mask_points)
+        self.mask_points.setText(mask_title_points if is_video else '')
+        self.refresh_mask_path_list(c if is_video else None)
         self.audio_noise_reduction.setValue(c.audio_noise_reduction if is_audioable else 0)
         self.audio_eq_low.setValue(c.audio_eq_low if is_audioable else 0); self.audio_eq_mid.setValue(c.audio_eq_mid if is_audioable else 0); self.audio_eq_high.setValue(c.audio_eq_high if is_audioable else 0)
         self.audio_compressor_enabled.setChecked(c.audio_compressor_enabled if is_audioable else False)
@@ -2250,11 +2654,13 @@ class Editor(QMainWindow):
             self.keyframe_time.setValue(local_time)
             self.keyframe_curve.setCurrentIndex(self.keyframe_curve.findData('linear'))
             self.refresh_keyframe_list(c)
+            self.refresh_keyframe_graph(c)
             self.speed_ramp_time.setMaximum(max(0.01,c.end-c.start))
             self.speed_ramp_time.setValue(max(0.0,min(c.end-c.start,local_time)))
             self.refresh_speed_ramp_list(c)
         else:
             self.keyframe_list.clear()
+            self.keyframe_graph.set_data([],1.0,'scale',1.0)
             self.speed_ramp_list.clear()
         if is_audioable:
             self.volume_keyframe_time.setMaximum(max(0.01,c.length))
@@ -2265,6 +2671,10 @@ class Editor(QMainWindow):
             self.volume_keyframe_list.clear()
         if not is_audioable:
             self.volume_keyframe_curve.setCurrentIndex(self.volume_keyframe_curve.findData('linear'))
+        beat_count=sum(1 for marker in self.markers if marker.get('kind') == 'beat')
+        self.beat_analyze_button.setEnabled(is_audioable and not self.worker)
+        self.beat_clear_button.setEnabled(beat_count > 0 and not self.worker)
+        self.beat_status.setText(f'{beat_count} Beat-Marker vorhanden.' if beat_count else 'Keine Beat-Marker vorhanden.')
 
     def select_clip(self,uid):
         if uid!=self.current and self.mode=='source':
@@ -2375,11 +2785,18 @@ class Editor(QMainWindow):
                              crop_right=self.crop_right.value()/100,crop_bottom=self.crop_bottom.value()/100,
                              rotation=self.rotation.value(),flip_horizontal=self.flip_horizontal.isChecked(),
                              flip_vertical=self.flip_vertical.isChecked(),brightness=self.brightness.value(),
-                             contrast=self.contrast.value(),saturation=self.saturation.value(),opacity=self.opacity.value()/100,
+                             contrast=self.contrast.value(),saturation=self.saturation.value(),
+                             color_exposure=self.color_exposure.value(),color_temperature=self.color_temperature.value()/100,
+                             color_tint=self.color_tint.value()/100,color_vibrance=self.color_vibrance.value()/100,
+                             **{key:spin.value()/100 for key,spin in self.color_wheel_spins.items()},
+                             opacity=self.opacity.value()/100,
                              blur=self.blur.value(),sharpen=self.sharpen.value(),stabilization=self.stabilization.value()/100,
                              background_removal_enabled=self.background_removal_enabled.isChecked(),
                              background_removed_path=c.background_removed_path,
                              tracking_keyframes=[dict(point) for point in c.tracking_keyframes],
+                             auto_reframe_enabled=self.auto_reframe_enabled.isChecked() if c.source_type == 'video' else False,
+                             auto_reframe_format=self.auto_reframe_format.currentData() or 'project',
+                             auto_reframe_keyframes=[dict(point) for point in c.auto_reframe_keyframes] if c.source_type == 'video' else [],
                              object_removal_enabled=self.object_removal_enabled.isChecked(),
                              effect_preset=c.effect_preset,
                              freeze_frame=self.freeze_enabled.isChecked(),
@@ -2389,7 +2806,10 @@ class Editor(QMainWindow):
                              chroma_key_enabled=self.chroma_key_enabled.isChecked(),chroma_key_color=self.chroma_key_color.text().strip(),
                              chroma_key_similarity=self.chroma_key_similarity.value()/100,chroma_key_blend=self.chroma_key_blend.value()/100,
                              mask_type=self.mask_type.currentData(),mask_x=self.mask_x.value()/100,mask_y=self.mask_y.value()/100,
-                             mask_width=self.mask_width.value()/100,mask_height=self.mask_height.value()/100,mask_feather=self.mask_feather.value()/100)
+                             mask_width=self.mask_width.value()/100,mask_height=self.mask_height.value()/100,mask_feather=self.mask_feather.value()/100,
+                             mask_points=self.parse_mask_points(self.mask_points.text()) if self.mask_type.currentData() == 'bezier' else [],
+                             mask_path_keyframes=[dict(frame, points=[dict(point) for point in frame.get('points', [])])
+                                                  for frame in c.mask_path_keyframes] if self.mask_type.currentData() == 'bezier' else [])
                 preset_values=EFFECT_PRESETS.get(c.effect_preset)
                 def differs_from_preset(key, value):
                     current=values.get(key, getattr(c,key))
@@ -2406,6 +2826,12 @@ class Editor(QMainWindow):
                 if c.tracking_keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
                                              or abs(values['speed']-c.speed)>1e-7):
                     values['tracking_keyframes']=retime_tracking_keyframes(c,values['start'],values['end'],values['speed'])
+                if c.auto_reframe_keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
+                                                 or abs(values['speed']-c.speed)>1e-7):
+                    values['auto_reframe_keyframes']=retime_auto_reframe_keyframes(c,values['start'],values['end'],values['speed'])
+                if c.mask_path_keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
+                                              or abs(values['speed']-c.speed)>1e-7):
+                    values['mask_path_keyframes']=retime_mask_path_keyframes(c,values['start'],values['end'],values['speed'])
             if c.kind in ('video','audio') and c.volume_keyframes and (
                     abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
                     or abs(values['speed']-c.speed)>1e-7):
@@ -2437,9 +2863,15 @@ class Editor(QMainWindow):
                       keyframes=[],speed_keyframes=[],brightness=0.0,contrast=1.0,saturation=1.0,
                       filter_preset='none',lut_path='',opacity=1.0,blur=0.0,sharpen=0.0,stabilization=0.0,effect_preset='clean',
                       background_removal_enabled=False,background_removed_path='',tracking_keyframes=[],object_removal_enabled=False,
+                      auto_reframe_enabled=False,auto_reframe_format='project',auto_reframe_keyframes=[],
+                      color_exposure=0.0,color_temperature=0.0,color_tint=0.0,color_vibrance=0.0,
+                      color_lift_r=0.0,color_lift_g=0.0,color_lift_b=0.0,
+                      color_gamma_r=0.0,color_gamma_g=0.0,color_gamma_b=0.0,
+                      color_gain_r=0.0,color_gain_g=0.0,color_gain_b=0.0,
                       freeze_frame=False,freeze_duration=0.0,reverse=False,chroma_key_enabled=False,
                       chroma_key_color='#00ff00',chroma_key_similarity=.1,chroma_key_blend=.1,
-                      mask_type='none',mask_x=0.0,mask_y=0.0,mask_width=1.0,mask_height=1.0,mask_feather=0.0)
+                      mask_type='none',mask_x=0.0,mask_y=0.0,mask_width=1.0,mask_height=1.0,mask_feather=0.0,
+                      mask_points=[],mask_path_keyframes=[])
         if all(getattr(c,key)==value for key,value in defaults.items()):
             return
         self.checkpoint(); candidate=replace(c,**defaults)
@@ -2865,6 +3297,116 @@ class Editor(QMainWindow):
             self.statusBar().showMessage(f'Motion-Tracking fertig · {len(unique)} Punkte gespeichert.',6000)
         except Exception as exc:
             self.error(exc)
+
+    def start_auto_reframe(self):
+        """Detect a local face focus path for the selected video clip."""
+        c=self.current_clip()
+        if not c or c.kind!='video' or c.source_type!='video':
+            return self.error('Wähle einen normalen Videoclip für Auto-Reframe.')
+        if self.worker or not self.require_unlocked(c):
+            return
+        format_name=self.auto_reframe_format.currentData() or 'project'
+        try:
+            target_aspect=auto_reframe_aspect(format_name,PRESETS[self.preset.currentText()])
+        except (KeyError,ValueError) as exc:
+            return self.error(exc)
+        uid=c.uid
+        def operation(progress,cancel):
+            try:
+                return auto_reframe_video(c.path,c.start,c.end,target_aspect,progress,cancel)
+            except AIToolError:
+                if cancel.is_set():
+                    raise ExportCancelled()
+                raise
+        self.start_job('Lokales Auto-Reframe wird analysiert …',operation,
+                       lambda result:self.auto_reframe_done(result,uid,format_name))
+
+    def auto_reframe_done(self,result,uid,format_name):
+        if not result['ok']:
+            return self.job_error(result)
+        c=next((value for value in self.clips if value.uid==uid),None)
+        if not c:
+            return self.statusBar().showMessage('Clip wurde während des Auto-Reframes entfernt.',5000)
+        divisor=max(.25,float(c.speed))
+        points=[]
+        for point in result['value']:
+            value=dict(point)
+            value['time']=round(min(c.length,max(0.0,float(point['time'])/divisor)),6)
+            points.append(value)
+        points.sort(key=lambda value:float(value['time']))
+        unique=[]
+        for point in points:
+            if unique and abs(float(unique[-1]['time'])-float(point['time'])) <= 1e-7:
+                unique[-1]=point
+            else:
+                unique.append(point)
+        try:
+            candidate=replace(c,auto_reframe_enabled=True,auto_reframe_format=format_name,
+                              auto_reframe_keyframes=unique)
+            proposed=[candidate if value.uid==uid else value for value in self.clips]
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
+            detected=sum(1 for point in unique if float(point.get('score',0.0)) > 0)
+            self.statusBar().showMessage(
+                f'Auto-Reframe fertig · {len(unique)} Fokus-Punkte · {detected} mit Gesichtserkennung.',6000)
+        except Exception as exc:
+            self.error(exc)
+
+    def clear_auto_reframe(self):
+        c=self.current_clip()
+        if not c or c.kind!='video' or not c.auto_reframe_keyframes:
+            return
+        if self.worker or not self.require_unlocked(c):
+            return
+        candidate=replace(c,auto_reframe_enabled=False,auto_reframe_keyframes=[])
+        self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
+
+    def start_beat_analysis(self):
+        c=self.current_clip()
+        if not c or c.kind not in ('video','audio') or not c.has_audio or c.source_type=='adjustment':
+            return self.error('Wähle einen Video- oder Audioclip mit Ton für Beat-Sync.')
+        if self.worker or not self.require_unlocked(c):
+            return
+        uid=c.uid
+        def operation(progress,cancel):
+            try:
+                return analyze_beats(c.path,c.start,c.end,progress,cancel)
+            except AIToolError:
+                if cancel.is_set():
+                    raise ExportCancelled()
+                raise
+        self.start_job('Lokale Beat-Erkennung wird berechnet …',operation,
+                       lambda result:self.beat_analysis_done(result,uid))
+
+    def beat_analysis_done(self,result,uid):
+        if not result['ok']:
+            return self.job_error(result)
+        c=next((value for value in self.clips if value.uid==uid),None)
+        if not c:
+            return self.statusBar().showMessage('Clip wurde während der Beat-Erkennung entfernt.',5000)
+        divisor=max(.25,float(c.speed))
+        beat_markers=[marker for marker in self.markers
+                      if not (marker.get('kind') == 'beat' and c.position-1e-6 <= float(marker.get('time',0)) <= c.finish+1e-6)]
+        for index, beat in enumerate(result['value'].get('beats', []), 1):
+            time=c.position+min(c.length,max(0.0,float(beat)/divisor))
+            beat_markers.append({'time':round(time,6),'label':f'Beat {index}','kind':'beat','color':'#ff7edb'})
+        try:
+            normalized=normalize_markers(beat_markers,length(self.clips))
+            self.checkpoint(); self.markers=normalized; self.changed()
+            bpm=result['value'].get('bpm',0.0)
+            self.statusBar().showMessage(
+                f"Beat-Sync fertig · {len(result['value'].get('beats',[]))} Beats"
+                + (f" · ca. {bpm:.0f} BPM" if bpm else ''),6000)
+        except Exception as exc:
+            self.error(exc)
+
+    def clear_beat_markers(self):
+        if self.worker:
+            return
+        markers=[marker for marker in self.markers if marker.get('kind') != 'beat']
+        if len(markers) == len(self.markers):
+            return
+        self.checkpoint(); self.markers=normalize_markers(markers,length(self.clips)); self.changed()
 
     def clear_motion_tracking(self):
         c=self.current_clip()
@@ -4059,7 +4601,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.17.1-Fenster.');return 1
+                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.18.0-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

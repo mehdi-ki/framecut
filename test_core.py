@@ -10,10 +10,11 @@ from array import array
 from core import (Clip,import_clip,import_image_sequence,parse_subtitle_file,subtitle_cues_from_clips,write_subtitle_file,split_clip,edited_clip,slip_clip,roll_edit,slide_edit,snap_time,validate_timeline,
                   save_project,load_project,render,probe,ExportCancelled,length,keyframe_expression,
                   volume_keyframe_expression,speed_keyframe_expression,speed_ramp_duration,curve_progress,
-                  audio_effect_filters,tracking_expression,normalize_export_settings,resolve_export_encoder,
+                  audio_effect_filters,tracking_expression,auto_reframe_expression,auto_reframe_aspect,normalize_export_settings,resolve_export_encoder,
                   relink_project_media,archive_project,extract_project_archive,create_proxy_files,
                   PROXY_PROFILES,proxy_path_for,cache_size,prune_cache,preview_acceleration_info,normalize_markers,
-                  normalize_master_mixer,master_audio_filters,EFFECT_PRESETS,TRANSITION_TYPES,KEYFRAME_CURVES)
+                  normalize_master_mixer,master_audio_filters,EFFECT_PRESETS,TRANSITION_TYPES,KEYFRAME_CURVES,color_grading_filters)
+from ai_tools import analyze_beats
 
 
 def ff(*args):
@@ -419,6 +420,64 @@ class EditorCoreTest(unittest.TestCase):
         self.assertEqual(loaded[0].tracking_keyframes,tracked.tracking_keyframes)
         self.assertTrue(loaded[0].object_removal_enabled)
         self.assertEqual(Path(loaded[1].background_removed_path),transparent.resolve())
+
+    def test_step9_auto_reframe_render_split_and_roundtrip(self):
+        """Auto-Reframe follows focus points in the real crop/render graph."""
+        clip=replace(import_clip(self.blue),end=2,auto_reframe_enabled=True,
+                     auto_reframe_format='9:16',auto_reframe_keyframes=[
+                         {'time':0,'x':.25,'y':.5,'width':.3,'height':.3,'score':1.0,'curve':'ease_in_out'},
+                         {'time':1,'x':.75,'y':.5,'width':.3,'height':.3,'score':.9,'curve':'ease_in_out'},
+                         {'time':2,'x':.65,'y':.45,'width':.25,'height':.25,'score':0.0,'curve':'ease_in_out'},
+                     ])
+        validate_timeline([clip],self.tracks)
+        self.assertAlmostEqual(auto_reframe_aspect('9:16',(320,180)),9/16)
+        self.assertIn('if(lt',auto_reframe_expression(clip,'x'))
+        target=self.root/'step9-auto-reframe.mp4';render([clip],self.tracks,target,(180,320))
+        self.assertTrue(probe(target)[1]);ff('-i',target,'-f','null','-')
+        first,second=split_clip(clip,1)
+        validate_timeline([first,second],self.tracks)
+        self.assertAlmostEqual(first.auto_reframe_keyframes[-1]['time'],first.length,places=5)
+        self.assertAlmostEqual(second.auto_reframe_keyframes[0]['time'],0,places=5)
+        project=self.root/'step9-auto-reframe.framecut';save_project(project,[clip],'1080p · 9:16',self.tracks)
+        loaded=load_project(project)['clips'][0]
+        self.assertTrue(loaded.auto_reframe_enabled)
+        self.assertEqual(loaded.auto_reframe_format,clip.auto_reframe_format)
+        self.assertEqual(loaded.auto_reframe_keyframes,clip.auto_reframe_keyframes)
+
+    def test_step10_bezier_grading_and_beat_sync(self):
+        """Free masks, three-way grading and beat markers survive delivery."""
+        points=[{'x':.10,'y':.12},{'x':.62,'y':.08},{'x':.88,'y':.55},{'x':.46,'y':.90},{'x':.08,'y':.68}]
+        moved=[{'x':.18,'y':.10},{'x':.72,'y':.14},{'x':.92,'y':.62},{'x':.50,'y':.94},{'x':.12,'y':.70}]
+        clip=replace(import_clip(self.blue),end=2,mask_type='bezier',mask_points=points,mask_feather=.03,
+                     mask_path_keyframes=[{'time':0,'points':points},{'time':1,'points':moved}],
+                     color_exposure=.75,color_temperature=.35,color_tint=-.2,color_vibrance=.45,
+                     color_lift_r=.12,color_lift_g=-.04,color_lift_b=.08,
+                     color_gamma_r=-.10,color_gamma_g=.06,color_gamma_b=.14,
+                     color_gain_r=.18,color_gain_g=.03,color_gain_b=-.08)
+        validate_timeline([clip],self.tracks)
+        self.assertTrue(any(value.startswith('colorbalance=') for value in color_grading_filters(clip)))
+        target=self.root/'step10-bezier-grading.mp4';render([clip],self.tracks,target,(320,180))
+        self.assertTrue(probe(target)[1]);ff('-i',target,'-f','null','-')
+        first,second=split_clip(clip,1)
+        validate_timeline([first,second],self.tracks)
+        self.assertEqual(len(first.mask_path_keyframes),2)
+        self.assertEqual(float(second.mask_path_keyframes[0]['time']),0.0)
+        markers=[{'time':.25,'label':'Beat 1','kind':'beat'},{'time':.75,'label':'Beat 2','kind':'beat'}]
+        project=self.root/'step10-delivery.framecut';save_project(project,[clip],'720p · 16:9',self.tracks,markers=markers)
+        loaded=load_project(project)
+        loaded_clip=loaded['clips'][0]
+        self.assertEqual(loaded_clip.mask_points,clip.mask_points)
+        self.assertEqual(loaded_clip.mask_path_keyframes,clip.mask_path_keyframes)
+        self.assertEqual((loaded_clip.color_exposure,loaded_clip.color_gain_b),
+                         (clip.color_exposure,clip.color_gain_b))
+        self.assertEqual(loaded['markers'],normalize_markers(markers,loaded['clips'][0].finish))
+
+        clicks=self.root/'step10-clicks.wav'
+        ff('-f','lavfi','-i','aevalsrc=if(lt(mod(t\\,0.5)\\,0.03)\\,sin(2*PI*900*t)\\,0):s=22050',
+           '-t',3,'-c:a','pcm_s16le',clicks)
+        beat_data=analyze_beats(clicks,0,3)
+        self.assertGreaterEqual(len(beat_data['beats']),4)
+        self.assertGreater(beat_data['bpm'],100)
 
     def test_step5_audio_ducking_render(self):
         """A ducked music bed is lowered while the foreground voice is present."""

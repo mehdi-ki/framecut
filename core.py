@@ -90,7 +90,7 @@ TRANSITION_TYPES = ('none', 'dissolve', 'slide_left', 'slide_right', 'slide_up',
                     'pixelize', 'smooth_left', 'smooth_right', 'smooth_up', 'smooth_down',
                     'cover_left', 'cover_right', 'cover_up', 'cover_down')
 FILTER_PRESETS = ('none', 'vivid', 'warm', 'cool', 'cinematic', 'vintage', 'noir')
-MASK_TYPES = ('none', 'rectangle', 'ellipse')
+MASK_TYPES = ('none', 'rectangle', 'ellipse', 'bezier')
 AUDIO_CHANNEL_MODES = ('stereo', 'mono', 'left', 'right')
 EXPORT_FORMATS = {
     'mp4': {'label': 'MP4 · kompatibel', 'extension': '.mp4', 'muxer': 'mp4', 'codecs': ('h264', 'hevc')},
@@ -120,8 +120,8 @@ PROXY_PROFILES = {
     '360p': {'label': '360p · schnell', 'width': 640, 'height': 360, 'crf': 31, 'preset': 'ultrafast'},
     '720p': {'label': '720p · sauber', 'width': 1280, 'height': 720, 'crf': 28, 'preset': 'veryfast'},
 }
-MARKER_KINDS = ('marker', 'chapter')
-MARKER_COLORS = {'marker': '#63ead4', 'chapter': '#f8c86f'}
+MARKER_KINDS = ('marker', 'chapter', 'beat')
+MARKER_COLORS = {'marker': '#63ead4', 'chapter': '#f8c86f', 'beat': '#ff7edb'}
 DEFAULT_EXPORT_SETTINGS = {
     'format': 'mp4',
     'video_codec': 'h264',
@@ -138,7 +138,33 @@ DEFAULT_MASTER_MIXER = {
 }
 PRESETS = {"1080p · 16:9": (1920, 1080), "720p · 16:9": (1280, 720),
            "1080p · 9:16": (1080, 1920), "Quadratisch": (1080, 1080)}
+AUTO_REFRAME_FORMATS = ('project', '16:9', '9:16', '1:1')
+AUTO_REFRAME_FORMAT_LABELS = {
+    'project': 'Projektformat',
+    '16:9': 'Querformat · 16:9',
+    '9:16': 'Hochformat · 9:16',
+    '1:1': 'Quadratisch · 1:1',
+}
 _PROBE_CACHE = {}
+
+
+def auto_reframe_aspect(format_name, size):
+    """Return the target crop aspect used by Auto-Reframe."""
+    if format_name not in AUTO_REFRAME_FORMATS:
+        raise ValueError("Ungültiges Auto-Reframe-Format.")
+    if format_name == '16:9':
+        return 16.0 / 9.0
+    if format_name == '9:16':
+        return 9.0 / 16.0
+    if format_name == '1:1':
+        return 1.0
+    try:
+        width, height = (float(size[0]), float(size[1]))
+    except (TypeError, IndexError, ValueError) as exc:
+        raise ValueError("Ungültige Projektgröße für Auto-Reframe.") from exc
+    if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or height <= 0:
+        raise ValueError("Ungültige Projektgröße für Auto-Reframe.")
+    return width / height
 
 
 @lru_cache(maxsize=1)
@@ -265,6 +291,20 @@ def speed_ramp_source_offset(source_span, default, frames, timeline_time):
     return (low+high)/2
 
 
+def _validate_mask_points(points, label):
+    """Validate normalized Bezier anchors and optional cubic handles."""
+    for point in points:
+        if not isinstance(point, dict) or "x" not in point or "y" not in point:
+            raise ValueError(f"{label} enthält einen unvollständigen Punkt.")
+        values = [point["x"], point["y"]]
+        for handle in ("in_x", "in_y", "out_x", "out_y"):
+            if handle in point:
+                values.append(point[handle])
+        if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                   and math.isfinite(float(value)) and 0 <= float(value) <= 1 for value in values):
+            raise ValueError(f"{label}-Punkte müssen zwischen 0 und 1 liegen.")
+
+
 @dataclass
 class Clip:
     path: str
@@ -324,6 +364,21 @@ class Clip:
     saturation: float = 1.0
     filter_preset: str = "none"
     lut_path: str = ""
+    # Professional three-way grading controls. Values are normalized so they
+    # remain portable across preview and export resolutions.
+    color_exposure: float = 0.0
+    color_temperature: float = 0.0
+    color_tint: float = 0.0
+    color_vibrance: float = 0.0
+    color_lift_r: float = 0.0
+    color_lift_g: float = 0.0
+    color_lift_b: float = 0.0
+    color_gamma_r: float = 0.0
+    color_gamma_g: float = 0.0
+    color_gamma_b: float = 0.0
+    color_gain_r: float = 0.0
+    color_gain_g: float = 0.0
+    color_gain_b: float = 0.0
     # Deterministic per-clip compositing/effect controls.
     opacity: float = 1.0
     blur: float = 0.0
@@ -334,6 +389,12 @@ class Clip:
     background_removal_enabled: bool = False
     background_removed_path: str = ""
     tracking_keyframes: list = field(default_factory=list)
+    # Auto-Reframe focus points use normalized subject centers.  Width and
+    # height retain the detector's confidence context for future refinements;
+    # the renderer uses x/y to keep the target inside the chosen crop.
+    auto_reframe_enabled: bool = False
+    auto_reframe_format: str = "project"
+    auto_reframe_keyframes: list = field(default_factory=list)
     object_removal_enabled: bool = False
     effect_preset: str = "clean"
     chroma_key_enabled: bool = False
@@ -346,6 +407,8 @@ class Clip:
     mask_width: float = 1.0
     mask_height: float = 1.0
     mask_feather: float = 0.0
+    mask_points: list = field(default_factory=list)
+    mask_path_keyframes: list = field(default_factory=list)
     # Local clip-time volume automation for audio and video source audio.
     volume_keyframes: list = field(default_factory=list)
     # Native FFmpeg audio processing controls. These defaults keep older
@@ -384,6 +447,10 @@ class Clip:
                     self.crop_right, self.crop_bottom, self.rotation, self.transition_duration,
                     self.brightness, self.contrast, self.saturation, self.opacity, self.blur,
                     self.stabilization,
+                    self.color_exposure, self.color_temperature, self.color_tint, self.color_vibrance,
+                    self.color_lift_r, self.color_lift_g, self.color_lift_b,
+                    self.color_gamma_r, self.color_gamma_g, self.color_gamma_b,
+                    self.color_gain_r, self.color_gain_g, self.color_gain_b,
                     self.sharpen, self.freeze_duration, self.chroma_key_similarity,
                     self.chroma_key_blend, self.mask_x, self.mask_y, self.mask_width,
                     self.mask_height, self.mask_feather, self.audio_noise_reduction,
@@ -516,6 +583,33 @@ class Clip:
             if x + width > 1.000001 or y + height > 1.000001:
                 raise ValueError("Motion-Tracking-Bereich liegt außerhalb des Bildes.")
             previous_tracking_time = time
+        if type(self.auto_reframe_enabled) is not bool or self.auto_reframe_format not in AUTO_REFRAME_FORMATS:
+            raise ValueError("Ungültige Auto-Reframe-Einstellung.")
+        if not isinstance(self.auto_reframe_keyframes, list):
+            raise ValueError("Ungültige Auto-Reframe-Daten.")
+        if self.kind != "video" and (self.auto_reframe_enabled or self.auto_reframe_keyframes):
+            raise ValueError("Auto-Reframe ist nur für Videoclips erlaubt.")
+        if self.source_type != "video" and (self.auto_reframe_enabled or self.auto_reframe_keyframes):
+            raise ValueError("Auto-Reframe ist nur für normale Videodateien erlaubt.")
+        previous_auto_reframe_time = -1.0
+        for point in self.auto_reframe_keyframes:
+            if not isinstance(point, dict):
+                raise ValueError("Ungültiger Auto-Reframe-Punkt.")
+            try:
+                values = (point["time"], point["x"], point["y"], point["width"], point["height"])
+            except KeyError as exc:
+                raise ValueError("Auto-Reframe-Punkt enthält unvollständige Daten.") from exc
+            if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                       and math.isfinite(float(value)) for value in values):
+                raise ValueError("Ungültige Auto-Reframe-Zahl.")
+            time, x, y, width, height = map(float, values)
+            if time < -1e-7 or time > self.length + 1e-7 or time <= previous_auto_reframe_time + 1e-7:
+                raise ValueError("Auto-Reframe-Zeit muss sortiert im Clip liegen.")
+            if not 0 <= x <= 1 or not 0 <= y <= 1 or not 0 < width <= 1 or not 0 < height <= 1:
+                raise ValueError("Auto-Reframe-Fokus liegt außerhalb des Bildes.")
+            if point.get("curve", "ease_in_out") not in KEYFRAME_CURVES:
+                raise ValueError("Ungültige Auto-Reframe-Kurve.")
+            previous_auto_reframe_time = time
         if self.kind == "text":
             if not isinstance(self.text, str) or not self.text.strip():
                 raise ValueError("Textclip darf nicht leer sein.")
@@ -563,6 +657,14 @@ class Clip:
                 raise ValueError("Die Rotation muss zwischen -360° und 360° liegen.")
             if not -1 <= self.brightness <= 1 or not 0 <= self.contrast <= 3 or not 0 <= self.saturation <= 3:
                 raise ValueError("Ungültige Farbkorrektur.")
+            if not -3 <= self.color_exposure <= 3 or not -1 <= self.color_temperature <= 1 \
+                    or not -1 <= self.color_tint <= 1 or not -1 <= self.color_vibrance <= 1:
+                raise ValueError("Ungültige Color-Grading-Grundwerte.")
+            if not all(-1 <= value <= 1 for value in (
+                    self.color_lift_r, self.color_lift_g, self.color_lift_b,
+                    self.color_gamma_r, self.color_gamma_g, self.color_gamma_b,
+                    self.color_gain_r, self.color_gain_g, self.color_gain_b)):
+                raise ValueError("Color-Grading-Werte müssen zwischen -1 und 1 liegen.")
             if not 0 <= self.opacity <= 1 or not 0 <= self.blur <= 20 or not 0 <= self.sharpen <= 5:
                 raise ValueError("Ungültiger Videoeffekt.")
             if not 0 <= self.stabilization <= 1:
@@ -586,6 +688,25 @@ class Clip:
                 raise ValueError("Ungültige Maske.")
             if self.mask_width <= 0 or self.mask_height <= 0 or self.mask_x+self.mask_width > 1.000001 or self.mask_y+self.mask_height > 1.000001:
                 raise ValueError("Die Maske muss innerhalb des Bildes liegen.")
+            if not isinstance(self.mask_points, list) or not isinstance(self.mask_path_keyframes, list):
+                raise ValueError("Ungültige Bezier-Maskendaten.")
+            if self.mask_type == 'bezier' and len(self.mask_points) < 3 and not self.mask_path_keyframes:
+                raise ValueError("Eine Bezier-Maske braucht mindestens drei Punkte.")
+            _validate_mask_points(self.mask_points, "Bezier-Maske")
+            previous_mask_path_time = -1.0
+            for path_frame in self.mask_path_keyframes:
+                if not isinstance(path_frame, dict) or "time" not in path_frame or "points" not in path_frame:
+                    raise ValueError("Ungültiger Bezier-Rotoskopie-Keyframe.")
+                time = path_frame["time"]
+                if not isinstance(time, (int, float)) or isinstance(time, bool) or not math.isfinite(float(time)):
+                    raise ValueError("Ungültige Bezier-Rotoskopie-Zeit.")
+                time = float(time)
+                if time < -1e-7 or time > self.length + 1e-7 or time <= previous_mask_path_time + 1e-7:
+                    raise ValueError("Bezier-Rotoskopie-Zeit muss sortiert im Clip liegen.")
+                if not isinstance(path_frame["points"], list) or len(path_frame["points"]) < 3:
+                    raise ValueError("Ein Rotoskopie-Keyframe braucht mindestens drei Punkte.")
+                _validate_mask_points(path_frame["points"], "Bezier-Rotoskopie")
+                previous_mask_path_time = time
             previous_time = -1.0
             for keyframe in self.keyframes:
                 if not isinstance(keyframe, dict):
@@ -846,7 +967,7 @@ def normalize_markers(markers, duration=None):
             raise ValueError("Marker-Name muss Text sein.")
         label = label.strip()[:80]
         if not label:
-            label = 'Kapitel' if kind == 'chapter' else 'Marker'
+            label = 'Kapitel' if kind == 'chapter' else 'Beat' if kind == 'beat' else 'Marker'
         color = raw.get('color', MARKER_COLORS[kind])
         if not isinstance(color, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}', color):
             color = MARKER_COLORS[kind]
@@ -981,12 +1102,16 @@ def split_clip(clip, timeline_time):
                     keyframes=retime_keyframes(clip,clip.start,split_source_time,clip.speed),
                     volume_keyframes=retime_volume_keyframes(clip,clip.start,split_source_time,clip.speed),
                     speed_keyframes=retime_speed_keyframes(clip,clip.start,split_source_time),
-                    tracking_keyframes=retime_tracking_keyframes(clip,clip.start,split_source_time,clip.speed))
+                    tracking_keyframes=retime_tracking_keyframes(clip,clip.start,split_source_time,clip.speed),
+                    auto_reframe_keyframes=retime_auto_reframe_keyframes(clip,clip.start,split_source_time,clip.speed),
+                    mask_path_keyframes=retime_mask_path_keyframes(clip,clip.start,split_source_time,clip.speed))
     second = replace(clip, start=split_source_time, position=timeline_time, uid=uuid.uuid4().hex,
                      keyframes=retime_keyframes(clip,split_source_time,clip.end,clip.speed),
                      volume_keyframes=retime_volume_keyframes(clip,split_source_time,clip.end,clip.speed),
                      speed_keyframes=retime_speed_keyframes(clip,split_source_time,clip.end),
-                     tracking_keyframes=retime_tracking_keyframes(clip,split_source_time,clip.end,clip.speed))
+                     tracking_keyframes=retime_tracking_keyframes(clip,split_source_time,clip.end,clip.speed),
+                     auto_reframe_keyframes=retime_auto_reframe_keyframes(clip,split_source_time,clip.end,clip.speed),
+                     mask_path_keyframes=retime_mask_path_keyframes(clip,split_source_time,clip.end,clip.speed))
     return first, second
 
 
@@ -1385,6 +1510,34 @@ def preset_filters(clip):
     return list(presets.get(clip.filter_preset, []))
 
 
+def color_grading_filters(clip, enable=None):
+    """Return native FFmpeg filters for exposure, wheels and vibrance."""
+    suffix = f":enable='{enable}'" if enable else ''
+    filters = []
+    if (abs(clip.color_exposure) > 1e-7 or abs(clip.color_vibrance) > 1e-7):
+        brightness = float(clip.color_exposure) / 3.0
+        saturation = 1.0 + float(clip.color_vibrance) * .35
+        filters.append(f"eq=brightness={brightness:.6f}:saturation={saturation:.6f}{suffix}")
+    temperature = float(clip.color_temperature)
+    tint = float(clip.color_tint)
+    lift = (float(clip.color_lift_r) + temperature*.22 + tint*.06,
+            float(clip.color_lift_g) - tint*.12,
+            float(clip.color_lift_b) - temperature*.22 + tint*.06)
+    gamma = (float(clip.color_gamma_r) + temperature*.16 + tint*.04,
+             float(clip.color_gamma_g) - tint*.08,
+             float(clip.color_gamma_b) - temperature*.16 + tint*.04)
+    gain = (float(clip.color_gain_r) + temperature*.28 + tint*.08,
+            float(clip.color_gain_g) - tint*.16,
+            float(clip.color_gain_b) - temperature*.28 + tint*.08)
+    if any(abs(value) > 1e-7 for value in (temperature, tint, *lift, *gamma, *gain)):
+        filters.append(
+            "colorbalance="
+            f"rs={max(-1,min(1,lift[0])):.6f}:gs={max(-1,min(1,lift[1])):.6f}:bs={max(-1,min(1,lift[2])):.6f}:"
+            f"rm={max(-1,min(1,gamma[0])):.6f}:gm={max(-1,min(1,gamma[1])):.6f}:bm={max(-1,min(1,gamma[2])):.6f}:"
+            f"rh={max(-1,min(1,gain[0])):.6f}:gh={max(-1,min(1,gain[1])):.6f}:bh={max(-1,min(1,gain[2])):.6f}{suffix}")
+    return filters
+
+
 def tracking_expression(clip, field, time_expression="t"):
     """Interpolate a tracked rectangle field in local clip seconds."""
     defaults = {'x': clip.mask_x, 'y': clip.mask_y,
@@ -1408,10 +1561,108 @@ def tracking_expression(clip, field, time_expression="t"):
     return expression
 
 
+def _mask_point_tuple(point):
+    return float(point['x']), float(point['y'])
+
+
+def _bezier_polygon(points, segments=6):
+    """Approximate cubic anchor handles with a compact polygon for FFmpeg."""
+    if not points:
+        return []
+    polygon = []
+    has_handles = any(any(key in point for key in ('in_x', 'in_y', 'out_x', 'out_y')) for point in points)
+    steps = max(1, int(segments if has_handles else 1))
+    for index, current in enumerate(points):
+        following = points[(index + 1) % len(points)]
+        p0 = _mask_point_tuple(current)
+        p1 = (float(current.get('out_x', current['x'])), float(current.get('out_y', current['y'])))
+        p2 = (float(following.get('in_x', following['x'])), float(following.get('in_y', following['y'])))
+        p3 = _mask_point_tuple(following)
+        for step in range(steps):
+            t = step / float(steps)
+            inverse = 1.0 - t
+            polygon.append((inverse**3*p0[0] + 3*inverse**2*t*p1[0] + 3*inverse*t**2*p2[0] + t**3*p3[0],
+                            inverse**3*p0[1] + 3*inverse**2*t*p1[1] + 3*inverse*t**2*p2[1] + t**3*p3[1]))
+    return polygon
+
+
+def _polygon_alpha_expression(points):
+    """Use a winding-angle test, which works for concave rotoscope paths."""
+    polygon = _bezier_polygon(points)
+    angles = []
+    for index, current in enumerate(polygon):
+        following = polygon[(index + 1) % len(polygon)]
+        ax = f"(W*{current[0]:.7f}-X)"
+        ay = f"(H*{current[1]:.7f}-Y)"
+        bx = f"(W*{following[0]:.7f}-X)"
+        by = f"(H*{following[1]:.7f}-Y)"
+        angles.append(f"atan2(({ax})*({by})-({ay})*({bx}),({ax})*({bx})+({ay})*({by}))")
+    winding = '(' + '+'.join(angles) + ')'
+    return f"if(gt(abs({winding}),3.14159265),1,0)"
+
+
+def _default_mask_points():
+    return [{'x': .15, 'y': .15}, {'x': .85, 'y': .15},
+            {'x': .85, 'y': .85}, {'x': .15, 'y': .85}]
+
+
+def _bezier_mask_filter(clip):
+    path_frames = [dict(frame) for frame in clip.mask_path_keyframes]
+    if not path_frames:
+        path_frames = [{'time': 0.0, 'points': clip.mask_points}]
+    if float(path_frames[0].get('time', 0.0)) > 1e-7:
+        path_frames.insert(0, {'time': 0.0, 'points': clip.mask_points or _default_mask_points()})
+    alpha_expression = _polygon_alpha_expression(path_frames[-1]['points'])
+    for left, right in reversed(list(zip(path_frames, path_frames[1:]))):
+        alpha_expression = f"if(lt(T,{float(right['time']):.6f}),{_polygon_alpha_expression(left['points'])},{alpha_expression})"
+    return f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({alpha_expression})'"
+
+
+def auto_reframe_expression(clip, field, time_expression="T"):
+    """Interpolate the normalized Auto-Reframe focus center in local seconds."""
+    if field not in ('x', 'y'):
+        raise ValueError("Unbekanntes Auto-Reframe-Feld.")
+    frames = clip.auto_reframe_keyframes if clip.kind == 'video' else []
+    if not frames:
+        return '0.500000'
+
+    def number(value):
+        return f'{float(value):.6f}'
+
+    expression = number(frames[-1][field])
+    for left, right in reversed(list(zip(frames, frames[1:]))):
+        left_time, right_time = float(left['time']), float(right['time'])
+        ratio = f'(({time_expression}-{number(left_time)})/{number(max(1e-9, right_time-left_time))})'
+        progress = keyframe_curve_expression(ratio, left.get('curve', 'ease_in_out'))
+        interpolated = (f'({number(left[field])}+({number(right[field])}-{number(left[field])})*'
+                        f'{progress})')
+        expression = f'if(lt({time_expression},{number(right_time)}),{interpolated},{expression})'
+    first_time = float(frames[0]['time'])
+    if first_time > 1e-7:
+        expression = f'if(lt({time_expression},{number(first_time)}),0.500000,{expression})'
+    return expression
+
+
+def auto_reframe_crop_filter(clip, size):
+    """Build a live FFmpeg crop that follows the saved focus keyframes."""
+    aspect = auto_reframe_aspect(clip.auto_reframe_format, size)
+    aspect_text = f'{aspect:.9f}'
+    x_expression = auto_reframe_expression(clip, 'x', 't')
+    y_expression = auto_reframe_expression(clip, 'y', 't')
+    crop_width = f'floor(min(iw,ih*{aspect_text})/2)*2'
+    crop_height = f'floor(min(ih,iw/{aspect_text})/2)*2'
+    return ("crop="
+            f"w='{crop_width}':h='{crop_height}':"
+            f"x='clip(iw*({x_expression})-ow/2,0,iw-ow)':"
+            f"y='clip(ih*({y_expression})-oh/2,0,ih-oh)'")
+
+
 def mask_filter(clip):
     """Create a soft rectangle/ellipse alpha mask after the frame is scaled."""
     if clip.mask_type == 'none':
         return None
+    if clip.mask_type == 'bezier':
+        return _bezier_mask_filter(clip)
     feather = max(0.0001, float(clip.mask_feather))
     if clip.mask_type == 'rectangle':
         # geq exposes the current frame dimensions as W/H (not iw/ih).
@@ -1436,6 +1687,17 @@ def mask_filter(clip):
         distance = f'hypot((X-({center_x}))/({radius_x}),(Y-({center_y}))/({radius_y}))'
         alpha = f'if(gt({distance},1),0,if(gt({distance},1-{feather:.6f}),(1-{distance})/{feather:.6f},1))'
     return f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({alpha})'"
+
+
+def mask_filters(clip):
+    """Return mask filters, including softening for free Bezier paths."""
+    expression = mask_filter(clip)
+    if not expression:
+        return []
+    filters = [expression]
+    if clip.mask_type == 'bezier' and clip.mask_feather > 1e-7:
+        filters.append(f"gblur=sigma={max(.1, float(clip.mask_feather)*18):.6f}:steps=1")
+    return filters
 
 
 def retime_keyframes(clip, start, end, speed):
@@ -1509,6 +1771,49 @@ def retime_tracking_keyframes(clip, start, end, speed):
     return result
 
 
+def retime_auto_reframe_keyframes(clip, start, end, speed):
+    """Keep Auto-Reframe focus points aligned after trim or speed changes."""
+    if clip.kind != "video" or not clip.auto_reframe_keyframes:
+        return []
+    source_per_local = max(0.25, float(clip.speed))
+    new_source_per_local = max(0.25, float(speed))
+    new_length = max(0.0, (float(end)-float(start))/new_source_per_local)
+    result = []
+    for point in clip.auto_reframe_keyframes:
+        source_time = float(clip.start) + float(point["time"]) * source_per_local
+        if source_time < float(start)-1e-7 or source_time > float(end)+1e-7:
+            continue
+        item = dict(point)
+        item["time"] = round(max(0.0, min(new_length, (source_time-float(start))/new_source_per_local)), 6)
+        if result and abs(result[-1]["time"]-item["time"]) <= 1e-6:
+            result[-1] = item
+        else:
+            result.append(item)
+    return result
+
+
+def retime_mask_path_keyframes(clip, start, end, speed):
+    """Keep free-form rotoscope paths aligned after trim or speed changes."""
+    if clip.kind != "video" or not clip.mask_path_keyframes:
+        return []
+    source_per_local = max(0.25, float(clip.speed))
+    new_source_per_local = max(0.25, float(speed))
+    new_length = max(0.0, (float(end)-float(start))/new_source_per_local)
+    result = []
+    for frame in clip.mask_path_keyframes:
+        source_time = float(clip.start) + float(frame["time"]) * source_per_local
+        if source_time < float(start)-1e-7 or source_time > float(end)+1e-7:
+            continue
+        item = dict(frame)
+        item["points"] = [dict(point) for point in frame.get("points", [])]
+        item["time"] = round(max(0.0, min(new_length, (source_time-float(start))/new_source_per_local)), 6)
+        if result and abs(result[-1]["time"]-item["time"]) <= 1e-6:
+            result[-1] = item
+        else:
+            result.append(item)
+    return result
+
+
 def edited_clip(original, mode, delta, track=None):
     """Pure, clamped geometry; collision validation is performed on commit."""
     if mode == "move":
@@ -1520,7 +1825,9 @@ def edited_clip(original, mode, delta, track=None):
                        keyframes=retime_keyframes(original,start,original.end,original.speed),
                        volume_keyframes=retime_volume_keyframes(original,start,original.end,original.speed),
                        speed_keyframes=retime_speed_keyframes(original,start,original.end),
-                       tracking_keyframes=retime_tracking_keyframes(original,start,original.end,original.speed))
+                       tracking_keyframes=retime_tracking_keyframes(original,start,original.end,original.speed),
+                       auto_reframe_keyframes=retime_auto_reframe_keyframes(original,start,original.end,original.speed),
+                       mask_path_keyframes=retime_mask_path_keyframes(original,start,original.end,original.speed))
     if mode == "right":
         delta = max(MIN_CLIP-original.length, min(delta, (original.duration-original.end)/original.speed))
         end = original.end+delta*original.speed
@@ -1528,7 +1835,9 @@ def edited_clip(original, mode, delta, track=None):
                        keyframes=retime_keyframes(original,original.start,end,original.speed),
                        volume_keyframes=retime_volume_keyframes(original,original.start,end,original.speed),
                        speed_keyframes=retime_speed_keyframes(original,original.start,end),
-                       tracking_keyframes=retime_tracking_keyframes(original,original.start,end,original.speed))
+                       tracking_keyframes=retime_tracking_keyframes(original,original.start,end,original.speed),
+                       auto_reframe_keyframes=retime_auto_reframe_keyframes(original,original.start,end,original.speed),
+                       mask_path_keyframes=retime_mask_path_keyframes(original,original.start,end,original.speed))
     raise ValueError("Unbekannte Schnittoperation.")
 
 
@@ -1546,7 +1855,7 @@ def slip_clip(original, delta):
     end = start + span
     # A slip changes the source image underneath the clip; previously
     # analysed positions are no longer trustworthy for the new material.
-    return replace(original, start=start, end=end, tracking_keyframes=[])
+    return replace(original, start=start, end=end, tracking_keyframes=[], auto_reframe_keyframes=[], mask_path_keyframes=[])
 
 
 def roll_edit(left, right, cut_time):
@@ -2200,6 +2509,7 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
                 adjustment_filters.append(
                     f"eq=brightness={c.brightness:.6f}:contrast={c.contrast:.6f}:"
                     f"saturation={c.saturation:.6f}:enable='{enabled}'")
+            adjustment_filters.extend(color_grading_filters(c, enabled))
             if c.blur > 1e-7:
                 adjustment_filters.append(f"gblur=sigma={c.blur:.6f}:enable='{enabled}'")
             if c.sharpen > 1e-7:
@@ -2234,13 +2544,16 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
         blur_animated = animated and any("blur" in frame for frame in c.keyframes)
         crop_w=1-c.crop_left-c.crop_right
         crop_h=1-c.crop_top-c.crop_bottom
-        if any(value > 0 for value in (c.crop_left,c.crop_top,c.crop_right,c.crop_bottom)):
+        if c.auto_reframe_enabled:
+            video_filters.append(auto_reframe_crop_filter(c, size))
+        elif any(value > 0 for value in (c.crop_left,c.crop_top,c.crop_right,c.crop_bottom)):
             video_filters.append(
                 f"crop=w='iw*{crop_w:.6f}':h='ih*{crop_h:.6f}':"
                 f"x='iw*{c.crop_left:.6f}':y='ih*{c.crop_top:.6f}'")
         video_filters.extend(preset_filters(c))
         if abs(c.brightness) > 1e-7 or abs(c.contrast-1) > 1e-7 or abs(c.saturation-1) > 1e-7:
             video_filters.append(f"eq=brightness={c.brightness:.6f}:contrast={c.contrast:.6f}:saturation={c.saturation:.6f}")
+        video_filters.extend(color_grading_filters(c))
         if c.lut_path:
             video_filters.append(f"lut3d=file='{_filter_escape(c.lut_path)}'")
         scale_expression = keyframe_expression(c, "scale") if animated else f"{c.video_scale:.6f}"
@@ -2335,9 +2648,7 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
             post_filters.append(f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{radial_alpha}'")
         if transition_kind == 'fade_white' and transition_duration > 0:
             post_filters.append(f"fade=t=in:st=0:d={transition_duration:.6f}:color=white")
-        mask_expression = mask_filter(c)
-        if mask_expression:
-            post_filters.append(mask_expression)
+        post_filters.extend(mask_filters(c))
         if opacity_animated:
             opacity_expression = keyframe_expression(c, "opacity", f"(N/{fps:.6f})")
             post_filters.append(f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({opacity_expression})'")

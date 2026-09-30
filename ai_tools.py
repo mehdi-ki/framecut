@@ -5,6 +5,9 @@ projects on machines that have not installed the optional OpenCV/rembg stack;
 the affected action then reports the missing dependency in the editor.
 """
 from pathlib import Path
+from array import array
+import math
+import statistics
 import shutil
 import subprocess
 
@@ -209,3 +212,209 @@ def track_motion(source, start, end, region, progress=lambda value: None, cancel
         return results
     finally:
         capture.release()
+
+
+def auto_reframe_video(source, start, end, target_aspect, progress=lambda value: None,
+                       cancel=None, sample_fps=6.0):
+    """Detect faces locally and return smooth normalized Auto-Reframe focus points.
+
+    The detector intentionally returns a usable center fallback when a frame has
+    no face. This keeps the feature deterministic for product shots, gameplay,
+    and other footage where face detection is not the right signal.
+    """
+    source = Path(source).expanduser().resolve()
+    if not source.is_file():
+        raise AIToolError(f"Quelldatei nicht gefunden: {source}")
+    try:
+        target_aspect = float(target_aspect)
+    except (TypeError, ValueError) as exc:
+        raise AIToolError("Ungültiges Auto-Reframe-Format.") from exc
+    if not math.isfinite(target_aspect) or target_aspect <= 0:
+        raise AIToolError("Ungültiges Auto-Reframe-Format.")
+    cv2 = _cv2()
+    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+    cascade = cv2.CascadeClassifier(str(cascade_path))
+    if cascade.empty():
+        raise AIToolError("Der lokale Gesichtserkenner konnte nicht geladen werden.")
+
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        raise AIToolError(f"Video konnte nicht für Auto-Reframe geöffnet werden: {source.name}")
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
+    if not 1.0 <= fps <= 240.0:
+        fps = 30.0
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if frame_count <= 0 or width < 8 or height < 8:
+        capture.release()
+        raise AIToolError("Das Video enthält keine nutzbaren Auto-Reframe-Frames.")
+
+    start_frame = max(0, min(frame_count - 1, round(float(start) * fps)))
+    end_frame = max(start_frame, min(frame_count - 1, round(float(end) * fps)))
+    stride = max(1, round(fps / max(1.0, float(sample_fps))))
+    total_frames = max(1, end_frame - start_frame + 1)
+    capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    results = []
+    previous_center = None
+    previous_size = (0.30, 0.30)
+    previous_score = 0.0
+    last_sampled_frame = None
+    try:
+        for frame_index in range(start_frame, end_frame + 1):
+            if _cancelled(cancel):
+                raise AIToolError("Auto-Reframe abgebrochen.")
+            ok, frame = capture.read()
+            if not ok:
+                break
+            should_sample = not results or (frame_index - start_frame) % stride == 0 or frame_index == end_frame
+            if should_sample:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                detector_width = min(640, width)
+                detector_scale = detector_width / float(width)
+                if detector_scale < 0.999:
+                    detector_height = max(8, round(height * detector_scale))
+                    gray = cv2.resize(gray, (detector_width, detector_height), interpolation=cv2.INTER_AREA)
+                else:
+                    detector_scale = 1.0
+                min_face = max(12, round(min(gray.shape[1], gray.shape[0]) / 30))
+                faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4,
+                                                 minSize=(min_face, min_face))
+                candidates = []
+                for x, y, box_width, box_height in faces:
+                    x = float(x) / detector_scale
+                    y = float(y) / detector_scale
+                    box_width = float(box_width) / detector_scale
+                    box_height = float(box_height) / detector_scale
+                    center = ((x + box_width / 2) / width, (y + box_height / 2) / height)
+                    candidates.append((box_width * box_height, center,
+                                       (box_width / width, box_height / height)))
+                if candidates:
+                    if previous_center is None:
+                        _, detected_center, detected_size = max(candidates, key=lambda item: item[0])
+                    else:
+                        _, detected_center, detected_size = min(
+                            candidates,
+                            key=lambda item: ((item[1][0] - previous_center[0]) ** 2
+                                              + (item[1][1] - previous_center[1]) ** 2,
+                                              -item[0]))
+                    if previous_center is None:
+                        center = detected_center
+                    else:
+                        center = (previous_center[0] * .65 + detected_center[0] * .35,
+                                  previous_center[1] * .65 + detected_center[1] * .35)
+                    previous_center = (max(0.0, min(1.0, center[0])),
+                                       max(0.0, min(1.0, center[1])))
+                    previous_size = (max(.01, min(1.0, detected_size[0])),
+                                     max(.01, min(1.0, detected_size[1])))
+                    previous_score = 1.0
+                elif previous_center is None:
+                    previous_center = (.5, .5)
+                    previous_score = 0.0
+                else:
+                    previous_score = 0.0
+                point = {
+                    'time': round((frame_index - start_frame) / fps, 6),
+                    'x': round(previous_center[0], 6),
+                    'y': round(previous_center[1], 6),
+                    'width': round(previous_size[0], 6),
+                    'height': round(previous_size[1], 6),
+                    'score': round(previous_score, 6),
+                    'curve': 'ease_in_out',
+                }
+                results.append(point)
+                last_sampled_frame = frame_index
+            progress(min(99, int((frame_index - start_frame + 1) / total_frames * 100)))
+        if not results:
+            raise AIToolError("Auto-Reframe hat keine Frames gefunden.")
+        duration = max(0.0, float(end) - float(start))
+        if duration > 0 and last_sampled_frame is not None:
+            final_time = round(duration, 6)
+            if final_time - float(results[-1]['time']) > 1e-6:
+                final_point = dict(results[-1])
+                final_point['time'] = final_time
+                results.append(final_point)
+        progress(100)
+        return results
+    finally:
+        capture.release()
+
+
+def analyze_beats(source, start, end, progress=lambda value: None, cancel=None):
+    """Detect musical onsets locally with an FFmpeg PCM energy pass."""
+    source = Path(source).expanduser().resolve()
+    if not source.is_file():
+        raise AIToolError(f"Quelldatei nicht gefunden: {source}")
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        raise AIToolError('FFmpeg fehlt. Installiere es mit: sudo apt install ffmpeg')
+    start = max(0.0, float(start)); duration = max(0.05, float(end)-start)
+    sample_rate = 22050
+    command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin',
+               '-ss', f'{start:.6f}', '-t', f'{duration:.6f}', '-i', str(source),
+               '-vn', '-ac', '1', '-ar', str(sample_rate), '-f', 's16le', 'pipe:1']
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    energies = []
+    chunk_samples = 1024
+    try:
+        while True:
+            if _cancelled(cancel):
+                process.terminate()
+                raise AIToolError('Beat-Erkennung abgebrochen.')
+            data = process.stdout.read(chunk_samples * 2)
+            if not data:
+                break
+            samples = array('h'); samples.frombytes(data)
+            if not samples:
+                continue
+            # Normalize the RMS to a compact, codec-independent energy curve.
+            rms = math.sqrt(sum(float(value) * float(value) for value in samples) / len(samples)) / 32768.0
+            time = len(energies) * chunk_samples / sample_rate
+            energies.append((time, rms))
+            progress(min(92, int(time / duration * 92)))
+        detail = process.stderr.read().decode(errors='replace').strip()
+        return_code = process.wait(timeout=30)
+        if return_code:
+            raise AIToolError('Audio konnte für die Beat-Erkennung nicht gelesen werden.' + (f'\n{detail}' if detail else ''))
+    except subprocess.TimeoutExpired as exc:
+        process.kill(); process.wait()
+        raise AIToolError('Beat-Erkennung brauchte zu lange.') from exc
+    finally:
+        if process.poll() is None:
+            process.kill(); process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+    if len(energies) < 3 or max(value for _, value in energies) < 1e-4:
+        progress(100)
+        return {'beats': [], 'bpm': 0.0, 'duration': duration}
+    values = [value for _, value in energies]
+    baseline_window = max(3, round(sample_rate / chunk_samples * .7))
+    beats = []
+    minimum_gap = .18
+    last_beat = -minimum_gap
+    for index in range(1, len(energies)-1):
+        time, energy = energies[index]
+        left = energies[max(0, index-baseline_window):index]
+        baseline = statistics.median(value for _, value in left) if left else statistics.median(values)
+        threshold = max(baseline * 1.42, statistics.median(values) * 1.7, .012)
+        if energy < threshold or energy < energies[index-1][1] or energy < energies[index+1][1]:
+            continue
+        if time-last_beat < minimum_gap:
+            if beats and energy > beats[-1][1]:
+                beats[-1] = (time, energy)
+            continue
+        beats.append((time, energy)); last_beat = time
+    beat_times = [round(time, 6) for time, _ in beats]
+    intervals = [beat_times[index]-beat_times[index-1] for index in range(1, len(beat_times))
+                 if .25 <= beat_times[index]-beat_times[index-1] <= 1.5]
+    bpm = 60.0 / statistics.median(intervals) if intervals else 0.0
+    if bpm:
+        while bpm < 70:
+            bpm *= 2
+        while bpm > 180:
+            bpm /= 2
+    progress(100)
+    return {'beats': beat_times, 'bpm': round(bpm, 2), 'duration': duration}

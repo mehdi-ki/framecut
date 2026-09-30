@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Framecut
+Comment=Lokaler Linux-Videoschnitt
+Exec=framecut %F
+Icon=framecut
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+MimeType=application/x-framecut;
+StartupWMClass=Framecut
+X-AppImage-Version=3.6

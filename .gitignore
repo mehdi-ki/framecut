@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.framecut-appimage-build/
+dist/
+release/
+*.AppImage
+*.deb
+*.zip
+SHA256SUMS

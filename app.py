@@ -1,4 +1,4 @@
-"""Framecut 3.17 — native Linux multitrack editor."""
+"""Framecut 3.17.1 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -33,9 +33,9 @@ from transcription import transcribe_media
 from ai_tools import AIToolError, remove_background_media, track_motion
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.17'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.17.1'
 except OSError:
-    APP_VERSION = '3.17'
+    APP_VERSION = '3.17.1'
 
 
 def label(text,name=None):
@@ -4059,7 +4059,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.17-Fenster.');return 1
+                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.17.1-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

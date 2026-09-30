@@ -1,4 +1,4 @@
-# Framecut 3.17 — Lokale KI-Werkzeuge, Linux-Auslieferung und professionelle Timeline
+# Framecut 3.17.1 — Lokale KI-Werkzeuge, Linux-Auslieferung und professionelle Timeline
 
 Native Linux-Videoschnitt-App mit einer CapCut-ähnlichen Anordnung. Eigener Code,
 keine CapCut-Kopie. Python/PySide6 mit lokalem FFmpeg-Export und optionaler lokaler
@@ -8,7 +8,7 @@ Whisper-Spracherkennung für automatische Untertitel.
 
 1. Framecut 0.1 schließen und die bisherigen Projekte speichern.
 2. Dieses ZIP in einen **neuen Ordner** entpacken. Version 0.1 als Rückfall behalten.
-3. Den Ordner `Framecut-3.17` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
+3. Den Ordner `Framecut-3.17.1` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
 4. Rechtsklick auf eine freie Stelle → „Im Terminal öffnen“.
 5. Ausführen:
 
@@ -17,14 +17,14 @@ Whisper-Spracherkennung für automatische Untertitel.
    ```
 
 Für eine Desktop-Installation kannst du stattdessen `bash install.sh` ausführen.
-Der Installer legt Framecut unter `~/.local/share/framecut/3.17` ab und erstellt
+Der Installer legt Framecut unter `~/.local/share/framecut/3.17.1` ab und erstellt
 den Starter `~/.local/bin/framecut` sowie einen Eintrag im Anwendungsmenü.
 
-## Linux-Auslieferung 3.17
+## Linux-Auslieferung 3.17.1
 
 Das Quellpaket enthält jetzt drei reproduzierbare Auslieferungswege:
 
-- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.17_amd64.deb`. Installation mit `sudo apt install ./framecut_3.17_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.17/.venv` an; FFmpeg und Python bleiben systemweit.
+- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.17.1_amd64.deb`. Installation mit `sudo apt install ./framecut_3.17.1_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.17.1/.venv` an; FFmpeg und Python bleiben systemweit.
 - **AppImage:** `bash build_appimage.sh` erzeugt aus der vorbereiteten `Framecut.AppDir` ein echtes Type-2-AppImage, sobald das offizielle `appimagetool` über `PATH` oder `APPIMAGETOOL=/pfad/appimagetool` verfügbar ist. Der Builder bricht ohne dieses Werkzeug bewusst ab und erzeugt keine Datei, die nur fälschlich `.AppImage` heißt.
 - **Komplettes Release:** `bash build_release.sh` erstellt das Linux-ZIP, das `.deb`, Prüfsummen und – falls `appimagetool` vorhanden ist – das AppImage. Ohne Tool bleibt eine kurze Build-Hinweisdatei neben den übrigen Artefakten.
 
@@ -131,7 +131,7 @@ Danach arbeitet die App lokal und lädt deine Videos nicht hoch.
 - **Timeline Design 3.10**: Die Werkzeugleiste über der Timeline ist in Verlauf, Bearbeiten, Einfügen, Marker, Add, Export, Mehr und Ausrichten gruppiert. Seltene Aktionen öffnen sich über Menüs; die sichtbare Leiste enthält nur eindeutige Symbole und behält Tooltips sowie Tastenkürzel.
 - **Professionelle Trim-Werkzeuge 3.12**: Ripple-In (**Q**) und Ripple-Out (**W**) schneiden bis zum Abspielkopf und schließen die betroffene Spur. Der Roll-Schnitt (**R**) verschiebt eine direkte Schnittkante, ohne die Gesamtdauer zu ändern. Slide verschiebt einen Clip frameweise zwischen direkten Nachbarn; Slip verschiebt frameweise nur das Quellfenster. Alle Modi sind auch über das Trim-Menü, den Rechtsklick auf Clips und **Strg+K** verfügbar und lassen sich mit Undo/Redo zurücknehmen.
 - **Source-Monitor 3.13**: **Clip ansehen** öffnet die ausgewählte Video- oder Audioquelle unabhängig vom Timeline-Mix. Mit **I** und **O** setzt du Quell-In und Quell-Out; der markierte Bereich lässt sich direkt als **Insert** einfügen oder als **Overwrite** verwenden. Die Marken sind temporär, werden beim Clipwechsel zurückgesetzt und alle Schnitte bleiben vollständig undo-/redo-fähig.
-- **Lokale KI-Werkzeuge 3.17**: **Hintergrund entfernen** erzeugt mit rembg/ONNX eine transparente lokale Video- oder Bildableitung, **Motion-Tracking** verfolgt den Rechteckbereich per OpenCV und **Objekt entfernen** füllt das getrackte Gebiet lokal per FFmpeg. **Sprachisolierung** hebt Dialoge mit FFmpeg hervor und reduziert Hintergrundgeräusche. Kein Video muss dafür einen Cloud-Dienst verlassen; die optionalen Zusatzpakete werden beim Start automatisch nachinstalliert.
+- **Lokale KI-Werkzeuge 3.17.1**: **Hintergrund entfernen** erzeugt mit rembg/ONNX eine transparente lokale Video- oder Bildableitung, **Motion-Tracking** verfolgt den Rechteckbereich per OpenCV und **Objekt entfernen** füllt das getrackte Gebiet lokal per FFmpeg. **Sprachisolierung** hebt Dialoge mit einer portablen FFmpeg-Kette hervor und reduziert Hintergrundgeräusche. Kein Video muss dafür einen Cloud-Dienst verlassen; die optionalen Zusatzpakete werden beim Start automatisch nachinstalliert.
 - **Videoeffekte** stehen pro Videoclip zur Verfügung: Deckkraft für Overlays/Picture-in-Picture, Unschärfe, Schärfe, Stabilisierung, Greenscreen-Keying und weiche Rechteck-/Ellipsenmasken. Deckkraft und Unschärfe lassen sich zusätzlich per Keyframe animieren.
 - **Speed-Ramping, Freeze-Frame und Reverse**: Mehrere lokale Geschwindigkeitspunkte werden interpoliert; ein Freeze-Frame hält das letzte Bild für eine einstellbare Dauer und Reverse dreht Bild und Originalton um.
 - **Übergänge**: Überblenden, Slide, Smooth, Cover, Wipe, Zoom, Dip to Black, Fade to White, Blur In, Pixelize, Circle Open/Close und Radial können zwischen direkt angrenzenden Video- oder Audioclips derselben Spur gewählt werden. Bild und Ton werden passend zur eingestellten Dauer behandelt.

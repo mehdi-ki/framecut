@@ -1190,15 +1190,25 @@ def audio_effect_filters(clip):
     if clip.audio_noise_reduction > 1e-7:
         filters.append(f"afftdn=nr={clip.audio_noise_reduction:.6f}:nf=-50")
     if clip.audio_voice_isolation > 1e-7:
-        # FFmpeg's dialogue enhancer is local and ships with the supported
-        # Linux builds.  It suppresses ambience while preserving the centre
-        # voice without requiring a cloud service or a proprietary model.
+        # Keep this deliberately portable: distro FFmpeg builds do not all
+        # ship the optional dialoguenhance/speechnorm filters.  Mixing both
+        # channels towards the centre reduces stereo ambience, while the
+        # speech-band limits, denoiser and compressor keep dialogue present
+        # without requiring a cloud service or a proprietary model.
         strength = float(clip.audio_voice_isolation)
-        original = max(0.0, 1.0 - .7 * strength)
-        enhance = 1.0 + 2.0 * strength
-        voice = 2.0 + 8.0 * strength
-        filters.append(f"dialoguenhance=original={original:.6f}:enhance={enhance:.6f}:voice={voice:.6f}")
-        filters.append(f"speechnorm=peak=.95:compression={1.0 + 3.0 * strength:.6f}:threshold=.02")
+        cross = .5 * strength
+        direct = 1.0 - cross
+        filters.append(
+            f"pan=stereo|c0={direct:.6f}*c0+{cross:.6f}*c1|"
+            f"c1={cross:.6f}*c0+{direct:.6f}*c1"
+        )
+        filters.append(f"highpass=f={60.0 + 40.0 * strength:.6f}")
+        filters.append(f"lowpass=f={16000.0 - 5000.0 * strength:.6f}")
+        filters.append(f"afftdn=nr={6.0 + 9.0 * strength:.6f}:nf=-50")
+        filters.append(
+            f"acompressor=threshold={.125 - .045 * strength:.6f}:"
+            f"ratio={2.0 + 2.0 * strength:.6f}:attack=10:release=180:makeup=1"
+        )
     bands = ((120, clip.audio_eq_low), (1000, clip.audio_eq_mid), (8000, clip.audio_eq_high))
     for frequency, gain in bands:
         if abs(gain) > 1e-7:

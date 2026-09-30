@@ -8,10 +8,10 @@ from unittest.mock import patch
 from PySide6.QtCore import Qt,QPoint,QMimeData,QPointF
 from PySide6.QtGui import QDragEnterEvent,QDropEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication,QMessageBox,QInputDialog,QFileDialog,QMenu,QToolButton
+from PySide6.QtWidgets import QApplication,QMessageBox,QInputDialog,QFileDialog,QToolButton
 from app import Editor,ExportDialog,STYLE
 from core import load_project,length,parse_subtitle_file,save_project
-from timeline import ASSET_MIME
+from timeline import ASSET_MIME,Timeline
 import test_core
 
 
@@ -237,10 +237,13 @@ class GuiTest(unittest.TestCase):
             self.assertEqual(w.snap_box.toolTip(),'Einrasten ein/aus')
             self.assertEqual(w.subtitle_export_button.toolTip(),'Untertitel exportieren')
             self.assertGreaterEqual(len(w.findChildren(QToolButton)),17)
-            with patch.object(QMenu,'exec',return_value=None) as menu_exec:
-                point=QPoint(w.timeline.LEFT+20,w.timeline.TOP+20)
-                QTest.mouseClick(w.timeline,Qt.RightButton,Qt.NoModifier,point)
-                self.assertTrue(menu_exec.called)
+            timeline=Timeline(); timeline.resize(900,320); timeline.show(); QTest.qWait(30)
+            received=[]
+            timeline.context_requested.connect(lambda uid,pos: received.append((uid,pos)))
+            point=QPoint(timeline.LEFT+20,timeline.TOP+20)
+            QTest.mouseClick(timeline,Qt.RightButton,Qt.NoModifier,point)
+            self.assertEqual(len(received),1)
+            timeline.close()
             w.dirty=False;w.close();QTest.qWait(50)
 
     def test_subtitle_import_and_text_inspector(self):

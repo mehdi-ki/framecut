@@ -44,7 +44,7 @@ if [[ -n "${FRAMECUT_RELEASE_BASE_URL:-}" ]]; then
     appimage_file="$APPIMAGE_OUTPUT"
     {
         printf '{\n  "product": "Framecut",\n  "version": "%s",\n' "$APP_VERSION"
-        printf '  "release_notes": ["Framecut 3.19.0: textbasierter Schnitt mit lokaler Pausen-/Füllwort-Erkennung, Bezier-Masken-Tracking, Beat-/Szenen-Auto-Cut, Compound-Clips und audio-synchronisierte Multi-Kamera-Winkel."],\n'
+        printf '  "release_notes": ["Framecut %s: zehn Workflow-Funktionen – Export-Presets, Arbeitsbereichsexport, Attribute-/Keyframe-Clipboard, Audio-Sync, Clip-Loudness, Standbilder, Frame-Capture, Kapiteldateien und Gap-Cleanup."],\n' "$APP_VERSION"
         printf '  "artifacts": {\n'
         if [[ -f "$appimage_file" ]]; then
             printf '    "appimage": {"filename": "%s", "url": "%s/%s", "sha256": "%s"},\n' \

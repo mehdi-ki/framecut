@@ -1,4 +1,4 @@
-"""Framecut 3.19.0 — native Linux multitrack editor."""
+"""Framecut 3.20.0 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -18,13 +18,15 @@ from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBo
 from PySide6.QtMultimedia import (QMediaPlayer,QAudioOutput,QMediaCaptureSession,QAudioInput,
                                   QMediaRecorder,QMediaFormat)
 from preview import VideoView
-from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_MODES,TEXT_STYLE_PRESETS,EFFECT_PRESETS,KEYFRAME_CURVES,KEYFRAME_CURVE_LABELS,EXPORT_FORMATS,EXPORT_CODEC_LABELS,EXPORT_ENCODER_LABELS,PROXY_PROFILES,AUTO_REFRAME_FORMATS,AUTO_REFRAME_FORMAT_LABELS,auto_reframe_aspect,curve_progress,
+from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_MODES,TEXT_STYLE_PRESETS,EFFECT_PRESETS,KEYFRAME_CURVES,KEYFRAME_CURVE_LABELS,EXPORT_FORMATS,EXPORT_CODEC_LABELS,EXPORT_ENCODER_LABELS,EXPORT_PRESETS,PROXY_PROFILES,AUTO_REFRAME_FORMATS,AUTO_REFRAME_FORMAT_LABELS,auto_reframe_aspect,curve_progress,
                   normalize_export_settings,import_clip,import_image_sequence,parse_subtitle_file,subtitle_cues_from_clips,write_subtitle_file,save_project,load_project,split_clip,render,
                   archive_project,extract_project_archive,find_relink_candidates,relink_project_media,missing_project_media,create_proxy_files,
                   preview_acceleration_info,cache_size,prune_cache,
                   ExportCancelled,validate_timeline,length,normalize_markers,edited_clip,retime_keyframes,retime_volume_keyframes,retime_speed_keyframes,
                   normalize_track_states,normalize_track_names,normalize_master_mixer,slip_clip,roll_edit,slide_edit,retime_tracking_keyframes,retime_auto_reframe_keyframes,retime_mask_path_keyframes,
-                  cut_clip_ranges,split_clip_at_times,build_auto_cut_points,mask_path_keyframes_from_tracking)
+                  cut_clip_ranges,split_clip_at_times,build_auto_cut_points,mask_path_keyframes_from_tracking,
+                  trim_timeline_range,close_track_gaps,copy_keyframe_bundle,paste_keyframe_bundle,
+                  write_chapter_file,capture_frame)
 from timeline import Timeline,MediaList
 from style import STYLE
 from update_system import (configured_manifest_url,download_verified,fetch_manifest,
@@ -35,9 +37,9 @@ from ai_tools import (AIToolError, remove_background_media, track_motion, auto_r
                        analyze_beats, detect_scene_changes, detect_audio_onset)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.19.0'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.20.0'
 except OSError:
-    APP_VERSION = '3.19.0'
+    APP_VERSION = '3.20.0'
 
 
 def label(text,name=None):
@@ -138,6 +140,45 @@ def state_directory():
 
 def app_icon_path():
     return Path(__file__).with_name('framecut.svg')
+
+
+# Attribute paste deliberately excludes source identity, timing, grouping and
+# animation. Keyframes have a dedicated clipboard so a quick effect paste
+# cannot unexpectedly overwrite motion data.
+VIDEO_ATTRIBUTE_FIELDS = (
+    'volume', 'fade_in', 'fade_out', 'video_scale', 'video_x', 'video_y',
+    'crop_left', 'crop_top', 'crop_right', 'crop_bottom', 'rotation',
+    'flip_horizontal', 'flip_vertical', 'brightness', 'contrast', 'saturation',
+    'filter_preset', 'lut_path', 'color_exposure', 'color_temperature',
+    'color_tint', 'color_vibrance', 'color_lift_r', 'color_lift_g',
+    'color_lift_b', 'color_gamma_r', 'color_gamma_g', 'color_gamma_b',
+    'color_gain_r', 'color_gain_g', 'color_gain_b', 'opacity', 'blur',
+    'sharpen', 'stabilization', 'effect_preset',
+    'chroma_key_enabled', 'chroma_key_color', 'chroma_key_similarity',
+    'chroma_key_blend', 'mask_type', 'mask_x', 'mask_y', 'mask_width',
+    'mask_height', 'mask_feather', 'mask_points', 'audio_noise_reduction',
+    'audio_eq_low', 'audio_eq_mid', 'audio_eq_high', 'audio_compressor_enabled',
+    'audio_compressor_threshold', 'audio_compressor_ratio', 'audio_ducking',
+    'audio_voice_isolation', 'audio_channel_mode', 'audio_pan',
+    'audio_normalize', 'audio_normalize_target', 'freeze_frame',
+    'freeze_duration', 'reverse', 'speed', 'transition_type',
+    'transition_duration',
+)
+AUDIO_ATTRIBUTE_FIELDS = (
+    'volume', 'fade_in', 'fade_out', 'audio_noise_reduction', 'audio_eq_low',
+    'audio_eq_mid', 'audio_eq_high', 'audio_compressor_enabled',
+    'audio_compressor_threshold', 'audio_compressor_ratio', 'audio_ducking',
+    'audio_voice_isolation', 'audio_channel_mode', 'audio_pan',
+    'audio_normalize', 'audio_normalize_target', 'speed', 'reverse',
+    'transition_type', 'transition_duration',
+)
+TEXT_ATTRIBUTE_FIELDS = (
+    'volume', 'fade_in', 'fade_out', 'font_size', 'color', 'font_family',
+    'font_bold', 'font_italic', 'outline_width', 'outline_color',
+    'shadow_size', 'shadow_color', 'background_enabled', 'background_color',
+    'background_opacity', 'background_padding', 'text_animation',
+    'text_animation_duration', 'x', 'y',
+)
 
 
 class KeyframeGraphWidget(QWidget):
@@ -295,13 +336,18 @@ class KeyframeGraphWidget(QWidget):
 
 class ExportDialog(QDialog):
     """Small, explicit export profile dialog backed by core validation."""
-    def __init__(self,parent=None):
+    def __init__(self,parent=None,work_area=None):
         super().__init__(parent)
         self.setWindowTitle('Export-Einstellungen')
         self.setMinimumWidth(430)
+        self.work_area=work_area
         layout=QVBoxLayout(self); layout.setContentsMargins(18,16,18,16); layout.setSpacing(12)
         layout.addWidget(label('EXPORT · FORMAT, QUALITÄT UND HARDWARE','heading'))
         form=QFormLayout()
+        self.preset_combo=QComboBox()
+        for value,info in EXPORT_PRESETS.items():
+            self.preset_combo.addItem(info['label'],value)
+        form.addRow('Export-Preset',self.preset_combo)
         self.format_combo=QComboBox()
         for value,info in EXPORT_FORMATS.items(): self.format_combo.addItem(info['label'],value)
         self.codec_combo=QComboBox()
@@ -315,6 +361,13 @@ class ExportDialog(QDialog):
         form.addRow('Bildrate',self.fps); form.addRow('Videobitrate',self.bitrate)
         form.addRow('Encoding',self.encoder_combo); form.addRow('Farbraum',self.hdr)
         layout.addLayout(form)
+        self.work_area_box=QCheckBox('Nur Arbeitsbereich exportieren')
+        self.work_area_box.setEnabled(bool(work_area))
+        if work_area:
+            self.work_area_box.setToolTip(f'Exportiert nur {work_area[0]:.2f}–{work_area[1]:.2f} s.')
+        else:
+            self.work_area_box.setToolTip('Setze zuerst Arbeitsbereich-In und Arbeitsbereich-Out in der Vorschau.')
+        layout.addWidget(self.work_area_box)
         self.queue_only_box=QCheckBox('Nur in Render-Queue einreihen')
         self.queue_only_box.setToolTip('Der Export startet erst, wenn die Render-Queue gestartet wird.')
         layout.addWidget(self.queue_only_box)
@@ -323,7 +376,27 @@ class ExportDialog(QDialog):
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
         self.format_combo.currentIndexChanged.connect(self.format_changed)
         self.codec_combo.currentIndexChanged.connect(self.codec_changed)
-        self.format_combo.setCurrentIndex(self.format_combo.findData('mp4')); self.format_changed()
+        self.preset_combo.currentIndexChanged.connect(self.preset_changed)
+        self.preset_combo.setCurrentIndex(self.preset_combo.findData('master'))
+        self.preset_changed()
+
+    def preset_changed(self,*_):
+        values=EXPORT_PRESETS.get(self.preset_combo.currentData())
+        if not values:
+            return
+        self.format_combo.blockSignals(True); self.codec_combo.blockSignals(True)
+        self.format_combo.setCurrentIndex(self.format_combo.findData(values['format']))
+        self.format_combo.blockSignals(False)
+        self.format_changed()
+        self.codec_combo.blockSignals(True)
+        self.codec_combo.setCurrentIndex(self.codec_combo.findData(values['video_codec']))
+        self.codec_combo.blockSignals(False)
+        self.fps.setValue(values['fps']); self.bitrate.setValue(values['bitrate_kbps'])
+        encoder_index=self.encoder_combo.findData(values['encoder'])
+        if encoder_index >= 0:
+            self.encoder_combo.setCurrentIndex(encoder_index)
+        self.hdr.setChecked(bool(values['hdr']))
+        self.codec_changed()
 
     def format_changed(self,*_):
         old=self.codec_combo.currentData(); self.codec_combo.blockSignals(True); self.codec_combo.clear()
@@ -340,13 +413,16 @@ class ExportDialog(QDialog):
     def settings(self):
         return {'format':self.format_combo.currentData(),'video_codec':self.codec_combo.currentData(),
                 'fps':self.fps.value(),'bitrate_kbps':self.bitrate.value(),
-                'encoder':self.encoder_combo.currentData(),'hdr':self.hdr.isChecked()}
+                'encoder':self.encoder_combo.currentData(),'hdr':self.hdr.isChecked(),
+                'export_preset':self.preset_combo.currentData(),
+                'size':EXPORT_PRESETS.get(self.preset_combo.currentData(),{}).get('size')}
 
     def accept(self):
         try:
             self.export_settings=normalize_export_settings(self.settings())
         except ValueError as exc:
             QMessageBox.warning(self,'Export-Einstellungen',str(exc)); return
+        self.export_work_area=self.work_area_box.isChecked()
         super().accept()
 
 
@@ -827,7 +903,7 @@ class Editor(QMainWindow):
         self.clips=[]; self.assets=[]; self.tracks=[2,1,-1,-2]
         self.track_states=normalize_track_states(None,self.tracks); self.track_names=normalize_track_names(None,self.tracks)
         self.master_mixer=normalize_master_mixer(None); self.mixer_dialog=None
-        self.current=None; self.selection=[]; self.clipboard=[]; self.markers=[]
+        self.current=None; self.selection=[]; self.clipboard=[]; self.attribute_clipboard=None; self.keyframe_clipboard=None; self.markers=[]
         self.project_path=None; self.suggested_name='Mein-Film.framecut'
         self.history=[]; self.future=[]; self.dirty=False; self.revision=0
         self.preview_revision=-1; self.preview_signature=None; self.preview_path=None
@@ -836,6 +912,7 @@ class Editor(QMainWindow):
         self.gpu_preview_info=preview_acceleration_info()
         self.render_queue=[]; self.render_current=None; self.render_queue_paused=False
         self.mode='timeline'; self.playhead=0.0
+        self.work_in=None; self.work_out=None
         # Source-monitor state is intentionally transient.  It is not part of
         # the project file: In/Out marks describe the current source-editing
         # session and are cleared whenever the timeline changes.
@@ -865,9 +942,12 @@ class Editor(QMainWindow):
                    ('Ctrl+O',self.open_project),('Ctrl+N',self.new_project),('Ctrl+Z',self.undo),
                    ('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('Ctrl+B',self.split),('S',self.split),
                    ('Ctrl+C',self.copy_selection),('Ctrl+V',self.paste_selection),('Ctrl+Shift+V',self.ripple_insert),
+                   ('Ctrl+Alt+C',self.copy_attributes),('Ctrl+Alt+V',self.paste_attributes),
+                   ('Ctrl+Alt+K',self.copy_keyframes),('Ctrl+Alt+Shift+K',self.paste_keyframes),
                    ('Ctrl+D',self.duplicate_selection),('Ctrl+G',self.group_selection),('Ctrl+Shift+G',self.ungroup_selection),
                    ('Ctrl+Shift+Delete',self.ripple_delete),('Q',self.ripple_trim_in),('W',self.ripple_trim_out),
                    ('I',self.set_source_in),('O',self.set_source_out),
+                   ('Ctrl+Alt+I',self.set_work_in),('Ctrl+Alt+O',self.set_work_out),
                    ('R',self.roll_to_playhead),('Alt+Left',lambda:self.slide_selected(-1)),
                    ('Alt+Right',lambda:self.slide_selected(1)),
                    ('Shift+Alt+Left',lambda:self.slip_selected(-1)),
@@ -1020,6 +1100,13 @@ class Editor(QMainWindow):
         self.source_overwrite_button=button('Overwrite',self.overwrite_source_range); self.source_overwrite_button.setObjectName('sourceEditButton'); self.source_overwrite_button.setToolTip('Markierten Quellbereich am Abspielkopf überschreiben')
         for widget in (self.source_in_button,self.source_out_button,self.source_clear_button,self.source_insert_button,self.source_overwrite_button): source_controls.addWidget(widget)
         pl.addLayout(source_controls)
+        work_controls=QHBoxLayout(); work_controls.setContentsMargins(0,0,0,0); work_controls.setSpacing(4)
+        self.work_range_label=label('Arbeitsbereich: gesamte Timeline','muted'); self.work_range_label.setObjectName('sourceRangeLabel'); work_controls.addWidget(self.work_range_label,1)
+        self.work_in_button=button('I  In',self.set_work_in); self.work_in_button.setObjectName('sourceMarkButton'); self.work_in_button.setToolTip('Arbeitsbereich-In am Abspielkopf setzen · Strg+Alt+I')
+        self.work_out_button=button('O  Out',self.set_work_out); self.work_out_button.setObjectName('sourceMarkButton'); self.work_out_button.setToolTip('Arbeitsbereich-Out am Abspielkopf setzen · Strg+Alt+O')
+        self.work_clear_button=button('×',self.clear_work_area); self.work_clear_button.setObjectName('sourceMarkButton'); self.work_clear_button.setToolTip('Arbeitsbereich löschen')
+        for widget in (self.work_in_button,self.work_out_button,self.work_clear_button): work_controls.addWidget(widget)
+        pl.addLayout(work_controls)
         top.addWidget(preview)
         inspector,inspector_outer=panel(); inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
         inspector_scroll=QScrollArea(); inspector_scroll.setWidgetResizable(True); inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -1043,6 +1130,9 @@ class Editor(QMainWindow):
         self.audio_ducking=QDoubleSpinBox(); self.audio_ducking.setRange(0,100); self.audio_ducking.setDecimals(0); self.audio_ducking.setSuffix(' %')
         self.audio_voice_isolation=QDoubleSpinBox(); self.audio_voice_isolation.setRange(0,100); self.audio_voice_isolation.setDecimals(0); self.audio_voice_isolation.setSuffix(' %')
         self.audio_voice_isolation.setToolTip('Lokale Sprachisolierung: Dialog hervorheben und Hintergrund reduzieren')
+        self.audio_normalize=QCheckBox('Loudness normalisieren')
+        self.audio_normalize_target=QDoubleSpinBox(); self.audio_normalize_target.setRange(-30,-5); self.audio_normalize_target.setDecimals(1); self.audio_normalize_target.setSingleStep(1); self.audio_normalize_target.setSuffix(' LUFS')
+        self.audio_normalize_target.setToolTip('Zielpegel für diesen Clip; -16 LUFS ist ein guter Allround-Wert.')
         self.audio_channel_mode=QComboBox()
         channel_titles={'stereo':'Stereo','mono':'Mono','left':'Linker Kanal auf Stereo','right':'Rechter Kanal auf Stereo'}
         for value in AUDIO_CHANNEL_MODES: self.audio_channel_mode.addItem(channel_titles[value],value)
@@ -1215,6 +1305,7 @@ class Editor(QMainWindow):
         audio_form.addRow('EQ Tiefen',self.audio_eq_low); audio_form.addRow('EQ Mitten',self.audio_eq_mid); audio_form.addRow('EQ Höhen',self.audio_eq_high)
         audio_form.addRow('Kompressor',self.audio_compressor_enabled); audio_form.addRow('Kompressor-Schwelle',self.audio_compressor_threshold); audio_form.addRow('Kompressor-Ratio',self.audio_compressor_ratio)
         audio_form.addRow('Audio-Ducking',self.audio_ducking); audio_form.addRow('Sprachisolierung',self.audio_voice_isolation); audio_form.addRow('Kanäle',self.audio_channel_mode); audio_form.addRow('Panorama',self.audio_pan)
+        audio_form.addRow('Clip-Loudness',self.audio_normalize); audio_form.addRow('Zielpegel',self.audio_normalize_target)
         beat_buttons=QHBoxLayout(); beat_buttons.setContentsMargins(0,0,0,0); beat_buttons.addWidget(self.beat_analyze_button,1); beat_buttons.addWidget(self.beat_clear_button,1)
         audio_form.addRow('Beat-Sync',beat_buttons); audio_form.addRow('',self.beat_status)
         audio_form.addRow('Textschnitt',self.text_cut_button); audio_form.addRow('',self.text_cut_status)
@@ -1303,6 +1394,7 @@ class Editor(QMainWindow):
         marker_menu=QMenu(self); marker_menu.setTitle('Marker')
         marker_menu.addAction('Marker hinzufügen',lambda:self.add_marker('marker'))
         marker_menu.addAction('Kapitel hinzufügen',lambda:self.add_marker('chapter'))
+        marker_menu.addSeparator(); marker_menu.addAction('Kapitel exportieren …',self.export_chapters)
         marker_button=timeline_menu_button('⚑','Marker oder Kapitel hinzufügen',marker_menu,'bookmark-new')
 
         add_menu=QMenu(self); add_menu.setTitle('Timeline-Element hinzufügen')
@@ -1323,7 +1415,16 @@ class Editor(QMainWindow):
         more_menu.addAction('Compound-Clip auflösen',self.dissolve_compound)
         more_menu.addSeparator()
         more_menu.addAction('Multi-Kamera synchronisieren',self.sync_multicam)
+        more_menu.addAction('Audio-Sync für Auswahl',self.sync_audio_selection)
         more_menu.addAction('Aktive Kamera wechseln',self.switch_multicam_angle)
+        more_menu.addAction('Attribute kopieren · Ctrl+Alt+C',self.copy_attributes)
+        more_menu.addAction('Attribute einfügen · Ctrl+Alt+V',self.paste_attributes)
+        more_menu.addAction('Keyframes kopieren · Ctrl+Alt+K',self.copy_keyframes)
+        more_menu.addAction('Keyframes einfügen · Ctrl+Alt+Shift+K',self.paste_keyframes)
+        more_menu.addSeparator()
+        more_menu.addAction('Lücken auf aktueller Spur schließen',self.close_selected_track_gaps)
+        more_menu.addAction('Standbild am Abspielkopf einfügen',self.add_freeze_frame)
+        more_menu.addAction('Aktuelles Bild als PNG speichern',self.start_frame_capture)
         more_menu.addAction('Textschnitt · Pausen/Füllwörter',self.start_text_based_cut)
         more_menu.addAction('Beat-/Szenen-Auto-Cut',self.start_auto_cut)
         more_button=timeline_menu_button('⋯','Weitere Timeline-Aktionen',more_menu,'view-more')
@@ -1367,7 +1468,7 @@ class Editor(QMainWindow):
         self.text_color.editingFinished.connect(self.apply_properties)
         for field in (self.position,self.start,self.end,self.speed,self.freeze_duration,self.fade_in,self.fade_out,self.volume,
                       self.audio_noise_reduction,self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high,self.audio_compressor_threshold,
-                      self.audio_compressor_ratio,self.audio_ducking,self.audio_pan,self.text_size,self.text_x,self.text_y,
+                      self.audio_compressor_ratio,self.audio_ducking,self.audio_pan,self.audio_normalize_target,self.text_size,self.text_x,self.text_y,
                       self.text_outline_width,self.text_outline_color,self.text_shadow_size,self.text_shadow_color,self.text_background_color,
                       self.text_background_opacity,self.text_background_padding,self.text_animation_duration,
                       self.transform_scale,self.transform_x,self.transform_y,self.rotation,self.crop_left,self.crop_top,self.crop_right,self.crop_bottom,
@@ -1379,6 +1480,7 @@ class Editor(QMainWindow):
         self.flip_horizontal.clicked.connect(self.apply_properties); self.flip_vertical.clicked.connect(self.apply_properties)
         self.freeze_enabled.clicked.connect(self.apply_properties); self.reverse_clip.clicked.connect(self.apply_properties)
         self.audio_compressor_enabled.clicked.connect(self.apply_properties)
+        self.audio_normalize.clicked.connect(self.apply_properties)
         self.audio_voice_isolation.editingFinished.connect(self.apply_properties)
         self.background_removal_enabled.clicked.connect(self.apply_properties)
         self.object_removal_enabled.clicked.connect(self.apply_properties)
@@ -1420,6 +1522,49 @@ class Editor(QMainWindow):
     def pan_timeline(self,delta):
         bar=self.scroll.horizontalScrollBar()
         bar.setValue(bar.value()-int(delta))
+
+    def work_area_bounds(self):
+        """Return the effective export range or the complete timeline."""
+        total=length(self.clips)
+        start=0.0 if self.work_in is None else max(0.0,min(total,float(self.work_in)))
+        end=total if self.work_out is None else max(0.0,min(total,float(self.work_out)))
+        if end-start < MIN_CLIP:
+            return 0.0,total
+        return start,end
+
+    def update_work_area_controls(self):
+        if not hasattr(self,'work_range_label'):
+            return
+        total=length(self.clips)
+        if self.work_in is None and self.work_out is None:
+            self.work_range_label.setText('Arbeitsbereich: gesamte Timeline')
+            self.work_range_label.setToolTip('Strg+Alt+I/O setzen den Exportbereich.')
+            return
+        start,end=self.work_area_bounds()
+        self.work_range_label.setText(f'Arbeitsbereich: {start:.2f}–{end:.2f} s')
+        self.work_range_label.setToolTip(f'{end-start:.2f} s von {total:.2f} s · Exportdialog kann diesen Bereich verwenden.')
+
+    def set_work_in(self):
+        if self.worker:
+            return
+        self.work_in=max(0.0,min(length(self.clips),float(self.playhead)))
+        if self.work_out is not None and self.work_out <= self.work_in+MIN_CLIP:
+            self.work_out=None
+        self.update_work_area_controls()
+        self.statusBar().showMessage(f'Arbeitsbereich-In: {self.work_in:.2f} s',2500)
+
+    def set_work_out(self):
+        if self.worker:
+            return
+        self.work_out=max(0.0,min(length(self.clips),float(self.playhead)))
+        if self.work_in is not None and self.work_out <= self.work_in+MIN_CLIP:
+            self.work_in=None
+        self.update_work_area_controls()
+        self.statusBar().showMessage(f'Arbeitsbereich-Out: {self.work_out:.2f} s',2500)
+
+    def clear_work_area(self):
+        self.work_in=None; self.work_out=None; self.update_work_area_controls()
+        self.statusBar().showMessage('Arbeitsbereich gelöscht · gesamte Timeline aktiv',2500)
 
     def preview_size(self):
         """Return the actual preview size used for the current UI settings."""
@@ -1496,6 +1641,11 @@ class Editor(QMainWindow):
             inspect.setEnabled(False)
             menu.addSeparator()
             menu.addAction('Kopieren',self.copy_selection)
+            menu.addAction('Attribute kopieren · Ctrl+Alt+C',self.copy_attributes)
+            menu.addAction('Attribute einfügen · Ctrl+Alt+V',self.paste_attributes)
+            if clip.kind == 'video' and clip.source_type != 'adjustment':
+                menu.addAction('Keyframes kopieren · Ctrl+Alt+K',self.copy_keyframes)
+                menu.addAction('Keyframes einfügen · Ctrl+Alt+Shift+K',self.paste_keyframes)
             menu.addAction('Duplizieren',self.duplicate_selection)
             menu.addAction('Insert einfügen',self.insert_selection)
             menu.addAction('Overwrite einfügen',self.overwrite_selection)
@@ -1571,6 +1721,8 @@ class Editor(QMainWindow):
                 menu.addAction('Audio aus Video extrahieren',self.extract_audio)
             if clip.kind=='video':
                 menu.addAction('Bildtransformation zurücksetzen',self.reset_transform)
+                menu.addAction('Standbild am Abspielkopf einfügen',self.add_freeze_frame)
+                menu.addAction('Aktuelles Bild als PNG speichern',self.start_frame_capture)
             if clip.kind in ('video','audio') and clip.source_type!='adjustment':
                 transition_menu=menu.addMenu('Übergang')
                 transition_menu.addAction('Überblenden · 0,5 s',lambda:self.set_transition('dissolve',.5))
@@ -1593,6 +1745,11 @@ class Editor(QMainWindow):
             menu.addSeparator()
             menu.addAction('Clip entfernen',self.remove)
         else:
+            menu.addAction('Arbeitsbereich-In setzen · Ctrl+Alt+I',self.set_work_in)
+            menu.addAction('Arbeitsbereich-Out setzen · Ctrl+Alt+O',self.set_work_out)
+            menu.addAction('Arbeitsbereich löschen',self.clear_work_area)
+            menu.addAction('Lücken auf aktueller Spur schließen',self.close_selected_track_gaps)
+            menu.addSeparator()
             menu.addAction('+ Text',self.add_text)
             menu.addAction('+ Adjustment-Layer',self.add_adjustment_layer)
             menu.addAction('+ Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog)
@@ -1760,6 +1917,7 @@ class Editor(QMainWindow):
                 self.text_animation,self.text_animation_duration,self.text_x,self.text_y,
                 self.audio_noise_reduction,self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high,self.audio_compressor_enabled,
                 self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_voice_isolation,self.audio_channel_mode,self.audio_pan,
+                self.audio_normalize,self.audio_normalize_target,
                 self.transform_scale,self.transform_x,self.transform_y,self.rotation,self.crop_left,self.crop_top,
                 self.crop_right,self.crop_bottom,self.flip_horizontal,self.flip_vertical,self.brightness,self.contrast,
                 self.saturation,self.filter_preset,self.effect_preset,self.effect_preset_apply_button,self.lut_path,self.lut_browse_button,self.opacity,self.blur,self.sharpen,self.stabilization,
@@ -1786,6 +1944,81 @@ class Editor(QMainWindow):
             return self.statusBar().showMessage('Kein Clip ausgewählt.',3000)
         self.clipboard = [self._clone_clip(clip, uid=clip.uid) for clip in clips]
         self.statusBar().showMessage(f"{len(clips)} Clip{'s' if len(clips) != 1 else ''} kopiert.",3000)
+
+    def copy_attributes(self):
+        """Copy only editable look/audio attributes from the active clip."""
+        clip=self.current_clip()
+        if not clip:
+            return self.statusBar().showMessage('Wähle zuerst einen Clip aus.',3000)
+        if clip.kind == 'video':
+            fields=VIDEO_ATTRIBUTE_FIELDS
+        elif clip.kind == 'audio':
+            fields=AUDIO_ATTRIBUTE_FIELDS
+        elif clip.kind == 'text':
+            fields=TEXT_ATTRIBUTE_FIELDS
+        else:
+            return self.statusBar().showMessage('Für diesen Clip gibt es keine Attribute.',3000)
+        self.attribute_clipboard={
+            'kind':clip.kind,
+            'fields':{field:([dict(item) for item in getattr(clip,field)]
+                             if isinstance(getattr(clip,field),list)
+                             else getattr(clip,field)) for field in fields},
+        }
+        self.statusBar().showMessage('Clip-Attribute kopiert · Zielclip(s) auswählen und Einfügen ausführen.',4000)
+
+    def paste_attributes(self):
+        """Paste copied look/audio attributes onto the current selection."""
+        if self.worker or not self.attribute_clipboard:
+            return self.statusBar().showMessage('Keine Clip-Attribute kopiert.',3000)
+        source_kind=self.attribute_clipboard.get('kind')
+        targets=[clip for clip in self.selected_clips() if clip.kind == source_kind]
+        if not targets:
+            return self.statusBar().showMessage('Wähle mindestens einen Clip desselben Typs aus.',4000)
+        if any(not self.require_unlocked(clip) for clip in targets):
+            return
+        fields=self.attribute_clipboard.get('fields',{})
+        proposed=list(self.clips)
+        for target in targets:
+            values={field:([dict(item) for item in value] if isinstance(value,list) else value)
+                    for field,value in fields.items() if hasattr(target,field)}
+            candidate=replace(target,**values)
+            proposed=[candidate if item.uid==target.uid else item for item in proposed]
+        try:
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
+            self.statusBar().showMessage(f'Attribute auf {len(targets)} Clip(s) angewendet.',3500)
+        except Exception as exc:
+            self.error(exc)
+
+    def copy_keyframes(self):
+        clip=self.current_clip()
+        if not clip or clip.kind != 'video' or clip.source_type == 'adjustment':
+            return self.statusBar().showMessage('Wähle einen normalen Videoclip für Keyframes aus.',3500)
+        try:
+            self.keyframe_clipboard=copy_keyframe_bundle(clip)
+            self.statusBar().showMessage('Keyframes kopiert · Zielclip(s) auswählen und Keyframes einfügen.',4000)
+        except Exception as exc:
+            self.error(exc)
+
+    def paste_keyframes(self):
+        if self.worker or not self.keyframe_clipboard:
+            return self.statusBar().showMessage('Keine Keyframes kopiert.',3000)
+        targets=[clip for clip in self.selected_clips()
+                 if clip.kind == 'video' and clip.source_type != 'adjustment']
+        if not targets:
+            return self.statusBar().showMessage('Wähle mindestens einen normalen Videoclip aus.',3500)
+        if any(not self.require_unlocked(clip) for clip in targets):
+            return
+        try:
+            proposed=list(self.clips)
+            for target in targets:
+                candidate=paste_keyframe_bundle(target,self.keyframe_clipboard)
+                proposed=[candidate if item.uid==target.uid else item for item in proposed]
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
+            self.statusBar().showMessage(f'Keyframes auf {len(targets)} Clip(s) angewendet.',3500)
+        except Exception as exc:
+            self.error(exc)
 
     def _clipboard_candidates(self, anchor):
         if not self.clipboard:
@@ -1996,6 +2229,137 @@ class Editor(QMainWindow):
         except Exception as exc:
             self.error(exc)
 
+    def sync_audio_selection(self):
+        """Align any selected video/audio sources by their first audio onset."""
+        clips=self.selected_clips()
+        if len(clips)<2 or any(clip.kind not in ('video','audio') or clip.source_type not in ('video','audio')
+                               for clip in clips):
+            return self.error('Wähle mindestens zwei normale Video- oder Audioclips für Audio-Sync.')
+        if any(not clip.has_audio for clip in clips):
+            return self.error('Jeder ausgewählte Clip braucht eine Audiospur.')
+        if any(self.track_locked(clip.track) for clip in clips):
+            return self.error('Eine ausgewählte Spur ist gesperrt.')
+        selected=[replace(clip) for clip in clips]
+        def operation(progress,cancel):
+            offsets={}
+            for index,clip in enumerate(selected):
+                if cancel.is_set():
+                    raise ExportCancelled()
+                offsets[clip.uid]=float(detect_audio_onset(
+                    clip.path,clip.start,clip.end,
+                    lambda value,base=index: progress(int((base+value/100)/len(selected)*100)),cancel))
+            target=max(clip.position+offsets[clip.uid] for clip in selected)
+            return {'offsets':offsets,'target':target}
+        self.start_job('Audio-Sync wird analysiert …',operation,
+                       lambda result:self.audio_sync_done(result,selected))
+
+    def audio_sync_done(self,result,selected):
+        if not result['ok']:
+            return self.job_error(result)
+        offsets=result['value']['offsets']; target=float(result['value']['target'])
+        selected_ids={clip.uid for clip in selected}
+        try:
+            proposed=[replace(value,position=max(0.0,round(target-float(offsets.get(value.uid,0.0)),6)))
+                      if value.uid in selected_ids else value for value in self.clips]
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.changed()
+            self.statusBar().showMessage(f'Audio-Sync abgeschlossen · {len(selected)} Clips ausgerichtet.',5000)
+        except Exception as exc:
+            self.error(exc)
+
+    def close_selected_track_gaps(self):
+        clip=self.current_clip()
+        if not clip or self.worker:
+            return self.statusBar().showMessage('Wähle einen Clip auf der zu bereinigenden Spur aus.',3500)
+        track=clip.track
+        if self.track_locked(track):
+            return self.statusBar().showMessage('Die Spur ist gesperrt.',3000)
+        try:
+            proposed,removed=close_track_gaps(self.clips,track)
+            if removed < MIN_CLIP:
+                return self.statusBar().showMessage('Auf dieser Spur gibt es keine schließbare Lücke.',3500)
+            validate_timeline(proposed,self.tracks)
+            self.checkpoint(); self.clips=proposed; self.changed()
+            self.statusBar().showMessage(f'Lücken auf Spur geschlossen · {removed:.2f} s eingespart.',4000)
+        except Exception as exc:
+            self.error(exc)
+
+    def add_freeze_frame(self):
+        """Create a short still overlay from the current source frame."""
+        clip=self.current_clip()
+        if (not clip or clip.kind != 'video' or clip.source_type not in ('video','image')
+                or self.worker):
+            return self.statusBar().showMessage('Wähle einen normalen Videoclip für ein Standbild aus.',3500)
+        if self.track_locked(clip.track):
+            return self.statusBar().showMessage('Die ausgewählte Spur ist gesperrt.',3000)
+        local=max(0.0,min(clip.length,self.playhead-clip.position))
+        source_time=min(clip.duration-0.001,max(0.0,clip.start+local*clip.speed))
+        frame_step=max(1.0/120.0,min(0.2,self._frame_step(clip)))
+        source_end=min(clip.duration,source_time+frame_step)
+        if source_end-source_time < MIN_CLIP:
+            source_time=max(0.0,clip.duration-MIN_CLIP); source_end=clip.duration
+        track=max((value for value in self.tracks if value>0),default=0)+1
+        candidate=replace(clip,uid=uuid.uuid4().hex,start=source_time,end=source_end,
+                          position=self.playhead,track=track,freeze_frame=True,
+                          freeze_duration=2.0,transition_type='none',transition_duration=0.0,
+                          keyframes=[],volume_keyframes=[],speed_keyframes=[],
+                          tracking_keyframes=[],auto_reframe_keyframes=[],mask_path_keyframes=[])
+        candidate=replace(candidate,compound_id='',compound_name='',multicam_group='',camera_angle='',multicam_active=True)
+        try:
+            proposed_tracks=list(self.tracks)+[track]
+            validate_timeline(self.clips+[candidate],proposed_tracks)
+            self.checkpoint(); self.tracks=proposed_tracks; self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks)
+            self.track_names[track]='Standbild'
+            self.clips.append(candidate); self.selection=[candidate.uid]; self.current=candidate.uid; self.changed()
+            self.statusBar().showMessage('Standbild eingefügt · 2 Sekunden Freeze-Frame',4000)
+        except Exception as exc:
+            self.error(exc)
+
+    def start_frame_capture(self):
+        clip=self.current_clip()
+        if not clip or clip.kind != 'video' or clip.source_type not in ('video','image') or self.worker:
+            return self.statusBar().showMessage('Wähle einen normalen Videoclip für den Frame-Export aus.',3500)
+        default_name='Frame-'+self._source_clock(self.playhead-clip.position).replace(':','-')+'.png'
+        path,_=QFileDialog.getSaveFileName(self,'Aktuelles Bild speichern',default_name,'PNG (*.png)',options=QFileDialog.DontConfirmOverwrite)
+        if not path:
+            return
+        target=Path(path).resolve()
+        if target.exists() and QMessageBox.question(self,'Bild ersetzen?',f'{target}\nüberschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
+            return
+        local=max(0.0,min(clip.length,self.playhead-clip.position))
+        source_time=min(clip.duration-0.001,max(0.0,clip.start+local*clip.speed))
+        def operation(progress,cancel):
+            if cancel.is_set():
+                raise ExportCancelled()
+            progress(15)
+            value=capture_frame(clip.path,source_time,target)
+            progress(100)
+            return value
+        self.start_job('Frame wird gespeichert …',operation,
+                       lambda result:self.statusBar().showMessage(
+                           f'Frame gespeichert: {result["value"]}',5000) if result['ok'] else self.job_error(result))
+
+    def export_chapters(self):
+        chapters=[marker for marker in self.markers if marker.get('kind') == 'chapter']
+        if not chapters:
+            return self.error('Setze zuerst mindestens einen Kapitelmarker.')
+        default='Kapitel.ffmeta'
+        if self.project_path:
+            default=str(Path(self.project_path).with_suffix('.ffmeta'))
+        path,_=QFileDialog.getSaveFileName(self,'Kapitel exportieren',default,'FFmpeg-Metadaten (*.ffmeta);;Alle Dateien (*)',options=QFileDialog.DontConfirmOverwrite)
+        if not path:
+            return
+        if not path.lower().endswith('.ffmeta'):
+            path+='.ffmeta'
+        target=Path(path).resolve()
+        if target.exists() and QMessageBox.question(self,'Kapitel ersetzen?',f'{target}\nüberschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
+            return
+        try:
+            write_chapter_file(target,self.markers,length(self.clips))
+            self.statusBar().showMessage(f'{len(chapters)} Kapitel exportiert · {target.name}',5000)
+        except Exception as exc:
+            self.error(exc)
+
     def _insert_candidates_ripple(self, candidates):
         if not candidates:
             return
@@ -2149,6 +2513,18 @@ class Editor(QMainWindow):
             ('Quellmarken löschen', '—', self.clear_source_marks),
             ('Quellbereich als Insert einfügen', '—', self.insert_source_range),
             ('Quellbereich als Overwrite einfügen', '—', self.overwrite_source_range),
+            ('Arbeitsbereich-In setzen', 'Ctrl+Alt+I', self.set_work_in),
+            ('Arbeitsbereich-Out setzen', 'Ctrl+Alt+O', self.set_work_out),
+            ('Arbeitsbereich löschen', '—', self.clear_work_area),
+            ('Attribute kopieren', 'Ctrl+Alt+C', self.copy_attributes),
+            ('Attribute einfügen', 'Ctrl+Alt+V', self.paste_attributes),
+            ('Keyframes kopieren', 'Ctrl+Alt+K', self.copy_keyframes),
+            ('Keyframes einfügen', 'Ctrl+Alt+Shift+K', self.paste_keyframes),
+            ('Audio-Sync für Auswahl', '—', self.sync_audio_selection),
+            ('Lücken auf aktueller Spur schließen', '—', self.close_selected_track_gaps),
+            ('Standbild am Abspielkopf einfügen', '—', self.add_freeze_frame),
+            ('Aktuelles Bild als PNG speichern', '—', self.start_frame_capture),
+            ('Kapitel exportieren', '—', self.export_chapters),
             ('Slide-Schnitt links', 'Alt+←', lambda: self.slide_selected(-1)),
             ('Slide-Schnitt rechts', 'Alt+→', lambda: self.slide_selected(1)),
             ('Slip-Schnitt links', 'Umschalt+Alt+←', lambda: self.slip_selected(-1)),
@@ -2335,6 +2711,7 @@ class Editor(QMainWindow):
         self.video_tracks.blockSignals(True); self.video_tracks.setValue(len([t for t in self.tracks if t>0])); self.video_tracks.blockSignals(False)
         self.audio_tracks.blockSignals(True); self.audio_tracks.setValue(len([t for t in self.tracks if t<0])); self.audio_tracks.blockSignals(False)
         self.total.setText(f'{len(self.clips)} Clips · {length(self.clips):.1f} s')
+        self.update_work_area_controls()
         self.playhead=max(0,self.playhead); self.timeline.set_playhead(self.playhead)
         self.update_time(); self.fill_inspector()
         if self.mixer_dialog is not None:
@@ -2714,7 +3091,8 @@ class Editor(QMainWindow):
                       self.keyframe_graph_property,self.keyframe_graph): field.setEnabled(is_video and not is_adjustment)
         for field in (self.volume_keyframe_time,self.volume_keyframe_curve,self.volume_keyframe_list,self.volume_keyframe_set_button,self.volume_keyframe_remove_button): field.setEnabled(is_audioable)
         for field in (self.audio_noise_reduction,self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high,self.audio_compressor_enabled,
-                      self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_voice_isolation,self.audio_channel_mode,self.audio_pan): field.setEnabled(is_audioable)
+                      self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_voice_isolation,self.audio_channel_mode,self.audio_pan,
+                      self.audio_normalize,self.audio_normalize_target): field.setEnabled(is_audioable)
         for field in (self.speed_ramp_time,self.speed_ramp_value,self.speed_ramp_list,self.speed_ramp_set_button,self.speed_ramp_remove_button): field.setEnabled(is_video and not is_adjustment)
         self.transition_type.setEnabled(is_transitionable); self.transition_duration.setEnabled(is_transitionable)
         self.text_value.setText(c.text if is_text else '')
@@ -2776,6 +3154,8 @@ class Editor(QMainWindow):
         self.audio_compressor_threshold.setValue(c.audio_compressor_threshold if is_audioable else -18); self.audio_compressor_ratio.setValue(c.audio_compressor_ratio if is_audioable else 4)
         self.audio_ducking.setValue(c.audio_ducking*100 if is_audioable else 0)
         self.audio_voice_isolation.setValue(c.audio_voice_isolation*100 if is_audioable else 0)
+        self.audio_normalize.setChecked(c.audio_normalize if is_audioable else False)
+        self.audio_normalize_target.setValue(c.audio_normalize_target if is_audioable else -16)
         channel_index=self.audio_channel_mode.findData(c.audio_channel_mode if is_audioable else 'stereo')
         self.audio_channel_mode.setCurrentIndex(channel_index if channel_index >= 0 else 0); self.audio_pan.setValue(c.audio_pan*100 if is_audioable else 0)
         self.freeze_enabled.setChecked(c.freeze_frame if is_video else False); self.freeze_duration.setValue(c.freeze_duration if is_video else 0)
@@ -3000,7 +3380,9 @@ class Editor(QMainWindow):
                               audio_compressor_threshold=self.audio_compressor_threshold.value(),audio_compressor_ratio=self.audio_compressor_ratio.value(),
                               audio_ducking=self.audio_ducking.value()/100,
                               audio_voice_isolation=self.audio_voice_isolation.value()/100,
-                              audio_channel_mode=self.audio_channel_mode.currentData(),audio_pan=self.audio_pan.value()/100)
+                              audio_channel_mode=self.audio_channel_mode.currentData(),audio_pan=self.audio_pan.value()/100,
+                              audio_normalize=self.audio_normalize.isChecked(),
+                              audio_normalize_target=self.audio_normalize_target.value())
                 transition_type='none' if c.source_type=='adjustment' else self.transition_type.currentData()
                 values.update(transition_type=transition_type,
                               transition_duration=self.transition_duration.value() if transition_type!='none' else 0.0)
@@ -4634,7 +5016,8 @@ class Editor(QMainWindow):
         item=self.render_queue.pop(0); self.render_current=item; self.update_render_queue_button()
         def operation(progress,cancel):
             render(item['clips'],item['tracks'],item['target'],item['size'],progress,cancel,False,
-                   item['track_states'],item['settings'],master_settings=item.get('master_settings',self.master_mixer))
+                   item['track_states'],item['settings'],master_settings=item.get('master_settings',self.master_mixer),
+                   duration_override=item.get('duration'))
             return str(item['target'])
         def complete(result):
             self.render_current=None; self.update_render_queue_button()
@@ -4653,7 +5036,8 @@ class Editor(QMainWindow):
     def start_export(self):
         if self.worker:return
         if not self.clips:return self.error('Die Timeline ist leer.')
-        dialog=ExportDialog(self)
+        work_area=self.work_area_bounds() if (self.work_in is not None or self.work_out is not None) else None
+        dialog=ExportDialog(self,work_area)
         if dialog.exec()!=QDialog.Accepted:return
         export_settings=dialog.export_settings
         format_info=EXPORT_FORMATS[export_settings['format']]
@@ -4670,13 +5054,23 @@ class Editor(QMainWindow):
         if any(Path(path).resolve()==target for path in source_files if path):return self.error('Der Export darf keine Quelldatei überschreiben.')
         if target.exists() and QMessageBox.question(self,'Datei ersetzen?',f'{target}\nüberschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:return
         clips=[replace(c,source_paths=list(c.source_paths)) for c in self.clips]
-        tracks=list(self.tracks);track_states={track:dict(state) for track,state in self.track_states.items()};size=PRESETS[self.preset.currentText()]
+        export_duration=None
+        if dialog.export_work_area and work_area:
+            try:
+                clips=trim_timeline_range(clips,*work_area)
+                export_duration=work_area[1]-work_area[0]
+            except Exception as exc:
+                return self.error(exc)
+        tracks=list(self.tracks);track_states={track:dict(state) for track,state in self.track_states.items()}
+        profile_size=export_settings.get('size')
+        size=tuple(profile_size) if profile_size else PRESETS[self.preset.currentText()]
         pending_targets=[item['target'] for item in self.render_queue]
         if self.render_current: pending_targets.append(self.render_current['target'])
         if target in pending_targets:
             return self.error('Dieses Ziel liegt bereits in der Render-Queue.')
         self.render_queue.append({'target':target,'clips':clips,'tracks':tracks,'track_states':track_states,
                                   'size':size,'settings':export_settings,'master_settings':dict(self.master_mixer),
+                                  'duration':export_duration,
                                   'label':f"{format_info['label']} · {target.name}"})
         self.update_render_queue_button()
         if dialog.queue_only_box.isChecked():
@@ -4843,6 +5237,7 @@ class Editor(QMainWindow):
         self.proxy_box.blockSignals(True);self.proxy_box.setChecked(False);self.proxy_box.blockSignals(False)
         self.current=self.clips[0].uid if self.clips else None;self.selection=[self.current] if self.current else [];self.playhead=0
         self.source_clip_uid=None;self.source_in=None;self.source_out=None
+        self.work_in=None;self.work_out=None
         self.history.clear();self.future.clear();self.revision+=1;self.preview_revision=-1;self.preview_signature=None;self.preview_path=None
         self.preset.blockSignals(True);self.preset.setCurrentText(data['preset'] if data['preset'] in PRESETS else next(iter(PRESETS)));self.preset.blockSignals(False)
         self.mode='timeline';self.dirty=False;self.prepare_visuals(self.assets);self.refresh_media();self.refresh()
@@ -4917,7 +5312,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.19.0-Fenster.');return 1
+                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.20.0-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

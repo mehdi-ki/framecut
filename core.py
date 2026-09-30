@@ -130,6 +130,38 @@ DEFAULT_EXPORT_SETTINGS = {
     'encoder': 'software',
     'hdr': False,
 }
+EXPORT_PRESETS = {
+    'master': {
+        'label': 'Master · 1080p / H.264',
+        'size': (1920, 1080),
+        'format': 'mp4', 'video_codec': 'h264', 'fps': 30.0,
+        'bitrate_kbps': 12000, 'encoder': 'auto', 'hdr': False,
+    },
+    'youtube': {
+        'label': 'YouTube · 1080p / 30 FPS',
+        'size': (1920, 1080),
+        'format': 'mp4', 'video_codec': 'h264', 'fps': 30.0,
+        'bitrate_kbps': 12000, 'encoder': 'auto', 'hdr': False,
+    },
+    'shorts': {
+        'label': 'Shorts / TikTok / Reels',
+        'size': (1080, 1920),
+        'format': 'mp4', 'video_codec': 'h264', 'fps': 30.0,
+        'bitrate_kbps': 10000, 'encoder': 'auto', 'hdr': False,
+    },
+    'instagram': {
+        'label': 'Instagram · quadratisch',
+        'size': (1080, 1080),
+        'format': 'mp4', 'video_codec': 'h264', 'fps': 30.0,
+        'bitrate_kbps': 10000, 'encoder': 'auto', 'hdr': False,
+    },
+    'archive': {
+        'label': 'Archiv · H.265 / hohe Qualität',
+        'size': None,
+        'format': 'mkv', 'video_codec': 'hevc', 'fps': 30.0,
+        'bitrate_kbps': 18000, 'encoder': 'auto', 'hdr': False,
+    },
+}
 DEFAULT_MASTER_MIXER = {
     'volume': 1.0,
     'pan': 0.0,
@@ -424,6 +456,11 @@ class Clip:
     audio_voice_isolation: float = 0.0
     audio_channel_mode: str = "stereo"
     audio_pan: float = 0.0
+    # Optional per-clip loudness normalization.  The master mixer remains
+    # available for the final project-wide level, while this keeps dialogue
+    # and imported music consistent before they are mixed together.
+    audio_normalize: bool = False
+    audio_normalize_target: float = -16.0
     # Editing workflow metadata. These fields were added after the first
     # project format and deliberately keep defaults for older .framecut files.
     group_id: str = ""
@@ -465,7 +502,8 @@ class Clip:
                     self.mask_height, self.mask_feather, self.audio_noise_reduction,
                     self.audio_eq_low, self.audio_eq_mid, self.audio_eq_high,
                     self.audio_compressor_threshold, self.audio_compressor_ratio,
-                    self.audio_ducking, self.audio_voice_isolation, self.audio_pan)):
+                    self.audio_ducking, self.audio_voice_isolation, self.audio_pan,
+                    self.audio_normalize_target)):
             raise ValueError("Ungültige Zahl im Projekt.")
         if not (0 <= self.start < self.end <= self.duration + 0.02):
             raise ValueError("Start und Ende müssen innerhalb der Quelldatei liegen.")
@@ -526,6 +564,8 @@ class Clip:
                 raise ValueError("Sprachisolierung muss zwischen 0 und 100 % liegen.")
             if self.audio_channel_mode not in AUDIO_CHANNEL_MODES or not -1 <= self.audio_pan <= 1:
                 raise ValueError("Ungültige Kanalsteuerung.")
+            if type(self.audio_normalize) is not bool or not -30 <= self.audio_normalize_target <= -5:
+                raise ValueError("Loudness-Normalisierung muss zwischen -30 und -5 LUFS liegen.")
         previous_volume_time = -1.0
         for keyframe in self.volume_keyframes:
             if not isinstance(keyframe, dict):
@@ -793,6 +833,42 @@ def probe(path):
         if len(_PROBE_CACHE) > 512:
             _PROBE_CACHE.pop(next(iter(_PROBE_CACHE)))
     return result
+
+
+def capture_frame(source, source_time, target):
+    """Extract one source frame as a PNG without modifying the media."""
+    source = Path(source).expanduser().resolve()
+    target = Path(target).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"Quelldatei fehlt:\n{source}")
+    duration, has_video, _ = probe(source)
+    if not has_video:
+        raise ValueError("Für einen Frame-Export wird eine Videodatei benötigt.")
+    if target.suffix.casefold() != '.png':
+        raise ValueError("Ein Frame muss als PNG gespeichert werden.")
+    if source == target:
+        raise ValueError("Der Frame darf die Quelldatei nicht überschreiben.")
+    try:
+        source_time = float(source_time)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Ungültige Frame-Zeit.") from exc
+    if not math.isfinite(source_time) or source_time < 0:
+        raise ValueError("Ungültige Frame-Zeit.")
+    source_time = min(source_time, max(0.0, duration-1e-3))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f'.{target.name}.{uuid.uuid4().hex}.tmp.png')
+    try:
+        command = ['ffmpeg', '-hide_banner', '-v', 'error', '-nostdin', '-y',
+                   '-ss', f'{source_time:.6f}', '-i', str(source),
+                   '-frames:v', '1', '-f', 'image2', str(temporary)]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode or not temporary.is_file() or temporary.stat().st_size == 0:
+            raise RuntimeError(result.stderr.strip() or 'FFmpeg konnte den Frame nicht exportieren.')
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return str(target)
 
 
 def import_clip(path):
@@ -1212,6 +1288,159 @@ def cut_clip_ranges(clip, keep_ranges):
     return segments
 
 
+def trim_timeline_range(clips, start, end):
+    """Return a self-contained composition for a timeline work area.
+
+    Media clips are source-trimmed with the same retiming helpers used by the
+    normal editor. Text and adjustment clips are cropped in timeline space.
+    The returned clips start at zero, making them safe to pass to ``render``
+    without changing the original project.
+    """
+    try:
+        start, end = float(start), float(end)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Arbeitsbereich muss aus gültigen Zeiten bestehen.") from exc
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+        raise ValueError("Der Arbeitsbereich muss eine positive Dauer haben.")
+    result = []
+    for clip in clips:
+        clip_start = float(clip.position)
+        clip_end = float(clip.finish)
+        visible_start = max(start, clip_start)
+        visible_end = min(end, clip_end)
+        if visible_end-visible_start < MIN_CLIP-1e-7:
+            continue
+        local_start = visible_start-clip_start
+        local_end = visible_end-clip_start
+        position = visible_start-start
+        if clip.kind in ("video", "audio") and clip.source_type in ("video", "audio"):
+            if clip.freeze_frame:
+                # A freeze region has no source window after the hold. Keep
+                # the clip intact when the work area intersects it; the
+                # duration override still makes the export end correctly.
+                value = replace(clip, position=position,
+                                transition_type="none", transition_duration=0.0)
+            else:
+                source_start = clip.start + speed_ramp_source_offset(
+                    clip.end-clip.start, clip.speed, clip.speed_keyframes, local_start)
+                source_end = clip.start + speed_ramp_source_offset(
+                    clip.end-clip.start, clip.speed, clip.speed_keyframes, local_end)
+                value = _source_segment(clip, source_start, source_end, position)
+            result.append(value)
+            continue
+        if clip.kind == "text":
+            result.append(replace(clip, start=0.0,
+                                  end=max(MIN_CLIP, visible_end-visible_start),
+                                  position=position, transition_type="none",
+                                  transition_duration=0.0))
+            continue
+        if clip.source_type == "adjustment":
+            result.append(replace(clip, start=0.0,
+                                  end=max(MIN_CLIP, visible_end-visible_start),
+                                  position=position, transition_type="none",
+                                  transition_duration=0.0))
+    return result
+
+
+def close_track_gaps(clips, track):
+    """Close gaps on one track while preserving clip order and durations."""
+    track = int(track)
+    ordered = sorted((clip for clip in clips if clip.track == track),
+                     key=lambda clip: (clip.position, clip.uid))
+    if not ordered:
+        return list(clips), 0.0
+    cursor = ordered[0].position
+    replacements = {}
+    removed = 0.0
+    for clip in ordered:
+        if clip.position > cursor + 1e-7:
+            removed += clip.position-cursor
+            replacements[clip.uid] = replace(clip, position=cursor)
+        cursor = cursor + clip.length
+    return [replacements.get(clip.uid, clip) for clip in clips], removed
+
+
+def copy_keyframe_bundle(clip):
+    """Copy all animated properties without copying source or clip geometry."""
+    if clip.kind != "video":
+        raise ValueError("Keyframes können nur von Videoclips kopiert werden.")
+    return {
+        'duration': float(clip.length),
+        'source_span': float(clip.end-clip.start),
+        'keyframes': [dict(frame) for frame in clip.keyframes],
+        'volume_keyframes': [dict(frame) for frame in clip.volume_keyframes],
+        'speed_keyframes': [dict(frame) for frame in clip.speed_keyframes],
+        'tracking_keyframes': [dict(point) for point in clip.tracking_keyframes],
+        'auto_reframe_keyframes': [dict(point) for point in clip.auto_reframe_keyframes],
+        'mask_path_keyframes': [dict(frame, points=[dict(point) for point in frame.get('points', [])])
+                                for frame in clip.mask_path_keyframes],
+    }
+
+
+def paste_keyframe_bundle(clip, bundle):
+    """Paste copied animation and scale local times to the target clip."""
+    if clip.kind != "video" or not isinstance(bundle, dict):
+        raise ValueError("Keyframes können nur auf Videoclips eingefügt werden.")
+    source_duration = max(1e-7, float(bundle.get('duration', clip.length)))
+    target_duration = max(1e-7, float(clip.length))
+    time_scale = target_duration/source_duration
+    source_span = max(1e-7, float(bundle.get('source_span', clip.end-clip.start)))
+    target_span = max(1e-7, float(clip.end-clip.start))
+    source_time_scale = target_span/source_span
+
+    def scaled(frames, factor, limit=target_duration):
+        result = []
+        for frame in frames or []:
+            value = dict(frame)
+            value['time'] = round(max(0.0, min(limit, float(value.get('time', 0.0))*factor)), 6)
+            if result and abs(result[-1]['time']-value['time']) <= 1e-6:
+                result[-1] = value
+            else:
+                result.append(value)
+        return result
+
+    return replace(clip,
+                   keyframes=scaled(bundle.get('keyframes'), time_scale),
+                   volume_keyframes=scaled(bundle.get('volume_keyframes'), time_scale),
+                   speed_keyframes=scaled(bundle.get('speed_keyframes'), source_time_scale, target_span),
+                   tracking_keyframes=scaled(bundle.get('tracking_keyframes'), time_scale),
+                   auto_reframe_keyframes=scaled(bundle.get('auto_reframe_keyframes'), time_scale),
+                   mask_path_keyframes=scaled(bundle.get('mask_path_keyframes'), time_scale))
+
+
+def write_chapter_file(path, markers, duration):
+    """Write chapter markers as an FFmpeg ``FFMETADATA1`` sidecar."""
+    target = Path(path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    duration = max(0.001, float(duration))
+    chapters = sorted((marker for marker in normalize_markers(markers, duration)
+                       if marker.get('kind') == 'chapter'),
+                      key=lambda marker: float(marker.get('time', 0.0)))
+    if not chapters:
+        raise ValueError("Keine Kapitelmarker vorhanden.")
+
+    def escape(value):
+        return (str(value).replace('\\', '\\\\').replace('=', '\\=')
+                .replace(';', '\\;').replace('#', '\\#').replace('\n', ' '))
+
+    lines = [';FFMETADATA1']
+    for index, marker in enumerate(chapters):
+        start_ms = max(0, round(float(marker['time'])*1000))
+        next_time = (float(chapters[index+1]['time']) if index+1 < len(chapters) else duration)
+        end_ms = max(start_ms+1, round(next_time*1000))
+        title = escape(marker.get('label') or f'Kapitel {index+1}')
+        lines.extend(['[CHAPTER]', 'TIMEBASE=1/1000', f'START={start_ms}',
+                      f'END={end_ms}', f'title={title}'])
+    temporary = target.with_name(f'.{target.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        temporary.write_text('\n'.join(lines)+'\n', encoding='utf-8')
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return str(target)
+
+
 def snap_time(time, targets, tolerance):
     if targets:
         nearest = min(targets, key=lambda t: abs(t-time))
@@ -1439,6 +1668,12 @@ def audio_effect_filters(clip):
         threshold = 10 ** (float(clip.audio_compressor_threshold) / 20.0)
         filters.append(f"acompressor=threshold={threshold:.6f}:ratio={clip.audio_compressor_ratio:.6f}:"
                        "attack=20:release=250:makeup=1")
+    if clip.audio_normalize:
+        # Use the portable single-pass mode so normalization works for every
+        # source without a second analysis render.  The master mixer can
+        # still perform a final project-wide LUFS pass afterwards.
+        filters.append(
+            f"loudnorm=I={float(clip.audio_normalize_target):.2f}:TP=-1.5:LRA=11:linear=true")
     if clip.audio_channel_mode == 'mono':
         filters.append("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1")
     elif clip.audio_channel_mode == 'left':
@@ -2552,7 +2787,8 @@ def resolve_export_encoder(settings):
 
 
 def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, cancel=None, preview=False,
-           track_states=None, export_settings=None, preview_acceleration=False, master_settings=None):
+           track_states=None, export_settings=None, preview_acceleration=False, master_settings=None,
+           duration_override=None):
     """Same composition for preview and export: upper video wins, all audio mixes."""
     export_settings = normalize_export_settings(export_settings, preview=preview)
     validate_timeline(clips, tracks)
@@ -2578,6 +2814,14 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
         raise ValueError("Export darf keine Quelldatei überschreiben.")
     target.parent.mkdir(parents=True, exist_ok=True)
     total = length(clips)
+    if duration_override is not None:
+        try:
+            duration_override = float(duration_override)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Ungültige Exportdauer.") from exc
+        if not math.isfinite(duration_override) or duration_override < MIN_CLIP:
+            raise ValueError("Die Exportdauer ist zu kurz.")
+        total = max(total, duration_override)
     width, height = size
     args = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin", "-y"]
     if preview and preview_acceleration and preview_acceleration_info()['available']:

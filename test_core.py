@@ -14,7 +14,9 @@ from core import (Clip,import_clip,import_image_sequence,parse_subtitle_file,sub
                   relink_project_media,archive_project,extract_project_archive,create_proxy_files,
                   PROXY_PROFILES,proxy_path_for,cache_size,prune_cache,preview_acceleration_info,normalize_markers,
                   normalize_master_mixer,master_audio_filters,EFFECT_PRESETS,TRANSITION_TYPES,KEYFRAME_CURVES,color_grading_filters,
-                  cut_clip_ranges,split_clip_at_times,build_auto_cut_points,mask_path_keyframes_from_tracking)
+                  cut_clip_ranges,split_clip_at_times,build_auto_cut_points,mask_path_keyframes_from_tracking,
+                  trim_timeline_range,close_track_gaps,copy_keyframe_bundle,paste_keyframe_bundle,
+                  write_chapter_file,capture_frame,EXPORT_PRESETS)
 from ai_tools import analyze_beats
 
 
@@ -711,6 +713,45 @@ class EditorCoreTest(unittest.TestCase):
         self.assertEqual({value.compound_name for value in loaded},{'Interview'})
         self.assertEqual(sum(value.multicam_active for value in loaded),1)
         self.assertEqual({value.camera_angle for value in loaded},{'Angle 1','Angle 2'})
+
+    def test_step12_final_workflow_batch(self):
+        self.assertEqual({'youtube','shorts','instagram','master','archive'},set(EXPORT_PRESETS))
+        self.assertEqual(EXPORT_PRESETS['shorts']['video_codec'],'h264')
+
+        first=replace(import_clip(self.blue),end=2,position=1,track=1)
+        second=replace(import_clip(self.red),end=1,position=3,track=1)
+        window=trim_timeline_range([first,second],1.5,3.5)
+        self.assertEqual(len(window),2)
+        self.assertAlmostEqual(window[0].position,0.0,places=5)
+        self.assertAlmostEqual(window[1].position,1.5,places=5)
+        self.assertAlmostEqual(window[-1].finish,2.0,places=4)
+
+        closed,removed=close_track_gaps([replace(first,position=0),replace(second,position=3)],1)
+        self.assertGreater(removed,0.9)
+        self.assertAlmostEqual(next(value for value in closed if value.uid==second.uid).position,2.0,places=5)
+
+        animated=replace(import_clip(self.blue),end=2,keyframes=[
+            {'time':0,'scale':1,'x':.5,'y':.5,'rotation':0,'opacity':1,'blur':0,'curve':'linear'},
+            {'time':1.5,'scale':1.8,'x':.7,'y':.4,'rotation':20,'opacity':.8,'blur':1,'curve':'ease_out'}],
+            volume_keyframes=[{'time':0,'volume':1,'curve':'linear'}, {'time':1.5,'volume':.5,'curve':'ease_in'}])
+        bundle=copy_keyframe_bundle(animated)
+        target=replace(import_clip(self.red),end=1,position=0)
+        pasted=paste_keyframe_bundle(target,bundle)
+        validate_timeline([pasted],self.tracks)
+        self.assertEqual(len(pasted.keyframes),2)
+        self.assertAlmostEqual(pasted.keyframes[-1]['time'],.75,places=5)
+        self.assertTrue(any('loudnorm' in value for value in audio_effect_filters(replace(target,audio_normalize=True))))
+
+        chapters=self.root/'chapters.ffmeta'
+        write_chapter_file(chapters,[{'time':0.2,'label':'Intro','kind':'chapter'},
+                                     {'time':1.4,'label':'Finale','kind':'chapter'}],3.0)
+        metadata=chapters.read_text(encoding='utf-8')
+        self.assertIn(';FFMETADATA1',metadata)
+        self.assertIn('title=Intro',metadata)
+        frame=self.root/'frame.png'
+        capture_frame(self.blue,0.4,frame)
+        self.assertTrue(frame.is_file())
+        self.assertTrue(probe(frame)[1])
 
 
 if __name__=='__main__':unittest.main()

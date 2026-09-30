@@ -4,9 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to build
+        required: true
+        default: v3.6
+        type: string
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
   release:
@@ -18,8 +28,8 @@ jobs:
       - name: Tag und Versionsdatei prüfen
         shell: bash
         run: |
-          test "${GITHUB_REF_NAME}" = "v$(<VERSION)" || {
-            echo "Tag ${GITHUB_REF_NAME} passt nicht zu VERSION $(<VERSION)."
+          test "${RELEASE_TAG}" = "v$(<VERSION)" || {
+            echo "Tag ${RELEASE_TAG} passt nicht zu VERSION $(<VERSION)."
             exit 1
           }
 
@@ -49,7 +59,7 @@ jobs:
       - name: Release-Artefakte bauen
         env:
           APPIMAGETOOL: ${{ runner.temp }}/appimagetool
-          FRAMECUT_RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
+          FRAMECUT_RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}
         run: |
           mkdir -p "$RUNNER_TEMP/release"
           ./build_release.sh "$RUNNER_TEMP/release"
@@ -58,15 +68,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" \
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --clobber \
               "$RUNNER_TEMP/release"/*
           else
-            gh release create "${GITHUB_REF_NAME}" \
+            gh release create "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
-              --title "Framecut ${GITHUB_REF_NAME}" \
+              --title "Framecut ${RELEASE_TAG}" \
               --generate-notes \
               "$RUNNER_TEMP/release"/*
           fi

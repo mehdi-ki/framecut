@@ -61,6 +61,7 @@ jobs:
           APPIMAGETOOL: ${{ runner.temp }}/appimagetool
           FRAMECUT_RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}
         run: |
+          chmod +x build_release.sh build_appimage.sh build_deb.sh
           mkdir -p "$RUNNER_TEMP/release"
           ./build_release.sh "$RUNNER_TEMP/release"
 

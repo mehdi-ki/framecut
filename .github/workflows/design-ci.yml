@@ -1,0 +1,36 @@
+name: Framecut Design CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - design/reference-ui
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Linux-Abhängigkeiten installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libxcb-cursor0 libegl1 python3-venv
+
+      - name: Python-Umgebung vorbereiten
+        run: |
+          python3 -m venv "$RUNNER_TEMP/framecut-venv"
+          "$RUNNER_TEMP/framecut-venv/bin/python" -m pip install -r requirements.txt
+
+      - name: Tests ausführen
+        env:
+          QT_QPA_PLATFORM: offscreen
+          FRAMECUT_DISABLE_UPDATE_CHECK: "1"
+        run: |
+          "$RUNNER_TEMP/framecut-venv/bin/python" -m unittest -q test_delivery.py test_core.py test_gui.py

@@ -59,6 +59,7 @@ jobs:
       - name: Release-Artefakte bauen
         env:
           APPIMAGETOOL: ${{ runner.temp }}/appimagetool
+          ARCH: x86_64
           FRAMECUT_RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}
         run: |
           chmod +x build_release.sh build_appimage.sh build_deb.sh

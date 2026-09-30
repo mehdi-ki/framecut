@@ -1,4 +1,4 @@
-FRAMECUT 3.20.1 — START
+FRAMECUT 3.21.0 — START
 
 1. Das ZIP vollständig in einen NEUEN Ordner entpacken.
 2. Den Ordner mit dieser Datei und start.sh öffnen.
@@ -22,6 +22,7 @@ NEU IN 3.18.0: Freie Bezier-/Rotoskopie-Masken mit Pfad-Keyframes, 3-Wege-Color-
 NEU IN 3.19.0: Textbasierter Schnitt mit lokaler Pausen-/Füllwort-Erkennung, Bezier-Masken-Tracking, Beat-/Szenen-Auto-Cut, benannte Compound-Clips und Audio-synchronisierte Multi-Kamera-Winkel.
 NEU IN 3.20.0: Export-Presets für YouTube/Shorts/Reels/Instagram, Arbeitsbereich-In/Out mit Bereichsexport, Attribute- und Keyframe-Clipboard, universeller Audio-Sync, Clip-Loudness-Normalisierung, Standbilder am Abspielkopf, PNG-Frame-Capture, FFmpeg-Kapiteldateien und automatisches Schließen von Spurlücken.
 NEU IN 3.20.1: Flache Symboltoolbar ohne doppelte Gruppenkästen, einheitliche Icon-Aktionen für Quelle und Arbeitsbereich, zuverlässiger Timeline-Rechtsklick und kompakte Kurztipps im Inspector.
+NEU IN 3.21.0: Neues Workspace-Redesign mit Medien links, größerer Vorschau in der Mitte, aufklappbarem Inspector rechts, kompakterem Header und überarbeiteter Timeline-Optik.
 
 VORSCHAU: ▶ Timeline berechnet den Mix nach kurzer Bearbeitungspause im Hintergrund. Der letzte gültige Frame bleibt sichtbar.
 Clip ansehen zeigt sofort die einzelne Quelle.

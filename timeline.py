@@ -270,7 +270,13 @@ class Timeline(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), QColor('#101318'))
+        p.fillRect(self.rect(), QColor('#0c131b'))
+        ruler = QRectF(0, 0, self.width(), self.TOP)
+        p.fillRect(ruler, QColor('#111d28'))
+        p.fillRect(QRectF(0, 0, self.LEFT, self.TOP), QColor('#15232e'))
+        p.setPen(QColor('#8ea6b5'))
+        p.setFont(QFont('Sans', 8, QFont.Bold))
+        p.drawText(QRectF(14, 0, self.LEFT-24, self.TOP), Qt.AlignLeft|Qt.AlignVCenter, 'TRACKS')
         p.setFont(QFont('Sans',9))
         viewport = QRectF(event.rect())
         steps = [.1,.25,.5,1,2,5,10,15,30,60,120,300,600]
@@ -279,23 +285,31 @@ class Timeline(QWidget):
         end = int((viewport.right()-self.LEFT)/self.scale/step)+2
         for k in range(begin,end):
             t=k*step; x=self.LEFT+t*self.scale
-            p.setPen(QColor('#222a33')); p.drawLine(int(x),self.TOP,int(x),self.height())
-            p.setPen(QColor('#7d8999'))
+            p.setPen(QColor('#22323f')); p.drawLine(int(x),self.TOP,int(x),self.height())
+            p.setPen(QColor('#9ab0bd'))
             p.drawText(int(x)+5,22,f'{int(t)//60:02}:{t%60:04.1f}' if step<1 else f'{int(t)//60:02}:{int(t)%60:02}')
-        p.fillRect(0,0,self.LEFT,self.height(),QColor('#1a1f27'))
-        p.setPen(QPen(QColor('#35404d'),1)); p.drawLine(self.LEFT,0,self.LEFT,self.height())
+        p.fillRect(0,self.TOP,self.LEFT,self.height()-self.TOP,QColor('#111b25'))
+        p.setPen(QPen(QColor('#304451'),1)); p.drawLine(self.LEFT,0,self.LEFT,self.height())
+        p.setFont(QFont('Sans',9))
         for i, track in enumerate(self.tracks):
             y=self.TOP+i*self.ROW
-            p.setPen(QColor('#29323d')); p.drawLine(0,y,self.width(),y)
-            p.setPen(QColor('#9bc8df' if track>0 else '#8bd9b9'))
+            row_color = QColor('#101a23' if i % 2 == 0 else '#0e1720')
+            p.fillRect(QRectF(0,y,self.width(),self.ROW), row_color)
+            p.setPen(QColor('#233541')); p.drawLine(0,y,self.width(),y)
+            p.setPen(QColor('#8bd9c5' if track < 0 else '#8fc9e1'))
+            p.setFont(QFont('Sans',9,QFont.Bold))
             name=self.track_names.get(track, f'VIDEO {track}' if track>0 else f'AUDIO {-track}')
-            p.drawText(QRectF(12,y+10,self.LEFT-62,27),Qt.AlignLeft|Qt.AlignVCenter,name)
+            p.drawText(QRectF(12,y+9,self.LEFT-64,22),Qt.AlignLeft|Qt.AlignVCenter,name)
+            p.setFont(QFont('Sans',8))
+            p.setPen(QColor('#6f8797'))
+            p.drawText(QRectF(12,y+32,self.LEFT-24,18),Qt.AlignLeft|Qt.AlignVCenter,'Bild + Ton' if track>0 else 'Musik / Ton')
             state = self.track_states.get(track, {})
-            p.setPen(QColor('#ff8f8f' if state.get('muted') else '#75869d'))
-            p.drawText(QRectF(self.LEFT-52,y+10,22,27),Qt.AlignCenter,'M')
-            p.setPen(QColor('#ffd166' if state.get('locked') else '#75869d'))
-            p.drawText(QRectF(self.LEFT-28,y+10,22,27),Qt.AlignCenter,'L')
-            p.setPen(QColor('#6f7c8d')); p.drawText(QRectF(12,y+36,self.LEFT-24,20),Qt.AlignLeft|Qt.AlignVCenter,'Bild + Ton' if track>0 else 'Musik / Ton')
+            mute_color = QColor('#ff9ca6' if state.get('muted') else '#78909e')
+            lock_color = QColor('#f4c86b' if state.get('locked') else '#78909e')
+            for box_x, letter, color in ((self.LEFT-53,'M',mute_color),(self.LEFT-29,'L',lock_color)):
+                p.setBrush(QColor('#26333d') if ((letter == 'M' and state.get('muted')) or (letter == 'L' and state.get('locked'))) else QColor('#192630'))
+                p.setPen(QPen(QColor('#334957'),1)); p.drawRoundedRect(QRectF(box_x,y+16,20,20),5,5)
+                p.setPen(color); p.setFont(QFont('Sans',8,QFont.Bold)); p.drawText(QRectF(box_x,y+16,20,20),Qt.AlignCenter,letter)
         for marker in self.markers:
             marker_time = float(marker.get('time', 0.0))
             x = self.LEFT + marker_time * self.scale
@@ -334,14 +348,18 @@ class Timeline(QWidget):
             return
         selected=c.uid in self.selection
         p.setOpacity(.7 if ghost else 1)
-        p.setPen(QPen(QColor('#62dfce' if selected else '#456878' if c.track>0 else '#397961'),2 if selected else 1))
-        p.setBrush(QColor('#5b4b28' if c.source_type=='adjustment' else '#49365e' if c.kind=='text' else '#23424d' if c.track>0 else '#203f38'))
-        p.drawRoundedRect(r,6,6)
+        border = QColor('#8cebdd' if selected else '#4b7381' if c.track>0 else '#3f806e')
+        fill = QColor('#4b3d20' if c.source_type=='adjustment' else '#3a2b50' if c.kind=='text' else '#1d3b48' if c.track>0 else '#1b3a32')
+        p.setPen(QPen(border,2 if selected else 1))
+        p.setBrush(fill)
+        p.drawRoundedRect(r,7,7)
+        accent = QColor('#e6bf67' if c.source_type=='adjustment' else '#c898ed' if c.kind=='text' else '#70c8e2' if c.track>0 else '#72d0ac')
+        p.setPen(Qt.NoPen); p.setBrush(accent); p.drawRoundedRect(QRectF(r.left()+1,r.top()+1,r.width()-2,3),2,2)
         if selected:
-            p.setBrush(QColor(99,234,212,38)); p.setPen(Qt.NoPen); p.drawRoundedRect(r.adjusted(3,3,-3,-3),4,4)
+            p.setBrush(QColor(116,226,208,36)); p.setPen(Qt.NoPen); p.drawRoundedRect(r.adjusted(3,4,-3,-3),5,5)
         if c.kind == 'text':
-            p.setPen(QColor('#f2ddff')); p.drawText(int(r.left()+10),int(r.top()+22),'T  '+c.text[:24])
-            p.setPen(QColor('#d7b5f6')); p.drawText(int(r.left()+10),int(r.top()+42),f'{c.length:.2f} s  ·  Text')
+            p.setPen(QColor('#f5e8ff')); p.setFont(QFont('Sans',9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),'T  '+c.text[:24])
+            p.setPen(QColor('#d8b9ef')); p.setFont(QFont('Sans',8)); p.drawText(int(r.left()+10),int(r.top()+43),f'{c.length:.2f} s  ·  Text')
         if c.kind == 'video' and c.path in self.thumbnails and r.width() > 34:
             image = self._thumbnail(c.path, r.height()-4)
             if image is not None:
@@ -356,8 +374,8 @@ class Timeline(QWidget):
                 p.restore()
         if c.source_type == 'adjustment':
             p.save(); p.setClipRect(r.adjusted(8,2,-7,-2))
-            p.setPen(QColor('#f8d27a')); p.drawText(int(r.left()+10),int(r.top()+22),'FX  Adjustment-Layer')
-            p.setPen(QColor('#d6b86a')); p.drawText(int(r.left()+10),int(r.top()+42),f'{c.length:.2f} s  ·  Effekte')
+            p.setPen(QColor('#f8d27a')); p.setFont(QFont('Sans',9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),'FX  Adjustment-Layer')
+            p.setPen(QColor('#d6b86a')); p.setFont(QFont('Sans',8)); p.drawText(int(r.left()+10),int(r.top()+43),f'{c.length:.2f} s  ·  Effekte')
             p.restore()
         if c.kind == 'audio' and c.path in self.waveforms and r.width() > 24:
             image = self._waveform(c, r.width()-6, r.height()-6)
@@ -371,17 +389,19 @@ class Timeline(QWidget):
             title = c.compound_name or Path(c.path).name
             if c.camera_angle:
                 title = f'{title} · {c.camera_angle}'
-            p.setPen(QColor('#e4f3f8')); p.drawText(int(r.left()+10),int(r.top()+22),title[:32])
-            detail = f'{c.length:.2f} s  ·  {c.volume:.0%}'
-            if c.multicam_group and not c.multicam_active:
-                detail += '  ·  inaktiver Winkel'
-            p.setPen(QColor('#b2c8d1')); p.drawText(int(r.left()+10),int(r.top()+42),detail)
+            if r.width() > 54:
+                p.setPen(QColor('#e5f4f8')); p.setFont(QFont('Sans',9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),title[:32])
+            if r.width() > 82:
+                detail = f'{c.length:.2f} s  ·  {c.volume:.0%}'
+                if c.multicam_group and not c.multicam_active:
+                    detail += '  ·  inaktiver Winkel'
+                p.setPen(QColor('#aec7d1')); p.setFont(QFont('Sans',8)); p.drawText(int(r.left()+10),int(r.top()+43),detail)
         p.restore()
         if selected and r.width()>18:
             p.setOpacity(1)
-            p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor('#b7fff4'),2)); p.drawRoundedRect(r,6,6)
-            p.fillRect(QRectF(r.left()+3,r.top()+15,3,r.height()-30),QColor('#8de7da'))
-            p.fillRect(QRectF(r.right()-6,r.top()+15,3,r.height()-30),QColor('#8de7da'))
+            p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor('#b7fff4'),2)); p.drawRoundedRect(r,7,7)
+            p.fillRect(QRectF(r.left()+3,r.top()+15,3,max(2,r.height()-30)),QColor('#8de7da'))
+            p.fillRect(QRectF(r.right()-6,r.top()+15,3,max(2,r.height()-30)),QColor('#8de7da'))
         if c.kind == 'video' and c.keyframes and r.width() > 18:
             p.setOpacity(.95 if not ghost else .45)
             p.setPen(Qt.NoPen); p.setBrush(QColor('#f8c86f'))

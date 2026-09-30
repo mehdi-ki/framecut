@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-APP_VERSION="${FRAMECUT_VERSION:-3.20.1}"
+APP_VERSION="${FRAMECUT_VERSION:-3.21.0}"
 if [[ -z "${FRAMECUT_VERSION:-}" && -f "$SCRIPT_DIR/VERSION" ]]; then
   APP_VERSION="$(<"$SCRIPT_DIR/VERSION")"
 fi

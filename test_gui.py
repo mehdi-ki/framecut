@@ -8,7 +8,7 @@ from unittest.mock import patch
 from PySide6.QtCore import Qt,QPoint,QMimeData,QPointF
 from PySide6.QtGui import QDragEnterEvent,QDropEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication,QMessageBox,QInputDialog,QFileDialog,QToolButton
+from PySide6.QtWidgets import QApplication,QMessageBox,QInputDialog,QFileDialog,QToolButton,QFrame
 from app import Editor,ExportDialog,STYLE
 from core import load_project,length,parse_subtitle_file,save_project
 from timeline import ASSET_MIME,Timeline
@@ -38,6 +38,17 @@ class GuiTest(unittest.TestCase):
             QTest.qWait(40)
             if w.worker is None and w.preview_worker is None:return
         self.fail('Background job did not finish after 20 seconds')
+
+    def test_visual_workspace_structure(self):
+        """The redesign keeps the editor's visual hierarchy explicit."""
+        with tempfile.TemporaryDirectory() as state:
+            w=Editor(state,recovery=False);w.show();QTest.qWait(50)
+            self.assertEqual(w.centralWidget().objectName(),'editorRoot')
+            self.assertGreaterEqual(len(w.findChildren(QToolButton,'headerToolButton')),8)
+            self.assertGreaterEqual(len(w.findChildren(QToolButton,'inspectorSectionHeader')),10)
+            self.assertIsNotNone(w.findChild(QFrame,'previewToolbar'))
+            self.assertIsNotNone(w.findChild(QFrame,'previewSubbar'))
+            w.close();QTest.qWait(30)
 
     def test_framecut_file_association_loads_project_argument(self):
         with tempfile.TemporaryDirectory() as state:

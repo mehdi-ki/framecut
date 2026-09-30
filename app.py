@@ -1,4 +1,4 @@
-"""Framecut 3.20.1 — native Linux multitrack editor."""
+"""Framecut 3.21.0 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -37,9 +37,9 @@ from ai_tools import (AIToolError, remove_background_media, track_motion, auto_r
                        analyze_beats, detect_scene_changes, detect_audio_onset)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.20.1'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.21.0'
 except OSError:
-    APP_VERSION = '3.20.1'
+    APP_VERSION = '3.21.0'
 
 
 def label(text,name=None):
@@ -51,6 +51,27 @@ def label(text,name=None):
 def button(text,callback,primary=False):
     widget=QPushButton(text); widget.clicked.connect(callback)
     if primary: widget.setObjectName('primary')
+    return widget
+
+
+def icon_action(symbol, tooltip, callback, theme_name=None):
+    """Create a compact header action without adding another text-heavy box."""
+    widget=QToolButton()
+    icon=QIcon.fromTheme(theme_name) if theme_name else QIcon()
+    if not icon.isNull():
+        widget.setIcon(icon)
+        widget.setToolButtonStyle(Qt.ToolButtonIconOnly)
+    else:
+        widget.setText(symbol)
+        widget.setToolButtonStyle(Qt.ToolButtonTextOnly)
+    widget.setObjectName('headerToolButton')
+    widget.setToolTip(tooltip)
+    widget.setStatusTip(tooltip)
+    widget.setAccessibleName(tooltip)
+    widget.setIconSize(QSize(17,17))
+    widget.setFixedSize(34,30)
+    widget.setAutoRaise(True)
+    widget.clicked.connect(callback)
     return widget
 
 
@@ -126,7 +147,7 @@ def timeline_track_group(video_spin, audio_spin):
 
 def panel():
     widget=QFrame(); widget.setObjectName('panel')
-    layout=QVBoxLayout(widget); layout.setContentsMargins(14,14,14,14); layout.setSpacing(10)
+    layout=QVBoxLayout(widget); layout.setContentsMargins(12,11,12,11); layout.setSpacing(8)
     return widget,layout
 
 
@@ -935,7 +956,7 @@ class Editor(QMainWindow):
         # Debounce edits so a burst of trim/property changes produces one
         # preview render after the user pauses, not one render per keystroke.
         self.live_preview_timer=QTimer(self); self.live_preview_timer.setSingleShot(True); self.live_preview_timer.setInterval(700); self.live_preview_timer.timeout.connect(self.auto_preview)
-        self.build_ui(); self.setAcceptDrops(True); self.update_cache_status()
+        self.build_ui(); self.update_project_identity(); self.setAcceptDrops(True); self.update_cache_status()
         shortcuts=[('Ctrl+I',self.import_dialog),('Ctrl+S',self.save),('Ctrl+Shift+S',lambda:self.save(True)),
                    ('Ctrl+O',self.open_project),('Ctrl+N',self.new_project),('Ctrl+Z',self.undo),
                    ('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('Ctrl+B',self.split),('S',self.split),
@@ -964,37 +985,43 @@ class Editor(QMainWindow):
         if configured_manifest_url(): QTimer.singleShot(2500,lambda:self.check_for_updates(True))
 
     def build_ui(self):
-        root=QWidget(); outer=QVBoxLayout(root); outer.setContentsMargins(10,10,10,7); outer.setSpacing(7)
+        root=QWidget(); root.setObjectName('editorRoot')
+        outer=QVBoxLayout(root); outer.setContentsMargins(12,10,12,8); outer.setSpacing(8)
 
         # Header: project identity and the actions that belong to the whole
         # edit. Keeping this separate from the workspace makes the hierarchy
         # readable even when the inspector is scrolled deeply.
         header=QFrame(); header.setObjectName('topbar')
-        head=QHBoxLayout(header); head.setContentsMargins(14,7,10,7); head.setSpacing(6)
-        head.addWidget(label('FRAMECUT','brand')); head.addWidget(label(f'{APP_VERSION} · EDITOR','muted'))
-        head.addStretch()
-        head.addWidget(label('Untitled project','projectTitle'))
-        head.addWidget(label('● Autosave aktiv','statusPill'))
-        head.addStretch()
-        header_actions=[]
-        for text,fn in [('Neu',self.new_project),('Öffnen',self.open_project),('Speichern',self.save)]:
-            action=button(text,fn); action.setObjectName('iconButton'); header_actions.append(action); head.addWidget(action)
-        self.update_button=button('Updates',self.check_for_updates); self.update_button.setObjectName('iconButton'); head.addWidget(self.update_button)
-        self.relink_button=button('Neu verknüpfen',self.relink_media); self.relink_button.setObjectName('iconButton'); head.addWidget(self.relink_button)
-        self.archive_button=button('Archiv',self.archive_project_dialog); self.archive_button.setObjectName('iconButton'); head.addWidget(self.archive_button)
-        self.render_queue_button=button('Queue (0)',self.show_render_queue); self.render_queue_button.setObjectName('iconButton'); head.addWidget(self.render_queue_button)
-        self.mixer_button=button('Mixer',self.open_mixer); self.mixer_button.setObjectName('iconButton'); head.addWidget(self.mixer_button)
-        self.command_button=button('Befehle  ⌘K',self.open_command_palette); self.command_button.setObjectName('iconButton'); head.addWidget(self.command_button)
-        self.preset=QComboBox(); self.preset.addItems(PRESETS); self.preset.currentTextChanged.connect(self.preset_changed); self.preset.setToolTip('Projektformat und Vorschaugröße')
-        head.addWidget(self.preset)
-        export_button=button('Exportieren  ↗',self.start_export,True); export_button.setObjectName('exportButton'); head.addWidget(export_button)
+        head=QHBoxLayout(header); head.setContentsMargins(13,7,10,7); head.setSpacing(5)
+        head.addWidget(label('FRAMECUT','brand'))
+        head.addWidget(label(f'v{APP_VERSION}','versionLabel'))
+        divider=QFrame(); divider.setObjectName('headerDivider'); divider.setFrameShape(QFrame.VLine); divider.setFixedHeight(22); head.addWidget(divider)
+        project_block=QVBoxLayout(); project_block.setContentsMargins(2,0,0,0); project_block.setSpacing(0)
+        self.project_title_label=label('Neues Projekt','projectTitle'); project_block.addWidget(self.project_title_label)
+        self.project_meta_label=label('Lokales Projekt','muted'); project_block.addWidget(self.project_meta_label)
+        project_widget=QWidget(); project_widget.setLayout(project_block); head.addWidget(project_widget)
+        head.addStretch(1)
+        self.autosave_pill=label('● Autosave','statusPill'); self.autosave_pill.setToolTip('Automatische Sicherung ist aktiv'); head.addWidget(self.autosave_pill)
+        self.new_button=icon_action('+','Neues Projekt · Strg+N',self.new_project,'document-new'); head.addWidget(self.new_button)
+        self.open_button=icon_action('↥','Projekt öffnen · Strg+O',self.open_project,'document-open'); head.addWidget(self.open_button)
+        self.save_button=icon_action('▣','Projekt speichern · Strg+S',self.save,'document-save'); head.addWidget(self.save_button)
+        self.update_button=icon_action('↻','Nach Updates suchen',self.check_for_updates,'view-refresh'); head.addWidget(self.update_button)
+        self.relink_button=icon_action('⛓','Medien neu verknüpfen',self.relink_media,'insert-link'); head.addWidget(self.relink_button)
+        self.archive_button=icon_action('▤','Projekt archivieren',self.archive_project_dialog,'package-x-generic'); head.addWidget(self.archive_button)
+        self.render_queue_button=icon_action('☷','Render-Queue öffnen',self.show_render_queue,'view-list'); head.addWidget(self.render_queue_button)
+        self.mixer_button=icon_action('♫','Audio-Mixer öffnen',self.open_mixer,'audio-volume-high'); head.addWidget(self.mixer_button)
+        self.command_button=icon_action('⌘','Befehlspalette öffnen · Strg+K',self.open_command_palette,'system-search'); head.addWidget(self.command_button)
+        self.preset=QComboBox(); self.preset.setObjectName('projectPreset'); self.preset.addItems(PRESETS); self.preset.currentTextChanged.connect(self.preset_changed); self.preset.setToolTip('Projektformat und Vorschaugröße'); head.addWidget(self.preset)
+        export_button=button('Exportieren',self.start_export,True); export_button.setObjectName('exportButton'); export_button.setMinimumWidth(106); head.addWidget(export_button)
         outer.addWidget(header)
 
         # The reference uses a lightweight mode strip above the three-column
         # workspace. These shortcuts expose existing actions without hiding
         # any of the editor's current controls.
         modebar=QFrame(); modebar.setObjectName('modebar')
-        mode_layout=QHBoxLayout(modebar); mode_layout.setContentsMargins(4,0,4,0); mode_layout.setSpacing(3)
+        mode_layout=QHBoxLayout(modebar); mode_layout.setContentsMargins(7,3,7,3); mode_layout.setSpacing(3)
+        mode_layout.addWidget(label('ARBEITSBEREICH','eyebrow'))
+        mode_layout.addWidget(timeline_separator())
         self.mode_buttons=[]
         def mode_tab(text, callback=None, active=False, tooltip=''):
             tab=QPushButton(text); tab.setObjectName('modeTabActive' if active else 'modeTab')
@@ -1016,27 +1043,22 @@ class Editor(QMainWindow):
         mode_tab('Übergänge',lambda:self.statusBar().showMessage('Übergänge findest du rechts im Inspector · Clip auswählen'))
         mode_tab('Filter',lambda:self.statusBar().showMessage('Filter findest du rechts im Inspector · Clip auswählen'))
         mode_layout.addStretch()
-        mode_layout.addWidget(label('WORKSPACE','muted'))
+        mode_layout.addWidget(label('CAPCUT WORKSPACE','muted'))
         outer.addWidget(modebar)
 
-        vertical=QSplitter(Qt.Vertical); top=QSplitter(Qt.Horizontal)
+        vertical=QSplitter(Qt.Vertical); top=QSplitter(Qt.Horizontal); top.setChildrenCollapsible(False)
         # Let the vertical splitter decide the height. The default Preferred
         # policy inherits the tall media-panel size hint and blocks the handle.
         top.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
-        rail=QFrame(); rail.setObjectName('workspaceRail'); rail.setMinimumWidth(72); rail.setMaximumWidth(88)
-        rail_layout=QVBoxLayout(rail); rail_layout.setContentsMargins(6,10,6,10); rail_layout.setSpacing(5)
-        rail_layout.addWidget(label('ASSETS','eyebrow'))
-        local_button=button('▦\nLokal',lambda:self.media_search.setFocus()); local_button.setObjectName('railButtonActive'); local_button.setToolTip('Lokale Medien')
-        library_button=button('▤\nBibliothek',lambda:self.statusBar().showMessage('Bibliothek · lokale Dateien über Import hinzufügen')); library_button.setObjectName('railButton'); library_button.setToolTip('Bibliothek')
-        rail_layout.addWidget(local_button); rail_layout.addWidget(library_button); rail_layout.addStretch()
-        rail_layout.addWidget(label('DROP\nMEDIA','muted'))
-        top.addWidget(rail)
-
-        media,ml=panel(); media.setObjectName('mediaPanel'); media.setMinimumWidth(220)
-        ml.addWidget(label('MEDIEN','heading')); ml.addWidget(button('+ Video / Audio / Bild importieren',self.import_dialog,True))
-        ml.addWidget(button('+ Bildsequenz importieren',self.import_sequence_dialog))
-        ml.addWidget(button('+ Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog))
-        ml.addWidget(button('+ Automatische Untertitel',self.automatic_subtitle_dialog))
+        media,ml=panel(); media.setObjectName('mediaPanel'); media.setMinimumWidth(250)
+        media_header=QHBoxLayout(); media_header.setContentsMargins(0,0,0,0); media_header.setSpacing(6)
+        media_header.addWidget(label('MEDIEN','heading')); media_header.addStretch()
+        self.media_count=label('0 Medien','muted'); media_header.addWidget(self.media_count); ml.addLayout(media_header)
+        import_row=QHBoxLayout(); import_row.setContentsMargins(0,0,0,0); import_row.setSpacing(5)
+        import_row.addWidget(button('+ Medien importieren',self.import_dialog,True),1)
+        import_more=QToolButton(); import_more.setText('⋯'); import_more.setObjectName('panelMenuButton'); import_more.setToolTip('Weitere Importoptionen'); import_more.setAccessibleName('Weitere Importoptionen')
+        import_menu=QMenu(self); import_menu.addAction('Bildsequenz importieren',self.import_sequence_dialog); import_menu.addAction('Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog); import_menu.addAction('Automatische Untertitel',self.automatic_subtitle_dialog)
+        import_more.setMenu(import_menu); import_more.setPopupMode(QToolButton.InstantPopup); import_row.addWidget(import_more); ml.addLayout(import_row)
         self.media_search=QLineEdit(); self.media_search.setPlaceholderText('Medien durchsuchen …'); self.media_search.setClearButtonEnabled(True)
         self.media_search.setToolTip('Suche nach Dateiname, Pfad oder Medientyp')
         ml.addWidget(self.media_search)
@@ -1050,15 +1072,14 @@ class Editor(QMainWindow):
             self.media_sort.addItem(title,value)
         self.media_sort.setToolTip('Reihenfolge der Medienablage')
         media_filter_row.addWidget(self.media_filter,1); media_filter_row.addWidget(self.media_sort,1); ml.addLayout(media_filter_row)
-        self.media_count=label('0 Medien','muted'); ml.addWidget(self.media_count)
-        ml.addWidget(label('In eine Timeline-Spur ziehen','muted'))
-        self.media_list=MediaList(); self.media_list.setViewMode(QListWidget.IconMode)
+        media_hint=label('Ziehen zum Einfügen · Doppelklick zum Anhängen','subtle'); media_hint.setWordWrap(True); ml.addWidget(media_hint)
+        self.media_list=MediaList(); self.media_list.setObjectName('mediaList'); self.media_list.setViewMode(QListWidget.IconMode)
         self.media_list.setResizeMode(QListWidget.Adjust); self.media_list.setWrapping(True); self.media_list.setSpacing(4)
-        self.media_list.setIconSize(QSize(116,66)); self.media_list.setGridSize(QSize(142,104)); self.media_list.setUniformItemSizes(True)
+        self.media_list.setIconSize(QSize(124,72)); self.media_list.setGridSize(QSize(150,108)); self.media_list.setUniformItemSizes(True)
         self.media_list.itemDoubleClicked.connect(lambda _:self.add_selected_asset())
         self.media_search.textChanged.connect(self.refresh_media); self.media_filter.currentIndexChanged.connect(self.refresh_media); self.media_sort.currentIndexChanged.connect(self.refresh_media)
         ml.addWidget(self.media_list,1)
-        ml.addWidget(button('Am Spurende hinzufügen +',self.add_selected_asset))
+        ml.addWidget(button('＋ Zur Timeline hinzufügen',self.add_selected_asset))
         top.addWidget(media)
         preview,pl=panel(); preview.setObjectName('previewPanel')
         preview_header=QHBoxLayout(); preview_header.setContentsMargins(0,0,0,0)
@@ -1069,7 +1090,7 @@ class Editor(QMainWindow):
         self.gpu_preview_box=QCheckBox('GPU-Decoding'); self.gpu_preview_box.setChecked(self.gpu_preview_info['available']); self.gpu_preview_box.setEnabled(self.gpu_preview_info['available'])
         self.gpu_preview_box.setToolTip(self.gpu_preview_info['label']+' · fällt sonst automatisch auf CPU zurück')
         self.live_preview_box.toggled.connect(self.preview_option_changed); self.quick_preview_box.toggled.connect(self.preview_option_changed); self.gpu_preview_box.toggled.connect(self.preview_option_changed)
-        preview_options.addWidget(self.live_preview_box); preview_options.addWidget(self.quick_preview_box); preview_options.addWidget(self.gpu_preview_box); preview_options.addStretch(); pl.addLayout(preview_options)
+        preview_options.addWidget(self.live_preview_box); preview_options.addWidget(self.quick_preview_box); preview_options.addWidget(self.gpu_preview_box); preview_options.addStretch()
         performance_options=QHBoxLayout(); self.proxy_box=QCheckBox('Proxy-Vorschau'); self.proxy_box.setEnabled(False)
         self.proxy_box.setToolTip('Erzeugt lokale, kleinere Vorschau-Dateien und lässt die Originale für den Export unverändert')
         self.proxy_profile_combo=QComboBox()
@@ -1078,7 +1099,7 @@ class Editor(QMainWindow):
         self.proxy_profile_combo.setToolTip('Qualität der Proxy-Dateien: 360p ist schneller, 720p detailreicher')
         self.cache_status=label('Cache wird automatisch begrenzt','muted'); self.cache_clear_button=button('Cache leeren',self.clear_cache)
         self.proxy_box.toggled.connect(self.proxy_toggled); self.proxy_profile_combo.currentIndexChanged.connect(self.proxy_profile_changed)
-        performance_options.addWidget(self.proxy_box); performance_options.addWidget(label('Profil','muted')); performance_options.addWidget(self.proxy_profile_combo); performance_options.addStretch(); performance_options.addWidget(self.cache_status); performance_options.addWidget(self.cache_clear_button); pl.addLayout(performance_options)
+        performance_options.addWidget(self.proxy_box); performance_options.addWidget(label('Profil','muted')); performance_options.addWidget(self.proxy_profile_combo); performance_options.addStretch(); performance_options.addWidget(self.cache_status); performance_options.addWidget(self.cache_clear_button)
         self.video_stack=QStackedWidget(); self.video_stack.setObjectName('previewCanvas'); self.video_stack.setMinimumSize(330,190)
         self.placeholder=label('Dein Film beginnt hier.\n\nMedien importieren → in die Timeline ziehen', 'muted')
         self.placeholder.setAlignment(Qt.AlignCenter); self.video_stack.addWidget(self.placeholder)
@@ -1097,21 +1118,39 @@ class Editor(QMainWindow):
         self.source_insert_button=timeline_tool_button('↳','Markierten Quellbereich am Abspielkopf einfügen und spätere Clips verschieben',self.insert_source_range,'insert-object',object_name='sourceToolButton')
         self.source_overwrite_button=timeline_tool_button('▣','Markierten Quellbereich am Abspielkopf überschreiben',self.overwrite_source_range,'document-save-as',object_name='sourceToolButton')
         for widget in (self.source_in_button,self.source_out_button,self.source_clear_button,self.source_insert_button,self.source_overwrite_button): source_controls.addWidget(widget)
-        pl.addLayout(source_controls)
+        source_bar=QFrame(); source_bar.setObjectName('previewSubbar'); source_bar.setLayout(source_controls); pl.addWidget(source_bar)
         work_controls=QHBoxLayout(); work_controls.setContentsMargins(0,0,0,0); work_controls.setSpacing(4)
         self.work_range_label=label('Arbeitsbereich: gesamte Timeline','muted'); self.work_range_label.setObjectName('sourceRangeLabel'); work_controls.addWidget(self.work_range_label,1)
         self.work_in_button=timeline_tool_button('I','Arbeitsbereich-In am Abspielkopf setzen · Strg+Alt+I',self.set_work_in,object_name='sourceToolButton')
         self.work_out_button=timeline_tool_button('O','Arbeitsbereich-Out am Abspielkopf setzen · Strg+Alt+O',self.set_work_out,object_name='sourceToolButton')
         self.work_clear_button=timeline_tool_button('×','Arbeitsbereich löschen',self.clear_work_area,object_name='sourceToolDanger')
         for widget in (self.work_in_button,self.work_out_button,self.work_clear_button): work_controls.addWidget(widget)
-        pl.addLayout(work_controls)
+        work_bar=QFrame(); work_bar.setObjectName('previewSubbar'); work_bar.setLayout(work_controls); pl.addWidget(work_bar)
+        preview_tools=QFrame(); preview_tools.setObjectName('previewToolbar')
+        preview_tools_layout=QVBoxLayout(preview_tools); preview_tools_layout.setContentsMargins(8,4,8,4); preview_tools_layout.setSpacing(1)
+        preview_tools_layout.addLayout(preview_options); preview_tools_layout.addLayout(performance_options); pl.addWidget(preview_tools)
         top.addWidget(preview)
         inspector,inspector_outer=panel(); inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
         inspector_scroll=QScrollArea(); inspector_scroll.setWidgetResizable(True); inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         inspector_content=QWidget(); il=QVBoxLayout(inspector_content); il.setContentsMargins(0,0,0,0); il.setSpacing(8)
         inspector_scroll.setWidget(inspector_content); inspector_outer.addWidget(inspector_scroll)
-        il.addWidget(label('CLIP-EINSTELLUNGEN','heading')); self.clip_name=label('Kein Clip ausgewählt','muted'); self.clip_name.setWordWrap(True); il.addWidget(self.clip_name)
-        form=QFormLayout(); self.position=QDoubleSpinBox(); self.start=QDoubleSpinBox(); self.end=QDoubleSpinBox()
+        inspector_header=QFrame(); inspector_header.setObjectName('inspectorHeader')
+        inspector_header_layout=QVBoxLayout(inspector_header); inspector_header_layout.setContentsMargins(10,8,10,8); inspector_header_layout.setSpacing(2)
+        inspector_header_layout.addWidget(label('INSPECTOR','eyebrow'))
+        self.clip_name=label('Kein Clip ausgewählt','projectTitle'); self.clip_name.setWordWrap(True); inspector_header_layout.addWidget(self.clip_name)
+        il.addWidget(inspector_header)
+
+        def inspector_section(title, expanded=True):
+            section=QFrame(); section.setObjectName('inspectorSection')
+            section_layout=QVBoxLayout(section); section_layout.setContentsMargins(0,0,0,0); section_layout.setSpacing(0)
+            toggle=QToolButton(); toggle.setObjectName('inspectorSectionHeader'); toggle.setText(title); toggle.setCheckable(True); toggle.setChecked(expanded); toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow); toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); toggle.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Fixed)
+            body=QFrame(); body.setObjectName('inspectorSectionBody'); body.setVisible(expanded)
+            body_layout=QVBoxLayout(body); body_layout.setContentsMargins(10,7,10,10); body_layout.setSpacing(7)
+            toggle.toggled.connect(lambda checked, body=body, toggle=toggle: (body.setVisible(checked), toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)))
+            section_layout.addWidget(toggle); section_layout.addWidget(body); il.addWidget(section)
+            return body_layout
+
+        self.position=QDoubleSpinBox(); self.start=QDoubleSpinBox(); self.end=QDoubleSpinBox()
         for spin in [self.position,self.start,self.end]: spin.setRange(0,864000); spin.setDecimals(3); spin.setSuffix(' s'); spin.setSingleStep(.1)
         self.track_combo=QComboBox(); self.volume=QDoubleSpinBox(); self.volume.setRange(0,100); self.volume.setDecimals(0); self.volume.setSuffix(' %')
         self.audio_noise_reduction=QDoubleSpinBox(); self.audio_noise_reduction.setRange(0,30); self.audio_noise_reduction.setDecimals(1); self.audio_noise_reduction.setSingleStep(1); self.audio_noise_reduction.setSuffix(' dB')
@@ -1233,7 +1272,7 @@ class Editor(QMainWindow):
         self.keyframe_time=QDoubleSpinBox(); self.keyframe_time.setRange(0,864000); self.keyframe_time.setDecimals(2); self.keyframe_time.setSingleStep(.1); self.keyframe_time.setSuffix(' s')
         self.keyframe_curve=QComboBox()
         for value in KEYFRAME_CURVES: self.keyframe_curve.addItem(KEYFRAME_CURVE_LABELS[value],value)
-        self.keyframe_list=QListWidget(); self.keyframe_list.setMaximumHeight(96); self.keyframe_list.setMinimumHeight(42)
+        self.keyframe_list=QListWidget(); self.keyframe_list.setObjectName('keyframeList'); self.keyframe_list.setMaximumHeight(96); self.keyframe_list.setMinimumHeight(42)
         self.keyframe_set_button=button('Keyframe setzen / aktualisieren',self.set_keyframe)
         self.keyframe_remove_button=button('Keyframe löschen',self.remove_keyframe)
         self.keyframe_list.currentRowChanged.connect(self.keyframe_selected)
@@ -1270,12 +1309,22 @@ class Editor(QMainWindow):
         self.multicam_sync_button=button('Multi-Kamera synchronisieren',self.sync_multicam)
         self.multicam_switch_button=button('Als aktive Kamera verwenden',self.switch_multicam_angle)
         self.multicam_status=label('Keine Multi-Kamera-Gruppe.','muted'); self.multicam_status.setWordWrap(True)
-        form.setVerticalSpacing(4)
-        color_row=QHBoxLayout(); color_row.setContentsMargins(0,0,0,0); color_row.addWidget(self.text_color,1); color_row.addWidget(self.text_palette_button)
-        for name,widget in [('Spur',self.track_combo),('Position',self.position),('Quellstart',self.start),('Quellende',self.end),('Geschwindigkeit',self.speed),('Freeze-Frame',self.freeze_enabled),('Freeze-Dauer',self.freeze_duration),('Reverse',self.reverse_clip),('Einblenden',self.fade_in),('Ausblenden',self.fade_out),('Lautstärke',self.volume),('Text',self.text_value),('Textgröße',self.text_size),('Schrift',self.text_font)]:form.addRow(name,widget)
-        form.addRow('Textfarbe',color_row)
-        for name,widget in [('Text X',self.text_x),('Text Y',self.text_y)]:form.addRow(name,widget)
-        text_style_form=QFormLayout()
+        def configure_form(layout):
+            layout.setVerticalSpacing(5); layout.setHorizontalSpacing(9)
+            layout.setLabelAlignment(Qt.AlignLeft|Qt.AlignVCenter)
+            layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+            return layout
+
+        clip_form=configure_form(QFormLayout())
+        for name,widget in [('Spur',self.track_combo),('Position',self.position),('Quellstart',self.start),('Quellende',self.end)]: clip_form.addRow(name,widget)
+        timing_form=configure_form(QFormLayout())
+        for name,widget in [('Geschwindigkeit',self.speed),('Freeze-Frame',self.freeze_enabled),('Freeze-Dauer',self.freeze_duration),('Reverse',self.reverse_clip),('Einblenden',self.fade_in),('Ausblenden',self.fade_out),('Lautstärke',self.volume)]: timing_form.addRow(name,widget)
+        text_form=configure_form(QFormLayout())
+        color_row=QHBoxLayout(); color_row.setContentsMargins(0,0,0,0); color_row.setSpacing(5); color_row.addWidget(self.text_color,1); color_row.addWidget(self.text_palette_button)
+        for name,widget in [('Text',self.text_value),('Textgröße',self.text_size),('Schrift',self.text_font)]: text_form.addRow(name,widget)
+        text_form.addRow('Textfarbe',color_row)
+        for name,widget in [('Text X',self.text_x),('Text Y',self.text_y)]: text_form.addRow(name,widget)
+        text_style_form=configure_form(QFormLayout())
         style_row=QHBoxLayout(); style_row.setContentsMargins(0,0,0,0); style_row.addWidget(self.text_bold); style_row.addWidget(self.text_italic); style_row.addStretch(); text_style_form.addRow('Schnitt',style_row)
         text_style_form.addRow('Kontur',self.text_outline_width); text_style_form.addRow('Konturfarbe',self.text_outline_color)
         text_style_form.addRow('Schatten',self.text_shadow_size); text_style_form.addRow('Schattenfarbe',self.text_shadow_color)
@@ -1284,8 +1333,11 @@ class Editor(QMainWindow):
         preset_row=QHBoxLayout(); preset_row.setContentsMargins(0,0,0,0); preset_row.addWidget(self.text_style_preset,1); preset_row.addWidget(self.text_style_apply_button)
         text_style_form.addRow('Stilvorlage',preset_row)
         text_style_form.addRow('Animation',self.text_animation); text_style_form.addRow('Anim.-Dauer',self.text_animation_duration)
-        il.addWidget(label('TEXTSTIL UND ANIMATION','heading')); il.addLayout(text_style_form)
-        transform_form=QFormLayout()
+        clip_section=inspector_section('CLIP · POSITION',True); clip_section.addLayout(clip_form)
+        timing_section=inspector_section('TIMING · AUDIO-BASIS',True); timing_section.addLayout(timing_form)
+        text_section=inspector_section('TEXT · INHALT UND POSITION',True); text_section.addLayout(text_form)
+        text_style_section=inspector_section('TEXT · STIL UND ANIMATION',False); text_style_section.addLayout(text_style_form)
+        transform_form=configure_form(QFormLayout())
         transform_form.addRow('Zoom',self.transform_scale)
         transform_form.addRow('Bild X',self.transform_x); transform_form.addRow('Bild Y',self.transform_y)
         transform_form.addRow('Rotation',self.rotation)
@@ -1293,8 +1345,8 @@ class Editor(QMainWindow):
         transform_form.addRow('Crop rechts',self.crop_right); transform_form.addRow('Crop unten',self.crop_bottom)
         flip_row=QHBoxLayout(); flip_row.setContentsMargins(0,0,0,0); flip_row.addWidget(self.flip_horizontal); flip_row.addWidget(self.flip_vertical); flip_row.addStretch()
         transform_form.addRow('Spiegeln',flip_row)
-        il.addLayout(form)
-        audio_form=QFormLayout(); audio_form.addRow('Rauschunterdrückung',self.audio_noise_reduction)
+        transform_section=inspector_section('BILD · TRANSFORMATION',True); transform_section.addLayout(transform_form)
+        audio_form=configure_form(QFormLayout()); audio_form.addRow('Rauschunterdrückung',self.audio_noise_reduction)
         audio_form.addRow('EQ Tiefen',self.audio_eq_low); audio_form.addRow('EQ Mitten',self.audio_eq_mid); audio_form.addRow('EQ Höhen',self.audio_eq_high)
         audio_form.addRow('Kompressor',self.audio_compressor_enabled); audio_form.addRow('Kompressor-Schwelle',self.audio_compressor_threshold); audio_form.addRow('Kompressor-Ratio',self.audio_compressor_ratio)
         audio_form.addRow('Audio-Ducking',self.audio_ducking); audio_form.addRow('Sprachisolierung',self.audio_voice_isolation); audio_form.addRow('Kanäle',self.audio_channel_mode); audio_form.addRow('Panorama',self.audio_pan)
@@ -1306,29 +1358,28 @@ class Editor(QMainWindow):
         audio_form.addRow('Auto-Cut',auto_cut_row); audio_form.addRow('',self.auto_cut_status)
         multicam_row=QHBoxLayout(); multicam_row.setContentsMargins(0,0,0,0); multicam_row.addWidget(self.multicam_sync_button,1); multicam_row.addWidget(self.multicam_switch_button,1)
         audio_form.addRow('Multi-Kamera',multicam_row); audio_form.addRow('',self.multicam_status)
-        il.addWidget(label('AUDIO · MIX UND KANÄLE','heading')); il.addLayout(audio_form)
-        il.addWidget(label('BILDTRANSFORMATION','heading')); il.addLayout(transform_form)
-        color_form=QFormLayout(); color_form.addRow('Helligkeit',self.brightness); color_form.addRow('Kontrast',self.contrast); color_form.addRow('Sättigung',self.saturation); color_form.addRow('Filter',self.filter_preset)
+        audio_section=inspector_section('AUDIO · MIX UND SMART TOOLS',False); audio_section.addLayout(audio_form)
+        color_form=configure_form(QFormLayout()); color_form.addRow('Helligkeit',self.brightness); color_form.addRow('Kontrast',self.contrast); color_form.addRow('Sättigung',self.saturation); color_form.addRow('Filter',self.filter_preset)
         effect_preset_row=QHBoxLayout(); effect_preset_row.setContentsMargins(0,0,0,0); effect_preset_row.addWidget(self.effect_preset,1); effect_preset_row.addWidget(self.effect_preset_apply_button); color_form.addRow('Effekt-Preset',effect_preset_row)
         lut_row=QHBoxLayout(); lut_row.setContentsMargins(0,0,0,0); lut_row.addWidget(self.lut_path,1); lut_row.addWidget(self.lut_browse_button); color_form.addRow('LUT',lut_row)
-        il.addWidget(label('FARBKORREKTUR','heading')); il.addLayout(color_form)
-        grading_form=QFormLayout(); grading_form.addRow('Belichtung',self.color_exposure); grading_form.addRow('Temperatur',self.color_temperature); grading_form.addRow('Tönung',self.color_tint); grading_form.addRow('Vibrance',self.color_vibrance)
+        color_section=inspector_section('FARBE · KORREKTUR',True); color_section.addLayout(color_form)
+        grading_form=configure_form(QFormLayout()); grading_form.addRow('Belichtung',self.color_exposure); grading_form.addRow('Temperatur',self.color_temperature); grading_form.addRow('Tönung',self.color_tint); grading_form.addRow('Vibrance',self.color_vibrance)
         for title,wheel in (('Lift / Schatten','lift'),('Gamma / Mitten','gamma'),('Gain / Lichter','gain')):
             row=QHBoxLayout(); row.setContentsMargins(0,0,0,0)
             for channel,title_channel in (('r','R'),('g','G'),('b','B')):
                 spin=self.color_wheel_spins[f'color_{wheel}_{channel}']; spin.setToolTip(f'{title} · {title_channel}')
                 row.addWidget(spin,1)
             grading_form.addRow(title,row)
-        il.addWidget(label('COLOR GRADING · 3-WEGE-FARBWHEELS','heading')); il.addLayout(grading_form)
-        effects_form=QFormLayout(); effects_form.addRow('Deckkraft',self.opacity); effects_form.addRow('Unschärfe',self.blur); effects_form.addRow('Schärfe',self.sharpen); effects_form.addRow('Stabilisierung',self.stabilization); effects_form.addRow('Greenscreen',self.chroma_key_enabled); effects_form.addRow('Key-Farbe',self.chroma_key_color); effects_form.addRow('Ähnlichkeit',self.chroma_key_similarity); effects_form.addRow('Weichheit',self.chroma_key_blend)
-        il.addWidget(label('VIDEO-EFFEKTE','heading')); il.addLayout(effects_form)
-        mask_form=QFormLayout(); mask_form.addRow('Maskentyp',self.mask_type); mask_form.addRow('Maske X',self.mask_x); mask_form.addRow('Maske Y',self.mask_y); mask_form.addRow('Maskenbreite',self.mask_width); mask_form.addRow('Maskenhöhe',self.mask_height); mask_form.addRow('Maskenweichheit',self.mask_feather)
+        grading_section=inspector_section('FARBE · 3-WEGE-GRADING',False); grading_section.addLayout(grading_form)
+        effects_form=configure_form(QFormLayout()); effects_form.addRow('Deckkraft',self.opacity); effects_form.addRow('Unschärfe',self.blur); effects_form.addRow('Schärfe',self.sharpen); effects_form.addRow('Stabilisierung',self.stabilization); effects_form.addRow('Greenscreen',self.chroma_key_enabled); effects_form.addRow('Key-Farbe',self.chroma_key_color); effects_form.addRow('Ähnlichkeit',self.chroma_key_similarity); effects_form.addRow('Weichheit',self.chroma_key_blend)
+        effects_section=inspector_section('EFFEKTE · VIDEO',True); effects_section.addLayout(effects_form)
+        mask_form=configure_form(QFormLayout()); mask_form.addRow('Maskentyp',self.mask_type); mask_form.addRow('Maske X',self.mask_x); mask_form.addRow('Maske Y',self.mask_y); mask_form.addRow('Maskenbreite',self.mask_width); mask_form.addRow('Maskenhöhe',self.mask_height); mask_form.addRow('Maskenweichheit',self.mask_feather)
         mask_points_row=QHBoxLayout(); mask_points_row.setContentsMargins(0,0,0,0); mask_points_row.addWidget(self.mask_points,1); mask_points_row.addWidget(self.mask_points_apply); mask_form.addRow('Bezier-Punkte',mask_points_row)
-        il.addWidget(label('MASKEN','heading')); il.addLayout(mask_form)
-        mask_path_form=QFormLayout(); mask_path_form.addRow('Rotoskopie-Zeit',self.mask_path_time)
+        mask_section=inspector_section('MASKEN · ROTOSKOPIE',False); mask_section.addLayout(mask_form)
+        mask_path_form=configure_form(QFormLayout()); mask_path_form.addRow('Rotoskopie-Zeit',self.mask_path_time)
         mask_path_buttons=QHBoxLayout(); mask_path_buttons.setContentsMargins(0,0,0,0); mask_path_buttons.addWidget(self.mask_path_set_button,1); mask_path_buttons.addWidget(self.mask_path_remove_button,1)
-        il.addLayout(mask_path_form); il.addLayout(mask_path_buttons); il.addWidget(self.mask_path_list)
-        ai_form=QFormLayout()
+        mask_section.addLayout(mask_path_form); mask_section.addLayout(mask_path_buttons); mask_section.addWidget(self.mask_path_list)
+        ai_form=configure_form(QFormLayout())
         background_buttons=QHBoxLayout(); background_buttons.setContentsMargins(0,0,0,0); background_buttons.addWidget(self.background_remove_button,1); background_buttons.addWidget(self.background_clear_button,1)
         tracking_buttons=QHBoxLayout(); tracking_buttons.setContentsMargins(0,0,0,0); tracking_buttons.addWidget(self.track_motion_button,1); tracking_buttons.addWidget(self.clear_tracking_button,1)
         tracking_buttons.addWidget(self.mask_track_button,1)
@@ -1337,25 +1388,27 @@ class Editor(QMainWindow):
         ai_form.addRow('Tracking',tracking_buttons); ai_form.addRow('',self.tracking_status); ai_form.addRow('Objekt entfernen',self.object_removal_enabled)
         ai_form.addRow('Auto-Reframe',self.auto_reframe_format); ai_form.addRow('',self.auto_reframe_enabled)
         ai_form.addRow('',auto_reframe_buttons); ai_form.addRow('',self.auto_reframe_status)
-        il.addWidget(label('KI-WERKZEUGE · LOKAL','heading')); il.addLayout(ai_form)
-        transition_form=QFormLayout(); transition_form.addRow('Übergang',self.transition_type); transition_form.addRow('Dauer',self.transition_duration)
-        il.addWidget(label('ÜBERGANG','heading')); il.addLayout(transition_form)
-        il.addWidget(label('KEYFRAMES · TRANSFORM + VIDEOEFFEKTE','heading'))
-        keyframe_form=QFormLayout(); keyframe_form.addRow('Zeit im Clip',self.keyframe_time); keyframe_form.addRow('Kurve',self.keyframe_curve); il.addLayout(keyframe_form)
-        keyframe_buttons=QHBoxLayout(); keyframe_buttons.setContentsMargins(0,0,0,0); keyframe_buttons.addWidget(self.keyframe_set_button,1); keyframe_buttons.addWidget(self.keyframe_remove_button,1); il.addLayout(keyframe_buttons)
-        il.addWidget(self.keyframe_list)
-        graph_form=QFormLayout(); graph_form.addRow('Kurve anzeigen',self.keyframe_graph_property); il.addLayout(graph_form); il.addWidget(self.keyframe_graph)
-        il.addWidget(label('LAUTSTÄRKE-KURVE','heading'))
-        volume_keyframe_form=QFormLayout(); volume_keyframe_form.addRow('Zeit im Clip',self.volume_keyframe_time); volume_keyframe_form.addRow('Kurve',self.volume_keyframe_curve); il.addLayout(volume_keyframe_form)
-        volume_keyframe_buttons=QHBoxLayout(); volume_keyframe_buttons.setContentsMargins(0,0,0,0); volume_keyframe_buttons.addWidget(self.volume_keyframe_set_button,1); volume_keyframe_buttons.addWidget(self.volume_keyframe_remove_button,1); il.addLayout(volume_keyframe_buttons)
-        il.addWidget(self.volume_keyframe_list)
-        il.addWidget(label('SPEED-RAMPING · VIDEO','heading'))
-        speed_ramp_form=QFormLayout(); speed_ramp_form.addRow('Quellzeit',self.speed_ramp_time); speed_ramp_form.addRow('Geschwindigkeit',self.speed_ramp_value); il.addLayout(speed_ramp_form)
-        speed_ramp_buttons=QHBoxLayout(); speed_ramp_buttons.setContentsMargins(0,0,0,0); speed_ramp_buttons.addWidget(self.speed_ramp_set_button,1); speed_ramp_buttons.addWidget(self.speed_ramp_remove_button,1); il.addLayout(speed_ramp_buttons)
-        il.addWidget(self.speed_ramp_list)
-        il.addWidget(button('Bild zurücksetzen',self.reset_transform)); il.addWidget(button('Übernehmen',self.apply_properties,True)); il.addWidget(button('Audio aus Video extrahieren',self.extract_audio))
-        hint=label('Kurztipps\n• Rechtsklick auf Clip, Spur oder freie Timeline öffnet Aktionen.\n• Clipmitte ziehen = verschieben · Ränder ziehen = kürzen.\n• Shift = ohne Einrasten · Strg+Klick = Mehrfachauswahl.\n• Leertaste = Play/Pause · Entf = Auswahl löschen.','muted'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
-        top.addWidget(inspector); top.setSizes([78,300,760,330]); vertical.addWidget(top)
+        ai_section=inspector_section('KI-WERKZEUGE · LOKAL',False); ai_section.addLayout(ai_form)
+        transition_form=configure_form(QFormLayout()); transition_form.addRow('Übergang',self.transition_type); transition_form.addRow('Dauer',self.transition_duration)
+        transition_section=inspector_section('ÜBERGÄNGE',False); transition_section.addLayout(transition_form)
+        keyframe_section=inspector_section('ANIMATION · KEYFRAMES UND SPEED-RAMPING',False)
+        keyframe_form=configure_form(QFormLayout()); keyframe_form.addRow('Zeit im Clip',self.keyframe_time); keyframe_form.addRow('Kurve',self.keyframe_curve); keyframe_section.addLayout(keyframe_form)
+        keyframe_buttons=QHBoxLayout(); keyframe_buttons.setContentsMargins(0,0,0,0); keyframe_buttons.addWidget(self.keyframe_set_button,1); keyframe_buttons.addWidget(self.keyframe_remove_button,1)
+        keyframe_section.addLayout(keyframe_buttons)
+        keyframe_section.addWidget(self.keyframe_list)
+        graph_form=configure_form(QFormLayout()); graph_form.addRow('Kurve anzeigen',self.keyframe_graph_property); keyframe_section.addLayout(graph_form); keyframe_section.addWidget(self.keyframe_graph)
+        volume_keyframe_form=configure_form(QFormLayout()); volume_keyframe_form.addRow('Zeit im Clip',self.volume_keyframe_time); volume_keyframe_form.addRow('Kurve',self.volume_keyframe_curve); keyframe_section.addLayout(volume_keyframe_form)
+        volume_keyframe_buttons=QHBoxLayout(); volume_keyframe_buttons.setContentsMargins(0,0,0,0); volume_keyframe_buttons.addWidget(self.volume_keyframe_set_button,1); volume_keyframe_buttons.addWidget(self.volume_keyframe_remove_button,1)
+        keyframe_section.addLayout(volume_keyframe_buttons)
+        keyframe_section.addWidget(self.volume_keyframe_list)
+        speed_ramp_form=configure_form(QFormLayout()); speed_ramp_form.addRow('Quellzeit',self.speed_ramp_time); speed_ramp_form.addRow('Geschwindigkeit',self.speed_ramp_value); keyframe_section.addLayout(speed_ramp_form)
+        speed_ramp_buttons=QHBoxLayout(); speed_ramp_buttons.setContentsMargins(0,0,0,0); speed_ramp_buttons.addWidget(self.speed_ramp_set_button,1); speed_ramp_buttons.addWidget(self.speed_ramp_remove_button,1)
+        keyframe_section.addLayout(speed_ramp_buttons)
+        keyframe_section.addWidget(self.speed_ramp_list)
+        actions_section=inspector_section('AKTIONEN',True)
+        actions_section.addWidget(button('Bild zurücksetzen',self.reset_transform)); actions_section.addWidget(button('Übernehmen',self.apply_properties,True)); actions_section.addWidget(button('Audio aus Video extrahieren',self.extract_audio))
+        hint=label('Rechtsklick = Aktionen · Mitte ziehen = verschieben · Ränder = kürzen\nShift = ohne Einrasten · Strg-Klick = Mehrfachauswahl · Leertaste = Play/Pause','subtle'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
+        top.addWidget(inspector); top.setSizes([310,760,360]); top.setStretchFactor(0,0); top.setStretchFactor(1,1); top.setStretchFactor(2,0); vertical.addWidget(top)
         bottom,bl=panel(); bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
         bar=QHBoxLayout(); bar.setContentsMargins(10,5,10,5); bar.setSpacing(6)
         bar.addWidget(label('TIMELINE','heading')); bar.addSpacing(2); bar.addWidget(timeline_separator())
@@ -1485,10 +1538,21 @@ class Editor(QMainWindow):
         self.filter_preset.activated.connect(lambda *_: self.apply_properties()); self.chroma_key_enabled.clicked.connect(self.apply_properties)
         self.mask_type.activated.connect(lambda *_: self.apply_properties())
         self.transition_type.activated.connect(lambda *_: self.apply_properties()); self.transition_duration.editingFinished.connect(self.apply_properties)
-        vertical.addWidget(bottom); vertical.setStretchFactor(0,4); vertical.setStretchFactor(1,3); vertical.setChildrenCollapsible(False); vertical.setSizes([480,420]); outer.addWidget(vertical,1); self.setCentralWidget(root)
+        vertical.addWidget(bottom); vertical.setStretchFactor(0,5); vertical.setStretchFactor(1,3); vertical.setChildrenCollapsible(False); vertical.setSizes([560,340]); outer.addWidget(vertical,1); self.setCentralWidget(root)
         self.update_source_monitor_controls()
 
     def error(self,message): QMessageBox.warning(self,'Framecut',str(message))
+
+    def update_project_identity(self):
+        """Keep the compact header in sync with the active project."""
+        if not hasattr(self,'project_title_label'):
+            return
+        name=Path(self.project_path).stem if self.project_path else 'Neues Projekt'
+        self.project_title_label.setText(name)
+        self.project_meta_label.setText('Gespeichert' if self.project_path else 'Lokales Projekt')
+        self.autosave_pill.setText('● Ungespeichert' if self.dirty else '● Autosave')
+        self.autosave_pill.setProperty('dirty',bool(self.dirty))
+        self.autosave_pill.style().unpolish(self.autosave_pill); self.autosave_pill.style().polish(self.autosave_pill); self.autosave_pill.update()
 
     def update_color_button(self,color):
         self.text_palette_button.setStyleSheet(f'QPushButton {{ background: {color}; color: #101216; border: 1px solid #e9edf2; }} QPushButton:hover {{ background: {color}; }}')
@@ -2683,6 +2747,7 @@ class Editor(QMainWindow):
             self.preview_status.setText('Vorschau wird nach kurzer Pause im Hintergrund berechnet …')
         self.setWindowTitle(f'Framecut {APP_VERSION} · '+(Path(self.project_path).stem if self.project_path else 'Neues Projekt')+' *')
         self.autosave_label.setText('Änderungen · Autosave folgt …'); self.autosave_timer.start()
+        self.update_project_identity()
         self.update_source_monitor_controls()
         if hasattr(self,'live_preview_box') and self.live_preview_box.isChecked() and self.clips:
             self.live_preview_timer.start()
@@ -5174,9 +5239,9 @@ class Editor(QMainWindow):
             self.autosave_timer.start();return
         try:
             save_project(self.recovery_path,self.clips,self.preset.currentText(),self.tracks,self.assets,self.project_path,self.track_states,self.track_names,self.markers,self.master_mixer)
-            self.autosave_label.setText('Autosave ✓');self.autosave_label.setToolTip(str(self.recovery_path))
+            self.autosave_label.setText('Autosave ✓');self.autosave_label.setToolTip(str(self.recovery_path)); self.update_project_identity()
         except Exception as exc:
-            self.autosave_label.setText('Autosave fehlgeschlagen');self.statusBar().showMessage(str(exc))
+            self.autosave_label.setText('Autosave fehlgeschlagen');self.statusBar().showMessage(str(exc)); self.update_project_identity()
 
     def clear_recovery(self):
         self.autosave_timer.stop()
@@ -5213,7 +5278,7 @@ class Editor(QMainWindow):
         try:
             save_project(path,self.clips,self.preset.currentText(),self.tracks,self.assets,None,self.track_states,self.track_names,self.markers,self.master_mixer)
             self.project_path=str(Path(path).resolve());self.dirty=False;self.clear_recovery()
-            self.setWindowTitle(f'Framecut {APP_VERSION} · '+Path(path).stem);self.autosave_label.setText('Projekt gespeichert ✓');return True
+            self.setWindowTitle(f'Framecut {APP_VERSION} · '+Path(path).stem);self.autosave_label.setText('Projekt gespeichert ✓');self.update_project_identity();return True
         except Exception as exc:self.error(exc);return False
 
     def can_discard(self):
@@ -5236,7 +5301,7 @@ class Editor(QMainWindow):
         self.mode='timeline';self.dirty=False;self.prepare_visuals(self.assets);self.refresh_media();self.refresh()
         self.placeholder.setText('▶ Timeline berechnet die Mehrspur-Vorschau.\n„Clip ansehen“ zeigt sofort die Quelle.')
         self.preview_status.setText('Timeline geladen · Vorschau noch nicht berechnet')
-        self.setWindowTitle(f'Framecut {APP_VERSION} · '+(Path(path).stem if path else 'Neues Projekt'))
+        self.setWindowTitle(f'Framecut {APP_VERSION} · '+(Path(path).stem if path else 'Neues Projekt')); self.update_project_identity()
 
     def open_project_path(self,path):
         if self.worker or not self.can_discard():return
@@ -5266,7 +5331,7 @@ class Editor(QMainWindow):
     def new_project(self):
         if self.worker or not self.can_discard():return
         self.clear_recovery();self.apply_project({'clips':[],'assets':[],'tracks':[2,1,-1,-2],'track_states':{},'track_names':{},'markers':[],'mixer':normalize_master_mixer(None),'preset':next(iter(PRESETS))},None)
-        self.suggested_name='Mein-Film.framecut';self.autosave_label.setText('Autosave bereit')
+        self.suggested_name='Mein-Film.framecut';self.autosave_label.setText('Autosave bereit'); self.update_project_identity()
 
     def closeEvent(self,event):
         if self.worker:
@@ -5305,7 +5370,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.20.1-Fenster.');return 1
+                QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.21.0-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

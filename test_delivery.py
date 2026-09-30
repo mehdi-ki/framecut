@@ -1,14 +1,34 @@
 """Tests for Linux packaging metadata and the opt-in update client."""
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from update_system import download_verified, fetch_manifest, is_newer, select_artifact, sha256_file, version_key
+from update_system import (DEFAULT_UPDATE_MANIFEST_URL, UPDATE_DISABLE_ENV,
+                           UPDATE_MANIFEST_ENV, configured_manifest_url,
+                           download_verified, fetch_manifest, is_newer,
+                           select_artifact, sha256_file, update_checks_disabled,
+                           version_key)
 
 
 class DeliveryTest(unittest.TestCase):
+    def test_default_update_manifest_and_disable_switch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clean_env={
+                "XDG_CONFIG_HOME": directory,
+                UPDATE_MANIFEST_ENV: "",
+                UPDATE_DISABLE_ENV: "",
+            }
+            with patch.dict(os.environ, clean_env, clear=False):
+                self.assertEqual(configured_manifest_url(), DEFAULT_UPDATE_MANIFEST_URL)
+                self.assertFalse(update_checks_disabled())
+            with patch.dict(os.environ, {**clean_env, UPDATE_DISABLE_ENV: "1"}, clear=False):
+                self.assertTrue(update_checks_disabled())
+                self.assertEqual(configured_manifest_url(), "")
+
     def test_versions_are_numeric_and_padded(self):
         self.assertEqual(version_key('3.10.0'), (3, 10, 0))
         self.assertTrue(is_newer('3.10', '3.9'))

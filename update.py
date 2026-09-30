@@ -18,14 +18,14 @@ from update_system import (
 )
 
 try:
-    DEFAULT_VERSION = Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip() or "3.6"
+    DEFAULT_VERSION = Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip() or "3.7"
 except OSError:
-    DEFAULT_VERSION = "3.6"
+    DEFAULT_VERSION = "3.7"
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Framecut-Updates prüfen und verifiziert herunterladen")
-    parser.add_argument("--manifest", help="Manifest-URL oder lokale JSON-Datei; sonst FRAMECUT_UPDATE_MANIFEST_URL")
+    parser.add_argument("--manifest", help="Manifest-URL oder lokale JSON-Datei; sonst Standard-GitHub-Manifest bzw. FRAMECUT_UPDATE_MANIFEST_URL")
     parser.add_argument("--current", default=DEFAULT_VERSION, help=f"Aktuelle Framecut-Version (Standard: {DEFAULT_VERSION})")
     parser.add_argument("--kind", choices=("appimage", "deb"), action="append", help="Bevorzugtes Paketformat; mehrfach möglich")
     parser.add_argument("--target", help="Zielpfad für den Download")

@@ -1,4 +1,4 @@
-"""Framecut 3.6 — native Linux multitrack editor."""
+"""Framecut 3.7 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -27,12 +27,13 @@ from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_
 from timeline import Timeline,MediaList
 from style import STYLE
 from update_system import (configured_manifest_url,download_verified,fetch_manifest,
-                           install_downloaded,preferred_kinds,select_artifact,update_cache_directory)
+                           install_downloaded,preferred_kinds,select_artifact,update_cache_directory,
+                           update_checks_disabled)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.6'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.7'
 except OSError:
-    APP_VERSION = '3.6'
+    APP_VERSION = '3.7'
 
 
 def label(text,name=None):
@@ -2765,7 +2766,10 @@ class Editor(QMainWindow):
         manifest_url=configured_manifest_url()
         if not manifest_url:
             if not silent:
-                QMessageBox.information(self,'Updates','Für automatische Updates ist noch keine Manifest-URL konfiguriert.\n\nSetze FRAMECUT_UPDATE_MANIFEST_URL auf deine veröffentlichte updates.json.')
+                if update_checks_disabled():
+                    QMessageBox.information(self,'Updates','Die Update-Prüfung ist deaktiviert.\n\nEntferne FRAMECUT_DISABLE_UPDATE_CHECK oder setze die Variable auf 0, um sie wieder einzuschalten.')
+                else:
+                    QMessageBox.information(self,'Updates','Es ist keine Update-Quelle verfügbar.\n\nSetze FRAMECUT_UPDATE_MANIFEST_URL auf deine veröffentlichte updates.json.')
             return
         self.update_button.setEnabled(False); self.update_button.setText('Updates werden geprüft …')
         self.update_job=UpdateCheckJob(manifest_url,APP_VERSION)
@@ -2958,7 +2962,7 @@ def main():
         QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
     state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-        QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.6-Fenster.');return 1
+        QMessageBox.warning(None,'Framecut läuft bereits','Bitte nutze das bereits geöffnete Framecut-3.7-Fenster.');return 1
     window=Editor(state);window.show()
     project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
     if project_argument:

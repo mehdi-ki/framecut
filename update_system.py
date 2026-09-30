@@ -1,8 +1,10 @@
 """Small, dependency-free update client used by Framecut and its CLI.
 
-The application never contacts a server unless FRAMECUT_UPDATE_MANIFEST_URL is
-set. A manifest names the release artifacts and their SHA-256 checksums; every
-download is written atomically only after the checksum matches.
+Framecut checks the stable GitHub release manifest by default. Users can
+override that endpoint with ``FRAMECUT_UPDATE_MANIFEST_URL`` or a config file,
+or disable checks with ``FRAMECUT_DISABLE_UPDATE_CHECK``. A manifest names the
+release artifacts and their SHA-256 checksums; every download is written
+atomically only after the checksum matches.
 """
 from __future__ import annotations
 
@@ -20,7 +22,9 @@ from pathlib import Path
 
 
 UPDATE_MANIFEST_ENV = "FRAMECUT_UPDATE_MANIFEST_URL"
-USER_AGENT = "Framecut-update/3.6"
+UPDATE_DISABLE_ENV = "FRAMECUT_DISABLE_UPDATE_CHECK"
+DEFAULT_UPDATE_MANIFEST_URL = "https://github.com/mehdi-ki/framecut/releases/latest/download/updates.json"
+USER_AGENT = "Framecut-update/3.7"
 _VERSION_PARTS = re.compile(r"\d+")
 
 
@@ -37,16 +41,27 @@ def is_newer(candidate: str, current: str) -> bool:
     return left + (0,) * (width - len(left)) > right + (0,) * (width - len(right))
 
 
+def update_checks_disabled() -> bool:
+    """Whether the user explicitly disabled background update checks."""
+    return os.environ.get(UPDATE_DISABLE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def configured_manifest_url() -> str:
-    """Read the opt-in update endpoint from env or the user config file."""
+    """Read the update endpoint from env, config, or the stable default."""
+    if update_checks_disabled():
+        return ""
     value = os.environ.get(UPDATE_MANIFEST_ENV, "").strip()
     if value:
         return value
     config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "framecut" / "update-manifest.url"
     try:
-        return config.read_text(encoding="utf-8").strip() if config.is_file() else ""
+        if config.is_file():
+            configured = config.read_text(encoding="utf-8").strip()
+            if configured:
+                return configured
     except OSError:
-        return ""
+        pass
+    return DEFAULT_UPDATE_MANIFEST_URL
 
 
 def _read_manifest_source(source: str, timeout: float) -> dict:

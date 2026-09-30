@@ -36,7 +36,7 @@ jobs:
       - name: Linux-Abhängigkeiten installieren
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libxcb-cursor0 python3-venv zip dpkg
+          sudo apt-get install -y ffmpeg libxcb-cursor0 libegl1 python3-venv zip dpkg
 
       - name: Python-Umgebung vorbereiten
         run: |

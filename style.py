@@ -165,6 +165,50 @@ QPushButton#iconButton:hover {
     border-color: #37424f;
 }
 
+QToolButton#timelineToolButton,
+QToolButton#timelineToolToggle {
+    color: #aeb9c8;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 4px;
+    font-size: 15px;
+    font-weight: 700;
+}
+
+QToolButton#timelineToolButton:hover,
+QToolButton#timelineToolToggle:hover {
+    color: #effffb;
+    background: #242a32;
+    border-color: #37424f;
+}
+
+QToolButton#timelineToolButton:pressed,
+QToolButton#timelineToolToggle:pressed {
+    background: #171b21;
+}
+
+QToolButton#timelineToolToggle:checked {
+    color: #071c19;
+    background: #65e3d0;
+    border-color: #65e3d0;
+}
+
+QToolButton#timelineToolButton:disabled,
+QToolButton#timelineToolToggle:disabled {
+    color: #5f6875;
+    background: transparent;
+}
+
+QLabel#timelineIconLabel {
+    color: #9aa7b7;
+    background: transparent;
+    font-size: 15px;
+    font-weight: 800;
+    padding-left: 3px;
+    padding-right: 1px;
+}
+
 QPushButton#modeTab {
     color: #8792a1;
     background: transparent;

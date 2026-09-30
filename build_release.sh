@@ -44,7 +44,7 @@ if [[ -n "${FRAMECUT_RELEASE_BASE_URL:-}" ]]; then
     appimage_file="$APPIMAGE_OUTPUT"
     {
         printf '{\n  "product": "Framecut",\n  "version": "%s",\n' "$APP_VERSION"
-        printf '  "release_notes": ["Framecut 3.8: Cinema-Vollbildvorschau, Befehls-Palette mit Strg+K sowie Linux-Auslieferung mit verifiziertem Update-Client."],\n'
+        printf '  "release_notes": ["Framecut 3.9: repariertes Timeline-Kontextmenü und kompakte Symbolleiste für die Timeline."],\n'
         printf '  "artifacts": {\n'
         if [[ -f "$appimage_file" ]]; then
             printf '    "appimage": {"filename": "%s", "url": "%s/%s", "sha256": "%s"},\n' \

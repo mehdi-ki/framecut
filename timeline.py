@@ -90,11 +90,9 @@ class Timeline(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         # QScrollArea/viewport combinations can swallow the default
-        # QWidget context-menu event on Linux. Use Qt's explicit signal so a
-        # right click always reaches the editor, regardless of the active
-        # scroll-bar or style implementation.
-        self.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._request_context_menu)
+        # QWidget context-menu event on Linux. Handle the right button
+        # directly in mousePressEvent so the editor always receives it.
+        self.setContextMenuPolicy(Qt.NoContextMenu)
         self.setAcceptDrops(True)
         self.setToolTip('M = Spur stumm · L = Spur sperren · Clipmitte ziehen: verschieben · Ränder ziehen: kürzen · leere Fläche ziehen: Mehrfachauswahl · Strg+Linksklick: Auswahl erweitern · Strg+Linksklick ziehen: Timeline verschieben · Umschalt: ohne Einrasten · Strg+Mausrad: Zoom · weißen Abspielkopf oben ziehen')
         self.refresh([], self.tracks, None)
@@ -398,6 +396,11 @@ class Timeline(QWidget):
         return any(self.track_locked(clip.track) for clip in self.clips if clip.uid in self.selection)
 
     def mousePressEvent(self,event):
+        if event.button()==Qt.RightButton:
+            point=event.position().toPoint()
+            self._request_context_menu(point,self.mapToGlobal(point))
+            event.accept()
+            return
         if event.button()!=Qt.LeftButton:
             return
         self.setFocus()

@@ -232,7 +232,7 @@ class GuiTest(unittest.TestCase):
     def test_timeline_context_menu_and_symbol_toolbar(self):
         with tempfile.TemporaryDirectory() as state:
             w=Editor(state,recovery=False);w.show();QTest.qWait(100)
-            self.assertEqual(w.timeline.contextMenuPolicy(),Qt.CustomContextMenu)
+            self.assertEqual(w.timeline.contextMenuPolicy(),Qt.NoContextMenu)
             self.assertTrue(w.snap_box.isCheckable())
             self.assertEqual(w.snap_box.toolTip(),'Einrasten ein/aus')
             self.assertEqual(w.subtitle_export_button.toolTip(),'Untertitel exportieren')

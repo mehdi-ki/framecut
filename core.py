@@ -1196,7 +1196,9 @@ def master_audio_filters(settings):
         filters.append(f"pan=stereo|c0={left_gain:.6f}*c0|c1={right_gain:.6f}*c1")
     if settings['loudness_normalization']:
         filters.append(f"loudnorm=I={settings['loudness_target']:.2f}:TP=-1.5:LRA=11:linear=true")
-    filters.append("alimiter=limit=0.95:level=0:latency=1")
+    # Keep the limiter compatible with the FFmpeg version shipped by Ubuntu.
+    # The optional `latency` parameter is unavailable in older FFmpeg builds.
+    filters.append("alimiter=limit=0.95:level=0")
     return filters
 
 

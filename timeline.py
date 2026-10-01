@@ -1,5 +1,6 @@
 """Painted multitrack timeline with transactional drag/trim and snapping."""
 from dataclasses import replace
+import math
 from pathlib import Path
 from time import monotonic
 from PySide6.QtCore import Qt, Signal, QRectF, QMimeData, QPointF
@@ -213,7 +214,7 @@ class Timeline(QWidget):
         return sorted({round(max(0.0, value), 6) for value in values})
 
     def _thumbnail(self, path, height):
-        image = self.thumbnails.get(path)
+        image = self._visual_image(self.thumbnails, path)
         if image is None or image.isNull():
             return None
         key = (path, int(height))
@@ -230,7 +231,7 @@ class Timeline(QWidget):
         return scaled
 
     def _waveform(self, clip, width, height):
-        image = self.waveforms.get(clip.path)
+        image = self._visual_image(self.waveforms, clip.path)
         if image is None or image.isNull():
             return None
         key = (clip.uid, round(clip.start, 6), round(clip.end, 6), int(width), int(height))
@@ -238,8 +239,9 @@ class Timeline(QWidget):
         if cached is not None:
             return cached
         source_width = image.width()
-        left = max(0, min(source_width-1, int(source_width*clip.start/max(clip.duration, 1e-9))))
-        right = max(left+1, min(source_width, int(source_width*clip.end/max(clip.duration, 1e-9))))
+        source_duration=max(float(getattr(clip,'duration',0.0)),1e-9)
+        left = max(0, min(source_width-1, int(source_width*max(0.0,clip.start)/source_duration)))
+        right = max(left+1, min(source_width, int(source_width*max(0.0,clip.end)/source_duration)))
         cropped = image.copy(left, 0, right-left, image.height())
         scaled = cropped.scaled(max(1, int(width)), max(8, int(height)),
                                 Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
@@ -248,6 +250,37 @@ class Timeline(QWidget):
             self._scaled_waveforms.clear()
             self._scaled_waveforms[key] = scaled
         return scaled
+
+    @staticmethod
+    def _visual_image(collection, path):
+        """Find a poster or waveform despite legacy path formatting."""
+        image=collection.get(path)
+        if image is not None:
+            return image
+        if not path:
+            return None
+        try:
+            canonical=str(Path(path).expanduser().resolve())
+        except (OSError, RuntimeError, TypeError):
+            canonical=str(path)
+        return collection.get(canonical)
+
+    def _draw_waveform_placeholder(self, painter, clip, rect, ghost=False):
+        """Keep audio clips visibly graphical while the real waveform loads."""
+        painter.save()
+        painter.setClipRect(rect.adjusted(3,3,-3,-3))
+        center=rect.center().y()
+        bars=max(10,min(96,int(rect.width()/6)))
+        seed=sum(ord(value) for value in str(getattr(clip,'uid','audio')))
+        color=QColor(197,255,219,80 if ghost else 150)
+        painter.setPen(QPen(color,1.2))
+        for index in range(bars):
+            phase=(seed % 37)/11.0 + index*.73
+            envelope=.35 + .65*abs(math.sin(index/max(1,bars-1)*math.pi))
+            height=max(3.0,(rect.height()*.30)*envelope*(.55+.45*abs(math.sin(phase))))
+            x=rect.left()+4+(rect.width()-8)*index/max(1,bars-1)
+            painter.drawLine(QPointF(x,center-height),QPointF(x,center+height))
+        painter.restore()
 
     def rect_for(self, clip):
         row = self.tracks.index(clip.track)
@@ -410,7 +443,7 @@ class Timeline(QWidget):
         if c.kind == 'text':
             p.setPen(QColor('#f5e8ff')); p.setFont(self.ui_font(9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),'T  '+c.text[:24])
             p.setPen(QColor('#d8b9ef')); p.setFont(self.ui_font(8)); p.drawText(int(r.left()+10),int(r.top()+43),f'{c.length:.2f} s  ·  Text')
-        if c.kind == 'video' and c.path in self.thumbnails and r.width() > 34:
+        if c.kind == 'video' and r.width() > 34:
             image = self._thumbnail(c.path, r.height()-4)
             if image is not None:
                 p.save(); p.setClipRect(r.adjusted(2,2,-2,-2))
@@ -427,13 +460,15 @@ class Timeline(QWidget):
             p.setPen(QColor('#f8d27a')); p.setFont(self.ui_font(9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),'FX  Adjustment-Layer')
             p.setPen(QColor('#d6b86a')); p.setFont(self.ui_font(8)); p.drawText(int(r.left()+10),int(r.top()+43),f'{c.length:.2f} s  ·  Effekte')
             p.restore()
-        if c.kind == 'audio' and c.path in self.waveforms and r.width() > 24:
+        if c.kind == 'audio' and r.width() > 24:
             image = self._waveform(c, r.width()-6, r.height()-6)
             if image is not None:
                 p.save(); p.setClipRect(r.adjusted(3,3,-3,-3))
                 p.setOpacity(.72 if not ghost else .35)
                 p.drawImage(int(r.left()+3), int(r.top()+3), image)
                 p.restore()
+            else:
+                self._draw_waveform_placeholder(p,c,r,ghost)
         p.save(); p.setClipRect(r.adjusted(8,2,-7,-2))
         if c.kind != 'text' and c.source_type != 'adjustment':
             title = c.display_name or c.compound_name or Path(c.path).name

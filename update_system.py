@@ -24,7 +24,7 @@ from pathlib import Path
 UPDATE_MANIFEST_ENV = "FRAMECUT_UPDATE_MANIFEST_URL"
 UPDATE_DISABLE_ENV = "FRAMECUT_DISABLE_UPDATE_CHECK"
 DEFAULT_UPDATE_MANIFEST_URL = "https://github.com/mehdi-ki/framecut/releases/latest/download/updates.json"
-USER_AGENT = "Framecut-update/3.24.0"
+USER_AGENT = "Framecut-update/3.25.0"
 _VERSION_PARTS = re.compile(r"\d+")
 
 

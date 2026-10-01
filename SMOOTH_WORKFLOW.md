@@ -1,6 +1,6 @@
-# Framecut 3.24.0 — Smooth Workflow
+# Framecut 3.25.0 — Smooth Workflow
 
-Dieses Update verbessert den vorhandenen Schnittworkflow in 30 Punkten.
+Dieses Update verbessert den vorhandenen Schnittworkflow in 32 Punkten.
 Projekte bleiben kompatibel; neue Clip-Metadaten werden mit neutralen Vorgaben geladen.
 
 | Nr. | Verbesserung | Bedienung und Verhalten |
@@ -8,6 +8,8 @@ Projekte bleiben kompatibel; neue Clip-Metadaten werden mit neutralen Vorgaben g
 | 1 | Autosave und Wiederherstellung | Zusätzlich zur verzögerten Sicherung prüft ein 30-Sekunden-Takt offene Änderungen. Die letzte lesbare Sicherung bleibt als Rückfall erhalten. |
 | 2 | Vorschau-Leistung | Einfache, zusammenhängende Videospuren werden direkt aus der Quelle geschnitten und abgespielt. Große Quellen erhalten automatisch 360p-Proxys im Hintergrund; komplexe Timelines nutzen den gerenderten Mehrspurpfad. Export nutzt Originale. |
 | 3 | Hintergrundaufgaben | Import, Proxy-Erstellung und Export zeigen abbrechbare Fortschrittszeilen. Thumbnails und Wellenformen entstehen im Hintergrund. Export verwendet einen unveränderlichen Projektstand. Exklusive Analysen sperren Bearbeitungen, lassen Navigation zu. |
+| 31 | Nicht blockierende Mehrspur-Vorschau | Nach Schnitten bleibt der letzte gültige Mix abspielbar, während die neue Komposition und fehlende Proxys unabhängig im Hintergrund entstehen. Audio-Wellenformen nutzen kanonische Medienpfade und einen sichtbaren Lade-Fallback. |
+| 32 | Eigene Preset-Bibliotheken | Textdesign, Sticker, Effekte, Übergänge und Filter besitzen eigene offline nutzbare Bibliotheken; Presets werden vor dem Einfügen bzw. Anwenden ausgewählt. |
 | 4 | Einrast-Vorschau | Beim Verschieben zeigt eine Führungslinie das Einrastziel; ungültige Positionen sind rot markiert. |
 | 5 | Bearbeitungsverlauf | Strg+Alt+Z oder ⋯ → Verlauf. Benannte Schritte, Doppelklick zum Zurück-/Vorwärtsspringen. |
 | 6 | Schnitt-Tastatur | J/K/L, I/O und Ripple-Kürzel bleiben erhalten; Pfeil hoch/runter springt zu Schnittkanten. |

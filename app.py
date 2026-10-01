@@ -1,6122 +1,5415 @@
-"""Framecut 3.24.0 â€” native Linux multitrack editor."""
-import math
-import os
-import sys
-import shutil
-import threading
-import tempfile
-import uuid
-import subprocess
-import inspect
-import time
-from pathlib import Path
-from dataclasses import replace
-
-from PySide6.QtCore import Qt, QUrl, QThread, Signal, QTimer, QLockFile, QSize
-from PySide6.QtGui import QAction, QImage, QColor, QFont, QPainter, QPen, QIcon, QPixmap
-from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,
-    QPushButton,QToolButton,QListWidgetItem,QFileDialog,QMessageBox,QSplitter,QDoubleSpinBox,QFormLayout,
-    QComboBox,QSlider,QScrollArea,QProgressDialog,QFrame,QCheckBox,QStackedWidget,QSpinBox,QLineEdit,QInputDialog,QSizePolicy,QMenu,QColorDialog,QListWidget,QFontComboBox,QDialog,QDialogButtonBox,QGridLayout,QPlainTextEdit)
-from PySide6.QtMultimedia import (QMediaPlayer,QAudioOutput,QMediaCaptureSession,QAudioInput,
-                                  QMediaRecorder,QMediaFormat)
-from preview import VideoView
-from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_MODES,TEXT_STYLE_PRESETS,EFFECT_PRESETS,KEYFRAME_CURVES,KEYFRAME_CURVE_LABELS,EXPORT_FORMATS,EXPORT_CODEC_LABELS,EXPORT_ENCODER_LABELS,EXPORT_PRESETS,PROXY_PROFILES,AUTO_REFRAME_FORMATS,AUTO_REFRAME_FORMAT_LABELS,auto_reframe_aspect,curve_progress,
-                  normalize_export_settings,import_clip,import_image_sequence,parse_subtitle_file,subtitle_cues_from_clips,write_subtitle_file,save_project,load_project,split_clip,render,
-                  archive_project,extract_project_archive,find_relink_candidates,relink_project_media,missing_project_media,create_proxy_files,
-                  preview_acceleration_info,cache_size,prune_cache,
-                  ExportCancelled,validate_timeline,length,normalize_markers,edited_clip,retime_keyframes,retime_volume_keyframes,retime_speed_keyframes,
-                  normalize_track_states,normalize_track_names,normalize_master_mixer,slip_clip,roll_edit,slide_edit,retime_tracking_keyframes,retime_auto_reframe_keyframes,retime_mask_path_keyframes,
-                  cut_clip_ranges,split_clip_at_times,build_auto_cut_points,mask_path_keyframes_from_tracking,
-                  trim_timeline_range,close_track_gaps,copy_keyframe_bundle,paste_keyframe_bundle,
-                  write_chapter_file,capture_frame)
-from timeline import Timeline,MediaList
-from asset_library import (AssetLibraryPanel, get_library_item, library_items,
-                           library_sound_path)
-from style import STYLE
-from ux import FineDoubleSpinBox as QDoubleSpinBox, line_icon
-from workbench import SmoothWorkbench, HISTORY_NAMES
-from update_system import (configured_manifest_url,download_verified,fetch_manifest,
-                           install_downloaded,preferred_kinds,select_artifact,update_cache_directory,
-                           update_checks_disabled)
-from transcription import transcribe_media, build_text_edit_plan
-from ai_tools import (AIToolError, remove_background_media, track_motion, auto_reframe_video,
-                       analyze_beats, detect_scene_changes, detect_audio_onset)
-
-try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.24.0'
-except OSError:
-    APP_VERSION = '3.24.0'
-
-
-def label(text,name=None):
-    widget=QLabel(text)
-    if name: widget.setObjectName(name)
-    return widget
-
-
-def button(text,callback,primary=False):
-    widget=QPushButton(text); widget.clicked.connect(lambda checked=False:callback())
-    if primary: widget.setObjectName('primary')
-    return widget
-
-
-def icon_action(symbol, tooltip, callback, theme_name=None):
-    """Create a compact header action without adding another text-heavy box."""
-    widget=QToolButton()
-    icon=line_icon(theme_name) if theme_name else QIcon()
-    if not icon.isNull():
-        widget.setIcon(icon)
-        widget.setToolButtonStyle(Qt.ToolButtonIconOnly)
-    else:
-        widget.setText(symbol)
-        widget.setToolButtonStyle(Qt.ToolButtonTextOnly)
-    widget.setObjectName('headerToolButton')
-    widget.setToolTip(tooltip)
-    widget.setStatusTip(tooltip)
-    widget.setAccessibleName(tooltip)
-    widget.setIconSize(QSize(17,17))
-    widget.setFixedSize(34,30)
-    widget.setAutoRaise(True)
-    widget.clicked.connect(lambda checked=False:callback())
-    return widget
-
-
-def timeline_tool_button(symbol, tooltip, callback=None, theme_name=None, toggle=False, object_name=None):
-    """Create a compact, icon-first timeline action with a descriptive tooltip."""
-    widget=QToolButton()
-    widget.setText(symbol)
-    icon=line_icon(theme_name) if theme_name else QIcon()
-    if not icon.isNull():
-        widget.setIcon(icon)
-        widget.setToolButtonStyle(Qt.ToolButtonIconOnly)
-    else:
-        widget.setToolButtonStyle(Qt.ToolButtonTextOnly)
-    widget.setObjectName(object_name or ('timelineToolToggle' if toggle else 'timelineToolButton'))
-    widget.setToolTip(tooltip)
-    widget.setStatusTip(tooltip)
-    widget.setAccessibleName(tooltip)
-    widget.setIconSize(QSize(18,18))
-    widget.setFixedSize(32,30)
-    widget.setAutoRaise(True)
-    if toggle:
-        widget.setCheckable(True)
-    if callback is not None:
-        widget.clicked.connect(lambda checked=False:callback())
-    return widget
-
-
-def timeline_menu_button(symbol, tooltip, menu, theme_name=None):
-    """Create an icon-only timeline button that opens a compact action menu."""
-    widget=timeline_tool_button(symbol, tooltip, theme_name=theme_name, object_name='timelineMenuButton')
-    widget.setPopupMode(QToolButton.InstantPopup)
-    widget.setMenu(menu)
-    return widget
-
-
-def timeline_icon_label(symbol, tooltip):
-    """Return a tiny symbol label for non-action timeline controls."""
-    widget=label(symbol,'timelineIconLabel')
-    widget.setToolTip(tooltip)
-    widget.setStatusTip(tooltip)
-    return widget
-
-
-def timeline_tool_group(title, widgets):
-    """Put related timeline actions into one flat, tooltip-labelled group."""
-    group=QFrame(); group.setObjectName('timelineToolGroup')
-    group.setToolTip(title); group.setAccessibleName(title)
-    layout=QHBoxLayout(group); layout.setContentsMargins(1,1,1,1); layout.setSpacing(1)
-    for widget in widgets:
-        layout.addWidget(widget)
-    return group
-
-
-def timeline_separator():
-    separator=QFrame(); separator.setObjectName('timelineSeparator'); separator.setFrameShape(QFrame.VLine)
-    separator.setFixedHeight(30)
-    return separator
-
-
-def timeline_track_group(video_spin, audio_spin):
-    """Create the compact video/audio track count control."""
-    group=QFrame(); group.setObjectName('timelineControlGroup')
-    layout=QVBoxLayout(group); layout.setContentsMargins(7,3,7,3); layout.setSpacing(1)
-    caption=label('SPUREN','timelineGroupLabel'); caption.setAlignment(Qt.AlignCenter); layout.addWidget(caption)
-    controls=QHBoxLayout(); controls.setContentsMargins(0,0,0,0); controls.setSpacing(4)
-    video_icon=timeline_icon_label('â–£','Video-Spuren'); controls.addWidget(video_icon)
-    video_spin.setFixedWidth(40); controls.addWidget(video_spin)
-    audio_icon=timeline_icon_label('â™«','Audio-Spuren'); controls.addWidget(audio_icon)
-    audio_spin.setFixedWidth(40); controls.addWidget(audio_spin)
-    layout.addLayout(controls)
-    return group
-
-
-def panel():
-    widget=QFrame(); widget.setObjectName('panel')
-    layout=QVBoxLayout(widget); layout.setContentsMargins(12,11,12,11); layout.setSpacing(8)
-    return widget,layout
-
-
-def state_directory():
-    path=Path(os.environ.get('XDG_STATE_HOME',str(Path.home()/'.local/state')))/'framecut'
-    path.mkdir(parents=True,exist_ok=True)
-    return path
-
-
-def app_icon_path():
-    return Path(__file__).with_name('framecut.svg')
-
-
-# Attribute paste deliberately excludes source identity, timing, grouping and
-# animation. Keyframes have a dedicated clipboard so a quick effect paste
-# cannot unexpectedly overwrite motion data.
-VIDEO_ATTRIBUTE_FIELDS = (
-    'volume', 'fade_in', 'fade_out', 'video_scale', 'video_x', 'video_y',
-    'crop_left', 'crop_top', 'crop_right', 'crop_bottom', 'rotation',
-    'flip_horizontal', 'flip_vertical', 'brightness', 'contrast', 'saturation',
-    'filter_preset', 'lut_path', 'color_exposure', 'color_temperature',
-    'color_tint', 'color_vibrance', 'color_lift_r', 'color_lift_g',
-    'color_lift_b', 'color_gamma_r', 'color_gamma_g', 'color_gamma_b',
-    'color_gain_r', 'color_gain_g', 'color_gain_b', 'opacity', 'blur',
-    'sharpen', 'stabilization', 'effect_preset',
-    'chroma_key_enabled', 'chroma_key_color', 'chroma_key_similarity',
-    'chroma_key_blend', 'mask_type', 'mask_x', 'mask_y', 'mask_width',
-    'mask_height', 'mask_feather', 'mask_points', 'audio_noise_reduction',
-    'audio_eq_low', 'audio_eq_mid', 'audio_eq_high', 'audio_compressor_enabled',
-    'audio_compressor_threshold', 'audio_compressor_ratio', 'audio_ducking',
-    'audio_voice_isolation', 'audio_channel_mode', 'audio_pan',
-    'audio_normalize', 'audio_normalize_target', 'freeze_frame',
-    'freeze_duration', 'reverse', 'speed', 'transition_type',
-    'transition_duration',
-)
-AUDIO_ATTRIBUTE_FIELDS = (
-    'volume', 'fade_in', 'fade_out', 'audio_noise_reduction', 'audio_eq_low',
-    'audio_eq_mid', 'audio_eq_high', 'audio_compressor_enabled',
-    'audio_compressor_threshold', 'audio_compressor_ratio', 'audio_ducking',
-    'audio_voice_isolation', 'audio_channel_mode', 'audio_pan',
-    'audio_normalize', 'audio_normalize_target', 'speed', 'reverse',
-    'transition_type', 'transition_duration',
-)
-TEXT_ATTRIBUTE_FIELDS = (
-    'volume', 'fade_in', 'fade_out', 'font_size', 'color', 'font_family',
-    'font_bold', 'font_italic', 'outline_width', 'outline_color',
-    'shadow_size', 'shadow_color', 'background_enabled', 'background_color',
-    'background_opacity', 'background_padding', 'text_animation',
-    'text_animation_duration', 'x', 'y',
-)
-
-
-class KeyframeGraphWidget(QWidget):
-    """Compact draggable curve editor for the clip transform keyframes."""
-    point_moved = Signal(int, float, float)
-    point_added = Signal(float, float)
-    point_selected = Signal(int)
-    drag_started = Signal()
-    drag_finished = Signal()
-    RANGES = {
-        'scale': (.1, 4.0, 'Zoom'),
-        'x': (0.0, 1.0, 'Bild X'),
-        'y': (0.0, 1.0, 'Bild Y'),
-        'rotation': (-360.0, 360.0, 'Rotation'),
-        'opacity': (0.0, 1.0, 'Deckkraft'),
-        'blur': (0.0, 20.0, 'UnschÃ¤rfe'),
-    }
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumHeight(142)
-        self.setMaximumHeight(190)
-        self.setMouseTracking(True)
-        self.frames = []
-        self.duration = 1.0
-        self.field = 'scale'
-        self.default = 1.0
-        self.selected = -1
-        self.dragging = False
-
-    def set_data(self, frames, duration, field, default):
-        self.frames = [dict(frame) for frame in frames]
-        self.duration = max(.01, float(duration))
-        self.field = field if field in self.RANGES else 'scale'
-        self.default = float(default)
-        self.selected = min(self.selected, len(self.frames)-1)
-        self.dragging = False
-        self.update()
-
-    def _plot(self):
-        return self.rect().adjusted(30, 12, -12, -24)
-
-    def _range(self):
-        low, high, _ = self.RANGES[self.field]
-        return low, high
-
-    def _value(self, frame):
-        return float(frame.get(self.field, self.default))
-
-    def _map(self, time, value):
-        plot = self._plot(); low, high = self._range()
-        x = plot.left() + max(0.0, min(self.duration, float(time))) / self.duration * plot.width()
-        ratio = (float(value)-low) / max(1e-9, high-low)
-        y = plot.bottom() - max(0.0, min(1.0, ratio)) * plot.height()
-        return x, y
-
-    def _unmap(self, point):
-        plot = self._plot(); low, high = self._range()
-        time = (point.x()-plot.left()) / max(1, plot.width()) * self.duration
-        ratio = (plot.bottom()-point.y()) / max(1, plot.height())
-        return max(0.0, min(self.duration, time)), max(low, min(high, low+ratio*(high-low)))
-
-    def _value_at(self, time):
-        if not self.frames:
-            return self.default
-        frames = sorted(self.frames, key=lambda value: float(value.get('time', 0.0)))
-        if time <= float(frames[0].get('time', 0.0)):
-            return self.default if float(frames[0].get('time', 0.0)) > 1e-7 else self._value(frames[0])
-        for left, right in zip(frames, frames[1:]):
-            left_time, right_time = float(left.get('time', 0.0)), float(right.get('time', 0.0))
-            if time <= right_time:
-                ratio = (time-left_time) / max(1e-9, right_time-left_time)
-                ratio = curve_progress(ratio, left.get('curve', 'linear'))
-                return self._value(left) + (self._value(right)-self._value(left))*ratio
-        return self._value(frames[-1])
-
-    def _hit(self, point):
-        nearest = -1; distance = 9e9
-        for index, frame in enumerate(self.frames):
-            x, y = self._map(frame.get('time', 0.0), self._value(frame))
-            current = (x-point.x())**2 + (y-point.y())**2
-            if current < distance and current <= 12**2:
-                nearest, distance = index, current
-        return nearest
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor('#101722'))
-        plot = self._plot(); low, high = self._range(); title = self.RANGES[self.field][2]
-        painter.setPen(QPen(QColor('#667085'), 1))
-        painter.drawText(6, 15, title)
-        painter.setPen(QPen(QColor('#253246'), 1))
-        for step in range(5):
-            y = plot.top() + step * plot.height() / 4
-            painter.drawLine(plot.left(), int(y), plot.right(), int(y))
-        for step in range(5):
-            x = plot.left() + step * plot.width() / 4
-            painter.drawLine(int(x), plot.top(), int(x), plot.bottom())
-        painter.setPen(QPen(QColor('#7d8da6'), 1))
-        painter.drawText(plot.left(), self.height()-6, '0 s')
-        painter.drawText(plot.right()-34, self.height()-6, f'{self.duration:.1f} s')
-        if not self.frames:
-            painter.setPen(QPen(QColor('#8b98aa'), 1))
-            painter.drawText(plot.left()+8, plot.center().y(), 'Keyframes im Inspector setzen oder doppelt klicken')
-            return
-        curve_points = []
-        for index in range(81):
-            time = self.duration * index / 80
-            curve_points.append(self._map(time, self._value_at(time)))
-        painter.setPen(QPen(QColor('#63ead4'), 2))
-        for left, right in zip(curve_points, curve_points[1:]):
-            painter.drawLine(int(left[0]), int(left[1]), int(right[0]), int(right[1]))
-        for index, frame in enumerate(self.frames):
-            x, y = self._map(frame.get('time', 0.0), self._value(frame))
-            color = QColor('#f8c86f' if index == self.selected else '#63ead4')
-            painter.setPen(QPen(color, 2)); painter.setBrush(color)
-            painter.drawEllipse(int(x)-4, int(y)-4, 8, 8)
-
-    def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton:
-            return
-        point = event.position().toPoint()
-        self.selected = self._hit(point)
-        if self.selected >= 0:
-            self.dragging = True
-            self.drag_started.emit()
-            self.point_selected.emit(self.selected)
-            self.update()
-
-    def mouseMoveEvent(self, event):
-        if not self.dragging or self.selected < 0:
-            return
-        time, value = self._unmap(event.position().toPoint())
-        if self.selected > 0:
-            time = max(time, float(self.frames[self.selected-1].get('time', 0.0))+.01)
-        if self.selected + 1 < len(self.frames):
-            time = min(time, float(self.frames[self.selected+1].get('time', self.duration))-.01)
-        frame = self.frames[self.selected]
-        frame['time'] = round(max(0.0, min(self.duration, time)), 6)
-        frame[self.field] = round(value, 6)
-        self.point_moved.emit(self.selected, frame['time'], frame[self.field])
-        self.update()
-
-    def mouseReleaseEvent(self, event):
-        if self.dragging:
-            self.drag_finished.emit()
-        self.dragging = False
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() != Qt.LeftButton:
-            return
-        time, value = self._unmap(event.position().toPoint())
-        self.point_added.emit(round(time, 6), round(value, 6))
-
-
-class ExportDialog(QDialog):
-    """Small, explicit export profile dialog backed by core validation."""
-    def __init__(self,parent=None,work_area=None):
-        super().__init__(parent)
-        self.setWindowTitle('Export-Einstellungen')
-        self.setMinimumWidth(430)
-        self.work_area=work_area
-        layout=QVBoxLayout(self); layout.setContentsMargins(18,16,18,16); layout.setSpacing(12)
-        layout.addWidget(label('EXPORT Â· FERTIGEN FILM SPEICHERN','heading'))
-        self.summary=label('','projectTitle'); self.summary.setWordWrap(True); layout.addWidget(self.summary)
-        form=QFormLayout()
-        self.preset_combo=QComboBox()
-        for value,info in EXPORT_PRESETS.items():
-            self.preset_combo.addItem(info['label'],value)
-        form.addRow('Export-Preset',self.preset_combo)
-        self.format_combo=QComboBox()
-        for value,info in EXPORT_FORMATS.items(): self.format_combo.addItem(info['label'],value)
-        self.codec_combo=QComboBox()
-        self.fps=QDoubleSpinBox(); self.fps.setRange(1,120); self.fps.setDecimals(2); self.fps.setSingleStep(1); self.fps.setValue(30); self.fps.setSuffix(' FPS')
-        self.bitrate=QSpinBox(); self.bitrate.setRange(256,200000); self.bitrate.setSingleStep(500); self.bitrate.setValue(12000); self.bitrate.setSuffix(' kbit/s')
-        self.encoder_combo=QComboBox()
-        for value,title in EXPORT_ENCODER_LABELS.items(): self.encoder_combo.addItem(title,value)
-        self.hdr=QCheckBox('HDR10 Â· BT.2020 / PQ')
-        self.hdr.setToolTip('10-Bit-Video mit HDR-Farbmetadaten; benÃ¶tigt H.265/HEVC oder AV1.')
-        form.addRow('Format',self.format_combo); form.addRow('Bildrate',self.fps)
-        layout.addLayout(form)
-        self.advanced_toggle=QToolButton(); self.advanced_toggle.setText('Erweitert Â· Codec und QualitÃ¤t')
-        self.advanced_toggle.setCheckable(True); self.advanced_toggle.setArrowType(Qt.RightArrow)
-        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); layout.addWidget(self.advanced_toggle)
-        self.advanced_panel=QWidget(); advanced=QFormLayout(self.advanced_panel)
-        advanced.addRow('Videocodec',self.codec_combo); advanced.addRow('Videobitrate',self.bitrate)
-        advanced.addRow('Encoding',self.encoder_combo); advanced.addRow('Farbraum',self.hdr)
-        layout.addWidget(self.advanced_panel); self.advanced_panel.hide()
-        self.advanced_toggle.toggled.connect(lambda visible:(self.advanced_panel.setVisible(visible),self.advanced_toggle.setArrowType(Qt.DownArrow if visible else Qt.RightArrow)))
-        self.work_area_box=QCheckBox('Nur Arbeitsbereich exportieren')
-        self.work_area_box.setEnabled(bool(work_area))
-        if work_area:
-            self.work_area_box.setToolTip(f'Exportiert nur {work_area[0]:.2f}â€“{work_area[1]:.2f} s.')
-        else:
-            self.work_area_box.setToolTip('Setze zuerst Arbeitsbereich-In und Arbeitsbereich-Out in der Vorschau.')
-        layout.addWidget(self.work_area_box)
-        self.queue_only_box=QCheckBox('Nur in Render-Queue einreihen')
-        self.queue_only_box.setToolTip('Der Export startet erst, wenn die Render-Queue gestartet wird.')
-        layout.addWidget(self.queue_only_box)
-        self.hint=label('Die Auswahl wird direkt im FFmpeg-Export verwendet.','muted'); self.hint.setWordWrap(True); layout.addWidget(self.hint)
-        buttons=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
-        self.format_combo.currentIndexChanged.connect(self.format_changed)
-        self.codec_combo.currentIndexChanged.connect(self.codec_changed)
-        self.preset_combo.currentIndexChanged.connect(self.preset_changed)
-        self.preset_combo.setCurrentIndex(self.preset_combo.findData('master'))
-        self.preset_changed()
-        if parent is not None and hasattr(parent,'clips'):
-            source=next((c for c in parent.clips if c.kind=='video' and c.source_type not in ('image','adjustment')),None)
-            self.fps.setValue(source.source_fps if source else 30)
-            saved=getattr(parent,'last_export_settings',{})
-            try: saved=normalize_export_settings(saved) if saved else {}
-            except (ValueError,TypeError): saved={}
-            if saved:
-                self.format_combo.setCurrentIndex(self.format_combo.findData(saved['format']))
-                self.codec_combo.setCurrentIndex(self.codec_combo.findData(saved['video_codec']))
-                self.fps.setValue(saved['fps']); self.bitrate.setValue(saved['bitrate_kbps'])
-                self.encoder_combo.setCurrentIndex(self.encoder_combo.findData(saved['encoder'])); self.hdr.setChecked(saved['hdr'])
-        self.fps.valueChanged.connect(self.update_summary); self.format_combo.currentIndexChanged.connect(self.update_summary)
-        self.preset_combo.currentIndexChanged.connect(self.update_summary); self.work_area_box.toggled.connect(self.update_summary)
-        self.update_summary()
-
-    def update_summary(self,*_):
-        parent=self.parent(); preset=EXPORT_PRESETS.get(self.preset_combo.currentData(),{})
-        size=preset.get('size') or (PRESETS[parent.preset.currentText()] if parent is not None and hasattr(parent,'preset') else (1920,1080))
-        area='Arbeitsbereich' if self.work_area_box.isChecked() else 'Gesamte Timeline'
-        self.summary.setText(f'{size[0]} Ã— {size[1]} Â· {self.fps.value():g} FPS Â· {self.format_combo.currentText()}\n{area} Â· Originalmedien')
-
-    def preset_changed(self,*_):
-        values=EXPORT_PRESETS.get(self.preset_combo.currentData())
-        if not values:
-            return
-        self.format_combo.blockSignals(True); self.codec_combo.blockSignals(True)
-        self.format_combo.setCurrentIndex(self.format_combo.findData(values['format']))
-        self.format_combo.blockSignals(False)
-        self.format_changed()
-        self.codec_combo.blockSignals(True)
-        self.codec_combo.setCurrentIndex(self.codec_combo.findData(values['video_codec']))
-        self.codec_combo.blockSignals(False)
-        self.fps.setValue(values['fps']); self.bitrate.setValue(values['bitrate_kbps'])
-        encoder_index=self.encoder_combo.findData(values['encoder'])
-        if encoder_index >= 0:
-            self.encoder_combo.setCurrentIndex(encoder_index)
-        self.hdr.setChecked(bool(values['hdr']))
-        self.codec_changed()
-
-    def format_changed(self,*_):
-        old=self.codec_combo.currentData(); self.codec_combo.blockSignals(True); self.codec_combo.clear()
-        info=EXPORT_FORMATS[self.format_combo.currentData()]
-        for value in info['codecs']: self.codec_combo.addItem(EXPORT_CODEC_LABELS[value],value)
-        index=self.codec_combo.findData(old)
-        self.codec_combo.setCurrentIndex(index if index >= 0 else 0); self.codec_combo.blockSignals(False); self.codec_changed()
-
-    def codec_changed(self,*_):
-        enabled=self.codec_combo.currentData() in ('hevc','av1')
-        self.hdr.setEnabled(enabled)
-        if not enabled:self.hdr.setChecked(False)
-
-    def settings(self):
-        return {'format':self.format_combo.currentData(),'video_codec':self.codec_combo.currentData(),
-                'fps':self.fps.value(),'bitrate_kbps':self.bitrate.value(),
-                'encoder':self.encoder_combo.currentData(),'hdr':self.hdr.isChecked(),
-                'export_preset':self.preset_combo.currentData(),
-                'size':EXPORT_PRESETS.get(self.preset_combo.currentData(),{}).get('size')}
-
-    def accept(self):
-        try:
-            self.export_settings=normalize_export_settings(self.settings())
-        except ValueError as exc:
-            QMessageBox.warning(self,'Export-Einstellungen',str(exc)); return
-        self.export_work_area=self.work_area_box.isChecked()
-        super().accept()
-
-
-class AutomaticSubtitleDialog(QDialog):
-    """Choose a local source and settings for speech-to-text subtitles."""
-
-    def __init__(self, sources, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle('Automatische Untertitel')
-        self.setMinimumWidth(560)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(11)
-        layout.addWidget(label('AUTOMATISCHE UNTERTITEL Â· LOKALE SPRACHERKENNUNG', 'heading'))
-        intro = label(
-            'Framecut wandelt die Sprache aus einem Video oder einer Audiodatei in editierbare Textclips um. '
-            'Die Quelldatei bleibt auf deinem Rechner; beim ersten Einsatz wird nur das gewÃ¤hlte Sprachmodell geladen.',
-            'muted')
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-
-        form = QFormLayout()
-        source_row = QHBoxLayout()
-        self.source_combo = QComboBox()
-        for title, path in sources:
-            self.source_combo.addItem(title, str(path))
-        self.source_combo.setToolTip('Bereits importiertes Video oder Audio verwenden')
-        source_row.addWidget(self.source_combo, 1)
-        browse = QPushButton('Datei auswÃ¤hlen â€¦')
-        browse.clicked.connect(self.choose_file)
-        source_row.addWidget(browse)
-        source_widget = QWidget(); source_widget.setLayout(source_row)
-        form.addRow('Quelle', source_widget)
-
-        self.language_combo = QComboBox()
-        for value, title in (
-            ('auto', 'Automatisch erkennen'),
-            ('de', 'Deutsch'),
-            ('en', 'English'),
-            ('tr', 'TÃ¼rkÃ§e'),
-            ('az', 'AzÉ™rbaycanca'),
-            ('es', 'EspaÃ±ol'),
-            ('fr', 'FranÃ§ais'),
-        ):
-            self.language_combo.addItem(title, value)
-        self.language_combo.setToolTip('Eine bekannte Sprache kann die Erkennung beschleunigen')
-        form.addRow('Sprache', self.language_combo)
-
-        self.model_combo = QComboBox()
-        for value, title in (
-            ('tiny', 'Schnell Â· tiny'),
-            ('base', 'Ausgewogen Â· base'),
-            ('small', 'Genauer Â· small'),
-        ):
-            self.model_combo.addItem(title, value)
-        self.model_combo.setCurrentIndex(self.model_combo.findData('base'))
-        self.model_combo.setToolTip('GrÃ¶ÃŸere Modelle sind genauer, brauchen aber lÃ¤nger und mehr Speicher')
-        form.addRow('Modell', self.model_combo)
-        layout.addLayout(form)
-
-        hint = label('Die Verarbeitung lÃ¤uft als Hintergrundvorgang und kann jederzeit abgebrochen werden. '
-                     'Das Modell wird im Framecut-Benutzerordner zwischengespeichert.', 'muted')
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText('Untertitel erstellen')
-        buttons.button(QDialogButtonBox.Cancel).setText('Abbrechen')
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def choose_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, 'Quelle fÃ¼r automatische Untertitel auswÃ¤hlen', '',
-            'Video und Audio (*.mp4 *.mkv *.mov *.webm *.avi *.mp3 *.wav *.m4a *.flac *.ogg);;Alle Dateien (*)')
-        if not path:
-            return
-        path = str(Path(path).expanduser().resolve())
-        index = self.source_combo.findData(path)
-        if index < 0:
-            self.source_combo.insertItem(0, f'{Path(path).name} Â· Datei', path)
-            index = 0
-        self.source_combo.setCurrentIndex(index)
-
-    def settings(self):
-        return {
-            'path': self.source_combo.currentData(),
-            'language': self.language_combo.currentData(),
-            'model_size': self.model_combo.currentData(),
-        }
-
-    def accept(self):
-        path = self.source_combo.currentData()
-        if not path:
-            QMessageBox.warning(self, 'Automatische Untertitel', 'WÃ¤hle zuerst ein Video oder eine Audiodatei aus.')
-            return
-        if not Path(path).is_file():
-            QMessageBox.warning(self, 'Automatische Untertitel', f'Die Quelldatei wurde nicht gefunden:\n{path}')
-            return
-        super().accept()
-
-
-class CommandPaletteDialog(QDialog):
-    """Searchable launcher for the editor's most important actions."""
-
-    def __init__(self, editor):
-        super().__init__(editor)
-        self.editor = editor
-        self.setWindowTitle('Framecut Â· Befehle')
-        self.setModal(True)
-        self.setMinimumSize(560, 430)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(10)
-        layout.addWidget(label('BEFEHLE UND SHORTCUTS', 'heading'))
-        hint = label('Suche eine Aktion und bestÃ¤tige mit Enter. Ã–ffnen jederzeit mit Strg+K.', 'muted')
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        self.query = QLineEdit()
-        self.query.setPlaceholderText('Befehl suchen â€¦')
-        self.query.setClearButtonEnabled(True)
-        layout.addWidget(self.query)
-        self.commands = editor.command_definitions()
-        self.results = QListWidget()
-        self.results.setViewMode(QListWidget.ListMode)
-        self.results.itemDoubleClicked.connect(self.run_selected)
-        layout.addWidget(self.results, 1)
-        footer = QHBoxLayout()
-        footer.addWidget(label('â†‘ â†“ auswÃ¤hlen Â· Enter ausfÃ¼hren Â· Esc schlieÃŸen', 'muted'))
-        footer.addStretch()
-        close = QPushButton('SchlieÃŸen')
-        close.clicked.connect(self.reject)
-        footer.addWidget(close)
-        layout.addLayout(footer)
-        self.query.textChanged.connect(self.refresh_results)
-        self.query.returnPressed.connect(self.run_selected)
-        self.refresh_results()
-        self.query.setFocus()
-
-    def refresh_results(self, *_):
-        query = self.query.text().strip().casefold()
-        self.results.clear()
-        for title, shortcut, callback in self.commands:
-            searchable = f'{title} {shortcut}'.casefold()
-            if query and query not in searchable:
-                continue
-            item = QListWidgetItem(f'{title}    {shortcut}')
-            item.setData(Qt.UserRole, callback)
-            self.results.addItem(item)
-        if self.results.count():
-            self.results.setCurrentRow(0)
-        else:
-            empty = QListWidgetItem('Keine passenden Befehle')
-            empty.setFlags(Qt.NoItemFlags)
-            self.results.addItem(empty)
-
-    def run_selected(self, *_):
-        item = self.results.currentItem()
-        callback = item.data(Qt.UserRole) if item is not None else None
-        if not callable(callback):
-            return
-        self.accept()
-        QTimer.singleShot(0, callback)
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.reject()
-            return
-        super().keyPressEvent(event)
-
-
-class CinemaPreviewDialog(QDialog):
-    """Fullscreen preview that temporarily uses its own video sink."""
-
-    def __init__(self, editor):
-        super().__init__(editor)
-        self.editor = editor
-        self.setObjectName('cinemaDialog')
-        self.setWindowTitle(f'Framecut {APP_VERSION} Â· Cinema-Vorschau')
-        self.setWindowFlag(Qt.Window)
-        self.setAttribute(Qt.WA_DeleteOnClose)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 18, 22, 16)
-        layout.setSpacing(10)
-        header = QHBoxLayout()
-        header.addWidget(label('FRAMECUT Â· CINEMA PREVIEW', 'heading'))
-        header.addStretch()
-        close = QPushButton('SchlieÃŸen  Esc')
-        close.setObjectName('iconButton')
-        close.clicked.connect(self.close)
-        header.addWidget(close)
-        layout.addLayout(header)
-        self.canvas = VideoView()
-        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.canvas.frame = editor.video.frame
-        layout.addWidget(self.canvas, 1)
-        controls = QHBoxLayout()
-        self.play_button = QPushButton('â–¶ Timeline')
-        self.play_button.clicked.connect(editor.toggle_play)
-        controls.addWidget(self.play_button)
-        controls.addWidget(label('F11 oder Esc zum SchlieÃŸen', 'muted'))
-        controls.addStretch()
-        self.time = label(editor.time_label.text(), 'muted')
-        controls.addWidget(self.time)
-        layout.addLayout(controls)
-        editor.player.setVideoSink(self.canvas.sink)
-        editor.player.playbackStateChanged.connect(self.sync_play_state)
-        editor.player.positionChanged.connect(self.sync_time)
-        self.sync_play_state(editor.player.playbackState())
-
-    def sync_play_state(self, state):
-        if state == QMediaPlayer.PlayingState:
-            self.play_button.setText('â…¡ Pause')
-        else:
-            self.play_button.setText('â–¶ Timeline')
-
-    def sync_time(self, *_):
-        self.time.setText(self.editor.time_label.text())
-
-    def keyPressEvent(self, event):
-        if event.key() in (Qt.Key_Escape, Qt.Key_F11):
-            self.close()
-            return
-        super().keyPressEvent(event)
-
-    def closeEvent(self, event):
-        self.editor.player.setVideoSink(self.editor.video.sink)
-        self.editor.video.frame = self.canvas.frame
-        self.editor.video.update()
-        self.editor.cinema_dialog = None
-        if hasattr(self.editor, 'cinema_button'):
-            self.editor.cinema_button.setText('â›¶ Cinema')
-        super().closeEvent(event)
-
-
-class LevelMeter(QWidget):
-    """Compact, dependency-free mixer meter driven by the current playhead."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.level = 0.0
-        self.setMinimumWidth(92)
-        self.setMinimumHeight(16)
-
-    def set_level(self, value):
-        value = max(0.0, min(1.0, float(value)))
-        if abs(value - self.level) > .005:
-            self.level = value
-            self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor('#0b1017'))
-        width = max(0, int((self.width()-4) * self.level))
-        if width:
-            green = max(0, min(width, int(self.width()*.70)))
-            yellow = max(0, min(width-green, int(self.width()*.20)))
-            painter.fillRect(2, 2, green, max(1, self.height()-4), QColor('#63d9a5'))
-            painter.fillRect(2+green, 2, yellow, max(1, self.height()-4), QColor('#f5c86b'))
-            painter.fillRect(2+green+yellow, 2, max(0, width-green-yellow), max(1, self.height()-4), QColor('#ff7777'))
-        painter.setPen(QColor('#334255'))
-        painter.drawRect(1, 1, self.width()-3, self.height()-3)
-
-
-class MixerDialog(QDialog):
-    """Track mixer with live faders, pan, solo/mute and master controls."""
-    def __init__(self, editor):
-        super().__init__(editor)
-        self.editor = editor
-        self.setWindowTitle('Audio-Mixer')
-        self.setMinimumSize(760, 420)
-        self._loading = True
-        self._checkpointed = False
-        self.track_controls = {}
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(10)
-        layout.addWidget(label('AUDIO-MIXER Â· SPUREN, MASTER UND PEGEL','heading'))
-        hint = label('Fader und Panorama wirken in Vorschau und Export. Solo schaltet alle anderen Tonspuren fÃ¼r den AbhÃ¶rmix aus.','muted')
-        hint.setWordWrap(True); layout.addWidget(hint)
-
-        grid = QGridLayout(); grid.setHorizontalSpacing(8); grid.setVerticalSpacing(6)
-        for column, title in enumerate(('Spur','LautstÃ¤rke','Panorama','M / S','Pegel')):
-            grid.addWidget(label(title,'muted'), 0, column)
-        for row, track in enumerate(editor.tracks, 1):
-            state = editor.track_states.get(track, {})
-            name = editor.track_names.get(track, editor.default_track_name(track))
-            grid.addWidget(label(name), row, 0)
-            volume_slider = QSlider(Qt.Horizontal); volume_slider.setRange(0, 200); volume_slider.setValue(round(float(state.get('volume',1))*100)); volume_slider.setToolTip('SpurlautstÃ¤rke 0â€“200 %')
-            volume_spin = QDoubleSpinBox(); volume_spin.setRange(0, 200); volume_spin.setDecimals(0); volume_spin.setSuffix(' %'); volume_spin.setValue(float(state.get('volume',1))*100)
-            volume_box = QHBoxLayout(); volume_box.setContentsMargins(0,0,0,0); volume_box.addWidget(volume_slider, 1); volume_box.addWidget(volume_spin)
-            volume_widget = QWidget(); volume_widget.setLayout(volume_box); grid.addWidget(volume_widget, row, 1)
-            pan_slider = QSlider(Qt.Horizontal); pan_slider.setRange(-100, 100); pan_slider.setValue(round(float(state.get('pan',0))*100)); pan_slider.setToolTip('Panorama links/rechts')
-            pan_spin = QDoubleSpinBox(); pan_spin.setRange(-100, 100); pan_spin.setDecimals(0); pan_spin.setSuffix(' %'); pan_spin.setValue(float(state.get('pan',0))*100)
-            pan_box = QHBoxLayout(); pan_box.setContentsMargins(0,0,0,0); pan_box.addWidget(pan_slider, 1); pan_box.addWidget(pan_spin)
-            pan_widget = QWidget(); pan_widget.setLayout(pan_box); grid.addWidget(pan_widget, row, 2)
-            mute = QCheckBox('M'); mute.setChecked(bool(state.get('muted',False))); mute.setToolTip('Spur stummschalten')
-            solo = QCheckBox('S'); solo.setChecked(bool(state.get('solo',False))); solo.setToolTip('Spur solo abhÃ¶ren')
-            buttons = QHBoxLayout(); buttons.setContentsMargins(0,0,0,0); buttons.addWidget(mute); buttons.addWidget(solo)
-            button_widget = QWidget(); button_widget.setLayout(buttons); grid.addWidget(button_widget, row, 3)
-            meter = LevelMeter(); grid.addWidget(meter, row, 4)
-            self.track_controls[track] = {'volume_slider':volume_slider,'volume_spin':volume_spin,
-                                          'pan_slider':pan_slider,'pan_spin':pan_spin,'mute':mute,
-                                          'solo':solo,'meter':meter}
-            volume_slider.valueChanged.connect(lambda value, s=volume_spin: s.setValue(value))
-            volume_spin.valueChanged.connect(lambda value, s=volume_slider: s.setValue(round(value)))
-            pan_slider.valueChanged.connect(lambda value, s=pan_spin: s.setValue(value))
-            pan_spin.valueChanged.connect(lambda value, s=pan_slider: s.setValue(round(value)))
-            for control in (volume_slider,pan_slider):
-                control.sliderPressed.connect(lambda:setattr(self,'_checkpointed',False))
-                control.sliderReleased.connect(lambda:setattr(self,'_checkpointed',False))
-            for control in (volume_spin,pan_spin):
-                control.editingFinished.connect(lambda:setattr(self,'_checkpointed',False))
-            volume_spin.valueChanged.connect(lambda value, t=track: self.set_track(t, volume=value/100.0))
-            pan_spin.valueChanged.connect(lambda value, t=track: self.set_track(t, pan=value/100.0))
-            mute.toggled.connect(lambda value, t=track: self.set_track(t, muted=value))
-            solo.toggled.connect(lambda value, t=track: self.set_track(t, solo=value))
-        scroll_content = QWidget(); scroll_content.setLayout(grid)
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(scroll_content); layout.addWidget(scroll, 1)
-
-        master_box = QFrame(); master_box.setObjectName('panel'); master_layout = QGridLayout(master_box)
-        master_layout.addWidget(label('MASTER','heading'), 0, 0)
-        self.master_volume = QDoubleSpinBox(); self.master_volume.setRange(0,200); self.master_volume.setDecimals(0); self.master_volume.setSuffix(' %')
-        self.master_volume.setValue(float(editor.master_mixer.get('volume',1))*100)
-        self.master_pan = QDoubleSpinBox(); self.master_pan.setRange(-100,100); self.master_pan.setDecimals(0); self.master_pan.setSuffix(' %')
-        self.master_pan.setValue(float(editor.master_mixer.get('pan',0))*100)
-        self.loudness_box = QCheckBox('Loudness-Normalisierung'); self.loudness_box.setChecked(bool(editor.master_mixer.get('loudness_normalization',False)))
-        self.loudness_target = QDoubleSpinBox(); self.loudness_target.setRange(-30,-5); self.loudness_target.setDecimals(1); self.loudness_target.setSuffix(' LUFS'); self.loudness_target.setValue(float(editor.master_mixer.get('loudness_target',-16)))
-        master_layout.addWidget(label('Fader','muted'), 1, 0); master_layout.addWidget(self.master_volume, 1, 1)
-        master_layout.addWidget(label('Pan','muted'), 1, 2); master_layout.addWidget(self.master_pan, 1, 3)
-        master_layout.addWidget(self.loudness_box, 1, 4); master_layout.addWidget(self.loudness_target, 1, 5)
-        self.master_meter = LevelMeter(); master_layout.addWidget(self.master_meter, 1, 6)
-        layout.addWidget(master_box)
-        actions = QHBoxLayout(); voice = QPushButton('Voice-over aufnehmenâ€¦'); voice.clicked.connect(editor.start_voiceover_recording); actions.addWidget(voice)
-        actions.addWidget(label('Aufnahme wird als WAV auf eine freie Audiospur gelegt.','muted')); actions.addStretch()
-        close = QPushButton('SchlieÃŸen'); close.clicked.connect(self.accept); actions.addWidget(close); layout.addLayout(actions)
-        self.master_volume.valueChanged.connect(lambda value:self.set_master(volume=value/100.0))
-        self.master_pan.valueChanged.connect(lambda value:self.set_master(pan=value/100.0))
-        self.loudness_box.toggled.connect(lambda value:self.set_master(loudness_normalization=value))
-        self.loudness_target.valueChanged.connect(lambda value:self.set_master(loudness_target=value))
-        self.meter_timer = QTimer(self); self.meter_timer.setInterval(90); self.meter_timer.timeout.connect(self.update_meters); self.meter_timer.start()
-        self._loading = False
-        self.update_meters()
-
-    def _checkpoint(self):
-        if not self._checkpointed:
-            self.editor.checkpoint(); self._checkpointed = True
-
-    def set_track(self, track, **values):
-        if self._loading or self.editor.worker:
-            return
-        self._checkpoint()
-        state = self.editor.track_states.setdefault(track, {'muted':False,'locked':False,'solo':False,'volume':1.0,'pan':0.0})
-        state.update(values)
-        self.editor.track_states = normalize_track_states(self.editor.track_states, self.editor.tracks)
-        self.editor.changed()
-
-    def set_master(self, **values):
-        if self._loading or self.editor.worker:
-            return
-        self._checkpoint()
-        updated = dict(self.editor.master_mixer); updated.update(values)
-        self.editor.master_mixer = normalize_master_mixer(updated)
-        self.editor.changed()
-
-    def update_meters(self):
-        playhead = float(self.editor.playhead)
-        solo_tracks = {track for track, state in self.editor.track_states.items() if state.get('solo',False)}
-        levels = []
-        for track, controls in self.track_controls.items():
-            state = self.editor.track_states.get(track, {})
-            allowed = not state.get('muted',False) and (not solo_tracks or track in solo_tracks)
-            active = [clip for clip in self.editor.clips if clip.track == track and clip.kind in ('audio','video')
-                      and clip.position <= playhead < clip.finish and getattr(clip,'has_audio',False) and clip.volume > 0]
-            level = 0.0
-            if allowed and active:
-                clip = active[-1]
-                pulse = .45 + .35 * (0.5 + 0.5 * math.sin(playhead * 8.0 + abs(track)))
-                level = min(1.0, pulse * min(1.0, clip.volume * float(state.get('volume',1.0))))
-            controls['meter'].set_level(level); levels.append(level)
-        master = max(levels, default=0.0) * min(1.0, float(self.editor.master_mixer.get('volume',1.0)))
-        self.master_meter.set_level(master)
-
-    def refresh_from_editor(self):
-        """Keep an already open mixer aligned after undo, redo or project load."""
-        self._loading = True
-        for track, controls in self.track_controls.items():
-            state = self.editor.track_states.get(track, {})
-            for widget, value in ((controls['volume_slider'], round(float(state.get('volume',1))*100)),
-                                  (controls['volume_spin'], float(state.get('volume',1))*100),
-                                  (controls['pan_slider'], round(float(state.get('pan',0))*100)),
-                                  (controls['pan_spin'], float(state.get('pan',0))*100),
-                                  (controls['mute'], bool(state.get('muted',False))),
-                                  (controls['solo'], bool(state.get('solo',False)))):
-                widget.blockSignals(True)
-                (widget.setChecked(value) if isinstance(widget,QCheckBox) else widget.setValue(value))
-                widget.blockSignals(False)
-        for widget, value in ((self.master_volume,float(self.editor.master_mixer.get('volume',1))*100),
-                              (self.master_pan,float(self.editor.master_mixer.get('pan',0))*100),
-                              (self.loudness_box,bool(self.editor.master_mixer.get('loudness_normalization',False))),
-                              (self.loudness_target,float(self.editor.master_mixer.get('loudness_target',-16)))):
-            widget.blockSignals(True)
-            (widget.setChecked(value) if isinstance(widget,QCheckBox) else widget.setValue(value))
-            widget.blockSignals(False)
-        self._loading = False
-        self.update_meters()
-
-    def closeEvent(self, event):
-        self.meter_timer.stop()
-        if self.editor.mixer_dialog is self:
-            self.editor.mixer_dialog = None
-        super().closeEvent(event)
-
-
-class Job(QThread):
-    progress=Signal(int)
-    result=Signal(object)
-
-    def __init__(self,operation):
-        super().__init__()
-        self.operation=operation; self.cancel=threading.Event()
-
-    def run(self):
-        try:
-            result=self.operation(self.progress.emit,self.cancel)
-            self.result.emit({'ok':True,'value':result})
-        except ExportCancelled:
-            self.result.emit({'ok':False,'cancelled':True,'error':'Vorgang abgebrochen.'})
-        except Exception as exc:
-            self.result.emit({'ok':False,'cancelled':False,'error':str(exc)})
-
-
-class UpdateCheckJob(QThread):
-    result=Signal(object)
-
-    def __init__(self,manifest_url,current_version):
-        super().__init__()
-        self.manifest_url=manifest_url; self.current_version=current_version
-
-    def run(self):
-        try:
-            manifest=fetch_manifest(self.manifest_url)
-            artifact=select_artifact(manifest,self.current_version,preferred_kinds())
-            self.result.emit({'ok':True,'artifact':artifact})
-        except Exception as exc:
-            self.result.emit({'ok':False,'error':str(exc)})
-
-
-class UpdateDownloadJob(QThread):
-    result=Signal(object)
-
-    def __init__(self,artifact,install=False,current_path=None):
-        super().__init__()
-        self.artifact=artifact; self.install=install; self.current_path=current_path
-
-    def run(self):
-        try:
-            target=update_cache_directory()/self.artifact['filename']
-            downloaded=download_verified(self.artifact['url'],self.artifact['sha256'],target)
-            message='Update verifiziert heruntergeladen: '+str(downloaded)
-            installed=False
-            if self.install and self.artifact['kind']=='appimage' and self.current_path:
-                message=install_downloaded(downloaded,'appimage',self.current_path)
-                installed=True
-            self.result.emit({'ok':True,'path':str(downloaded),'message':message,'installed':installed})
-        except Exception as exc:
-            self.result.emit({'ok':False,'error':str(exc)})
-
-
-class Editor(SmoothWorkbench,QMainWindow):
-    def __init__(self,state_dir=None,recovery=True):
-        super().__init__()
-        self.state_dir=Path(state_dir) if state_dir else state_directory()
-        self.state_dir.mkdir(parents=True,exist_ok=True)
-        self.init_smooth_state(); self.job_type=Job
-        self.recovery_path=self.state_dir/'recovery.framecut'
-        self.cache_root=self.state_dir/'cache'; self.cache_root.mkdir(parents=True,exist_ok=True)
-        self.cache_limit_bytes=768*1024*1024
-        prune_cache(self.cache_root,self.cache_limit_bytes)
-        sessions=self.cache_root/'sessions'; sessions.mkdir(parents=True,exist_ok=True)
-        self.cache=tempfile.TemporaryDirectory(prefix='framecut-preview-',dir=str(sessions))
-        self.thumbnail_cache=self.cache_root/'thumbnails'; self.thumbnail_cache.mkdir(parents=True,exist_ok=True)
-        self.thumbnails={}
-        self.waveforms={}
-        self.clips=[]; self.assets=[]; self.tracks=[2,1,-1,-2]
-        self.track_states=normalize_track_states(None,self.tracks); self.track_names=normalize_track_names(None,self.tracks)
-        self.master_mixer=normalize_master_mixer(None); self.mixer_dialog=None
-        self.current=None; self.selection=[]; self.clipboard=[]; self.attribute_clipboard=None; self.keyframe_clipboard=None; self.markers=[]
-        # These are UI preferences, not project media.  They keep the editor
-        # calm for beginners while leaving the full professional surface one
-        # click away.
-        self.edit_mode='simple'
-        self.workspace_preset='Schnitt'
-        self.focus_mode=False
-        self.favorite_assets=set()
-        self.inspector_sections=[]
-        self.project_path=None; self.suggested_name='Mein-Film.framecut'
-        self.history=[]; self.future=[]; self.dirty=False; self.revision=0
-        self.preview_revision=-1; self.preview_signature=None; self.preview_path=None
-        self.preview_worker=None; self.preview_queued=False; self.preview_play_requested=False
-        # A plain, contiguous video timeline does not need an FFmpeg
-        # composition render just to cut and play it.  The direct backend
-        # keeps the source in QMediaPlayer and switches only when the playhead
-        # crosses a cut.  Complex timelines still use the rendered backend.
-        self.direct_preview=False; self.direct_preview_revision=-1
-        self.direct_preview_signature=None; self.direct_clip_uid=None
-        self.missing_media=[]; self.proxy_enabled=False; self.proxy_map={}; self.proxy_directory=None; self.proxy_profile='360p'
-        self.auto_proxy_sources=set()
-        self.gpu_preview_info=preview_acceleration_info()
-        self.render_queue=[]; self.render_current=None; self.render_queue_paused=False
-        self.mode='timeline'; self.playhead=0.0
-        self.work_in=None; self.work_out=None
-        # Source-monitor state is intentionally transient.  It is not part of
-        # the project file: In/Out marks describe the current source-editing
-        # session and are cleared whenever the timeline changes.
-        self.source_clip_uid=None; self.source_in=None; self.source_out=None
-        self.transport_rate=0.0; self.transport_rate_pending=None
-        self.voiceover_capture=None; self.voiceover_input=None; self.voiceover_recorder=None
-        self.voiceover_dialog=None; self.voiceover_target=None
-        self.cinema_dialog=None
-        self.transport_timer=QTimer(self); self.transport_timer.setInterval(40); self.transport_timer.timeout.connect(self.transport_tick)
-        self.pending_seek=None; self.worker=None; self.recovery_enabled=recovery
-        self._closing=False
-        self.update_job=None; self.update_download_job=None; self.update_artifact=None
-        self.setWindowTitle(f'Framecut {APP_VERSION} Â· Neues Projekt')
-        self.resize(1460,980); self.setMinimumSize(1120,740)
-        self.player=QMediaPlayer(self); self.audio=QAudioOutput(self); self.player.setAudioOutput(self.audio)
-        # Library previews use a separate player so they never disturb the
-        # timeline/source monitor state.
-        self.library_player=QMediaPlayer(self); self.library_audio=QAudioOutput(self)
-        self.library_audio.setVolume(.8); self.library_player.setAudioOutput(self.library_audio)
-        self.player.positionChanged.connect(self.position_changed)
-        self.player.mediaStatusChanged.connect(self.media_ready)
-        self.player.errorOccurred.connect(lambda *_:self.statusBar().showMessage('Vorschau: '+self.player.errorString()))
-        self.player.playbackStateChanged.connect(self.play_state)
-        self.autosave_timer=QTimer(self); self.autosave_timer.setSingleShot(True)
-        self.autosave_timer.setInterval(2000); self.autosave_timer.timeout.connect(self.autosave)
-        # Debounce edits so a burst of trim/property changes produces one
-        # preview render after the user pauses, not one render per keystroke.
-        self.live_preview_timer=QTimer(self); self.live_preview_timer.setSingleShot(True); self.live_preview_timer.setInterval(700); self.live_preview_timer.timeout.connect(self.auto_preview)
-        self.build_ui(); self.init_smooth_ui(); self.update_project_identity(); self.setAcceptDrops(True); self.update_cache_status()
-        shortcuts=[('Ctrl+I',self.import_dialog),('Ctrl+S',self.save),('Ctrl+Shift+S',lambda:self.save(True)),
-                   ('Ctrl+O',self.open_project),('Ctrl+N',self.new_project),('Ctrl+Z',self.undo),
-                   ('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('Ctrl+B',self.split),('S',self.split),
-                   ('Ctrl+C',self.copy_selection),('Ctrl+V',self.paste_selection),('Ctrl+Shift+V',self.ripple_insert),
-                   ('Ctrl+Alt+C',self.copy_attributes),('Ctrl+Alt+V',self.paste_attributes),
-                   ('Ctrl+Alt+K',self.copy_keyframes),('Ctrl+Alt+Shift+K',self.paste_keyframes),
-                   ('Ctrl+D',self.duplicate_selection),('Ctrl+G',self.group_selection),('Ctrl+Shift+G',self.ungroup_selection),
-                   ('Ctrl+Shift+Delete',self.ripple_delete),('Q',self.ripple_trim_in),('W',self.ripple_trim_out),
-                   ('I',self.set_source_in),('O',self.set_source_out),
-                   ('Ctrl+Alt+I',self.set_work_in),('Ctrl+Alt+O',self.set_work_out),
-                   ('R',self.roll_to_playhead),('Alt+Left',lambda:self.slide_selected(-1)),
-                   ('Alt+Right',lambda:self.slide_selected(1)),
-                   ('Shift+Alt+Left',lambda:self.slip_selected(-1)),
-                   ('Shift+Alt+Right',lambda:self.slip_selected(1)),
-                   ('Ctrl+A',self.select_all),('J',self.transport_j),('K',self.transport_stop),('L',self.transport_l),
-                   ('Ctrl+K',self.open_command_palette),('Ctrl+Shift+F',self.toggle_focus_mode),('F11',self.toggle_cinema_preview),
-                   ('Ctrl+Alt+Z',self.show_history),('Up',lambda:self.jump_cut(-1)),('Down',lambda:self.jump_cut(1)),
-                   ('Space',self.toggle_play),('Delete',self.remove),('Backspace',self.remove),
-                   ('Left',lambda:self.nudge_playhead(-1)),('Right',lambda:self.nudge_playhead(1)),
-                   ('Shift+Left',lambda:self.nudge_playhead(-5)),('Shift+Right',lambda:self.nudge_playhead(5)),
-                   ('Home',lambda:self.set_playhead(0)),('End',lambda:self.set_playhead(length(self.clips)))]
-        for shortcut,fn in shortcuts:
-            action=QAction(self); action.setShortcut(shortcut); action.setShortcutContext(Qt.WindowShortcut); action.triggered.connect(fn); self.addAction(action)
-        self.refresh()
-        self.statusBar().showMessage('Bereit Â· Lokal auf deinem Rechner Â· Quelldateien bleiben unverÃ¤ndert')
-        if recovery: QTimer.singleShot(0,self.offer_recovery)
-        if configured_manifest_url(): QTimer.singleShot(2500,lambda:self.check_for_updates(True))
-
-    def build_ui(self):
-        root=QWidget(); root.setObjectName('editorRoot')
-        outer=QVBoxLayout(root); outer.setContentsMargins(12,10,12,8); outer.setSpacing(8)
-
-        # Header: project identity and the actions that belong to the whole
-        # edit. Keeping this separate from the workspace makes the hierarchy
-        # readable even when the inspector is scrolled deeply.
-        header=QFrame(); header.setObjectName('topbar')
-        head=QHBoxLayout(header); head.setContentsMargins(13,7,10,7); head.setSpacing(5)
-        head.addWidget(label('FRAMECUT','brand'))
-        head.addWidget(label(f'v{APP_VERSION}','versionLabel'))
-        divider=QFrame(); divider.setObjectName('headerDivider'); divider.setFrameShape(QFrame.VLine); divider.setFixedHeight(22); head.addWidget(divider)
-        project_block=QVBoxLayout(); project_block.setContentsMargins(2,0,0,0); project_block.setSpacing(0)
-        self.project_title_label=label('Neues Projekt','projectTitle'); project_block.addWidget(self.project_title_label)
-        self.project_meta_label=label('Lokales Projekt','muted'); project_block.addWidget(self.project_meta_label)
-        project_widget=QWidget(); project_widget.setLayout(project_block); head.addWidget(project_widget)
-        head.addStretch(1)
-        self.autosave_pill=label('â— Autosave','statusPill'); self.autosave_pill.setToolTip('Automatische Sicherung ist aktiv'); head.addWidget(self.autosave_pill)
-        self.new_button=icon_action('+','Neues Projekt Â· Strg+N',self.new_project,'document-new'); head.addWidget(self.new_button)
-        self.open_button=icon_action('â†¥','Projekt Ã¶ffnen Â· Strg+O',self.open_project,'document-open'); head.addWidget(self.open_button)
-        self.save_button=icon_action('â–£','Projekt speichern Â· Strg+S',self.save,'document-save'); head.addWidget(self.save_button)
-        self.update_button=icon_action('â†»','Nach Updates suchen',self.check_for_updates,'view-refresh'); head.addWidget(self.update_button)
-        self.relink_button=icon_action('â›“','Medien neu verknÃ¼pfen',self.relink_media,'insert-link'); head.addWidget(self.relink_button)
-        self.archive_button=icon_action('â–¤','Projekt archivieren',self.archive_project_dialog,'package-x-generic'); head.addWidget(self.archive_button)
-        self.render_queue_button=icon_action('â˜·','Render-Queue Ã¶ffnen',self.show_render_queue,'view-list'); head.addWidget(self.render_queue_button)
-        self.mixer_button=icon_action('â™«','Audio-Mixer Ã¶ffnen',self.open_mixer,'audio-volume-high'); head.addWidget(self.mixer_button)
-        self.command_button=icon_action('âŒ˜','Befehlspalette Ã¶ffnen Â· Strg+K',self.open_command_palette,'system-search'); head.addWidget(self.command_button)
-        self.preset=QComboBox(); self.preset.setObjectName('projectPreset'); self.preset.addItems(PRESETS); self.preset.currentTextChanged.connect(self.preset_changed); self.preset.setToolTip('Projektformat und VorschaugrÃ¶ÃŸe'); head.addWidget(self.preset)
-        export_button=button('Exportieren',self.start_export,True); export_button.setObjectName('exportButton'); export_button.setMinimumWidth(106); head.addWidget(export_button)
-        outer.addWidget(header)
-
-        # The reference uses a lightweight mode strip above the three-column
-        # workspace. These shortcuts expose existing actions without hiding
-        # any of the editor's current controls.
-        modebar=QFrame(); self.modebar=modebar; modebar.setObjectName('modebar')
-        mode_layout=QHBoxLayout(modebar); mode_layout.setContentsMargins(7,3,7,3); mode_layout.setSpacing(3)
-        mode_layout.addWidget(label('ARBEITSBEREICH','eyebrow'))
-        mode_layout.addWidget(timeline_separator())
-        self.mode_buttons=[]
-        def mode_tab(text, callback=None, active=False, tooltip=''):
-            tab=QPushButton(text); tab.setObjectName('modeTabActive' if active else 'modeTab')
-            if tooltip: tab.setToolTip(tooltip)
-            self.mode_buttons.append(tab)
-            def activate(checked=False):
-                for other in self.mode_buttons:
-                    other.setObjectName('modeTab')
-                    other.style().unpolish(other); other.style().polish(other); other.update()
-                tab.setObjectName('modeTabActive'); tab.style().unpolish(tab); tab.style().polish(tab); tab.update()
-                if callback: callback()
-            tab.clicked.connect(activate); mode_layout.addWidget(tab)
-            return tab
-        mode_tab('Medien',self.open_media_panel,True,'Medienablage Ã¶ffnen')
-        mode_tab('Bibliothek',self.open_library_panel,tooltip='Starter-Bibliothek mit Sounds, Effekten und Animationen Ã¶ffnen')
-        mode_tab('Audio',self.open_mixer,tooltip='Audio-Mixer Ã¶ffnen')
-        mode_tab('Text',self.add_text,tooltip='Textclip am Spurende anlegen')
-        mode_tab('Sticker',lambda:self.statusBar().showMessage('Sticker-Bereich Â· eigene Medien lassen sich Ã¼ber Import hinzufÃ¼gen'))
-        mode_tab('Effekte',lambda:self.statusBar().showMessage('Effekte findest du rechts im Inspector Â· Presets und Adjustment-Layer sind verfÃ¼gbar'))
-        mode_tab('ÃœbergÃ¤nge',lambda:self.statusBar().showMessage('ÃœbergÃ¤nge findest du rechts im Inspector Â· Clip auswÃ¤hlen'))
-        mode_tab('Filter',lambda:self.statusBar().showMessage('Filter findest du rechts im Inspector Â· Clip auswÃ¤hlen'))
-        mode_layout.addStretch()
-        mode_layout.addWidget(label('LAYOUT','eyebrow'))
-        self.workspace_preset_combo=QComboBox(); self.workspace_preset_combo.setObjectName('workspacePreset')
-        self.workspace_preset_combo.addItem('Schnitt','edit')
-        self.workspace_preset_combo.addItem('Shorts / Reels','shorts')
-        self.workspace_preset_combo.addItem('Audio','audio')
-        self.workspace_preset_combo.addItem('Farbe','color')
-        self.workspace_preset_combo.addItem('Untertitel','captions')
-        self.workspace_preset_combo.setToolTip('Arbeitsbereich fÃ¼r die aktuelle Aufgabe wÃ¤hlen')
-        self.workspace_preset_combo.currentIndexChanged.connect(self.apply_workspace_preset)
-        mode_layout.addWidget(self.workspace_preset_combo)
-        mode_layout.addWidget(label('MODUS','eyebrow'))
-        self.edit_mode_combo=QComboBox(); self.edit_mode_combo.setObjectName('editModeCombo')
-        self.edit_mode_combo.addItem('Einfach','simple'); self.edit_mode_combo.addItem('Pro','pro')
-        self.edit_mode_combo.setToolTip('Einfach zeigt nur die hÃ¤ufigsten Einstellungen Â· Pro zeigt alle Werkzeuge')
-        self.edit_mode_combo.currentIndexChanged.connect(self.set_edit_mode)
-        mode_layout.addWidget(self.edit_mode_combo)
-        self.focus_button=QPushButton('Fokus'); self.focus_button.setObjectName('modeTab'); self.focus_button.setToolTip('Vorschau und Timeline vergrÃ¶ÃŸern Â· Strg+Shift+F')
-        self.focus_button.clicked.connect(self.toggle_focus_mode); mode_layout.addWidget(self.focus_button)
-        outer.addWidget(modebar)
-
-        vertical=QSplitter(Qt.Vertical); self.vertical=vertical; top=QSplitter(Qt.Horizontal); self.top=top; top.setChildrenCollapsible(False)
-        # Let the vertical splitter decide the height. The default Preferred
-        # policy inherits the tall media-panel size hint and blocks the handle.
-        top.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
-        media,ml=panel(); self.media_panel=media; media.setObjectName('mediaPanel'); media.setMinimumWidth(250)
-        media_header=QHBoxLayout(); media_header.setContentsMargins(0,0,0,0); media_header.setSpacing(6)
-        self.media_heading=label('MEDIEN','heading'); media_header.addWidget(self.media_heading); media_header.addStretch()
-        self.media_count=label('0 Medien','muted'); media_header.addWidget(self.media_count); ml.addLayout(media_header)
-        import_row=QHBoxLayout(); import_row.setContentsMargins(0,0,0,0); import_row.setSpacing(5)
-        import_row.addWidget(button('+ Medien importieren',self.import_dialog,True),1)
-        import_more=QToolButton(); import_more.setText('â‹¯'); import_more.setObjectName('panelMenuButton'); import_more.setToolTip('Weitere Importoptionen'); import_more.setAccessibleName('Weitere Importoptionen')
-        import_menu=QMenu(self); import_menu.addAction('Bildsequenz importieren',self.import_sequence_dialog); import_menu.addAction('Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog); import_menu.addAction('Automatische Untertitel',self.automatic_subtitle_dialog)
-        import_more.setMenu(import_menu); import_more.setPopupMode(QToolButton.InstantPopup); import_row.addWidget(import_more)
-        self.media_import_container=QWidget(); self.media_import_container.setLayout(import_row); ml.addWidget(self.media_import_container)
-        self.media_search=QLineEdit(); self.media_search.setPlaceholderText('Medien durchsuchen â€¦'); self.media_search.setClearButtonEnabled(True)
-        self.media_search.setToolTip('Suche nach Dateiname, Pfad oder Medientyp')
-        ml.addWidget(self.media_search)
-        media_filter_row=QHBoxLayout(); media_filter_row.setContentsMargins(0,0,0,0); media_filter_row.setSpacing(6)
-        self.media_filter=QComboBox()
-        for value,title in (('all','Alle'),('video','Video'),('audio','Audio'),('image','Bilder'),('sequence','Sequenzen'),('offline','Offline')):
-            self.media_filter.addItem(title,value)
-        self.media_filter.setToolTip('Medien nach Typ oder Offline-Status filtern')
-        self.media_sort=QComboBox()
-        for value,title in (('order','Import-Reihenfolge'),('name','Name'),('type','Typ'),('duration','Dauer')):
-            self.media_sort.addItem(title,value)
-        self.media_sort.setToolTip('Reihenfolge der Medienablage')
-        media_filter_row.addWidget(self.media_filter,1); media_filter_row.addWidget(self.media_sort,1)
-        self.media_filter_container=QWidget(); self.media_filter_container.setLayout(media_filter_row); ml.addWidget(self.media_filter_container)
-        library_tools=QHBoxLayout(); library_tools.setContentsMargins(0,0,0,0); library_tools.setSpacing(5)
-        self.media_view_combo=QComboBox(); self.media_view_combo.setObjectName('mediaViewCombo')
-        self.media_view_combo.addItem('Karten','cards'); self.media_view_combo.addItem('Liste','list')
-        self.media_view_combo.setToolTip('Medienablage als Karten oder kompakte Liste anzeigen')
-        self.media_view_combo.currentIndexChanged.connect(self.set_media_view)
-        self.media_favorites_only=QCheckBox('â˜… Favoriten'); self.media_favorites_only.setObjectName('mediaFavorites')
-        self.media_favorites_only.setToolTip('Nur markierte Medien anzeigen')
-        self.media_favorites_only.toggled.connect(lambda *_: self.refresh_media())
-        self.media_favorite_button=QToolButton(); self.media_favorite_button.setObjectName('mediaFavoriteButton'); self.media_favorite_button.setText('â˜†'); self.media_favorite_button.setToolTip('AusgewÃ¤hltes Medium als Favorit markieren'); self.media_favorite_button.setAccessibleName('Medium als Favorit markieren'); self.media_favorite_button.clicked.connect(self.toggle_asset_favorite)
-        library_tools.addWidget(self.media_view_combo); library_tools.addWidget(self.media_favorites_only); library_tools.addStretch(); library_tools.addWidget(self.media_favorite_button)
-        self.media_tools_container=QWidget(); self.media_tools_container.setLayout(library_tools); ml.addWidget(self.media_tools_container)
-        self.media_hint=label('Ziehen zum EinfÃ¼gen Â· Doppelklick zum AnhÃ¤ngen','subtle'); self.media_hint.setWordWrap(True); ml.addWidget(self.media_hint)
-        self.media_empty_hint=label('Noch keine Medien\nImportiere ein Video, Audio oder Bild, um zu starten.','emptyState'); self.media_empty_hint.setAlignment(Qt.AlignCenter); self.media_empty_hint.setWordWrap(True); self.media_empty_hint.setVisible(False); ml.addWidget(self.media_empty_hint)
-        self.media_list=MediaList(); self.media_list.setObjectName('mediaList'); self.media_list.setViewMode(QListWidget.IconMode)
-        self.media_list.setResizeMode(QListWidget.Adjust); self.media_list.setWrapping(True); self.media_list.setSpacing(4)
-        self.media_list.setIconSize(QSize(124,72)); self.media_list.setGridSize(QSize(150,108)); self.media_list.setUniformItemSizes(True)
-        self.media_list.itemDoubleClicked.connect(lambda _:self.add_selected_asset())
-        self.media_list.currentItemChanged.connect(lambda *_: self.update_media_favorite_button())
-        self.media_search.textChanged.connect(self.refresh_media); self.media_filter.currentIndexChanged.connect(self.refresh_media); self.media_sort.currentIndexChanged.connect(self.refresh_media)
-        ml.addWidget(self.media_list,1)
-        self.add_timeline_button=button('ï¼‹ Zur Timeline hinzufÃ¼gen',self.add_selected_asset); ml.addWidget(self.add_timeline_button)
-        self.asset_library_panel=AssetLibraryPanel(); self.asset_library_panel.hide()
-        self.asset_library_panel.use_requested.connect(self.use_library_item)
-        self.asset_library_panel.preview_requested.connect(self.preview_library_item)
-        ml.addWidget(self.asset_library_panel,1)
-        self._media_controls=(self.media_import_container,self.media_search,self.media_filter_container,
-                              self.media_tools_container,self.media_hint,self.media_empty_hint,
-                              self.media_list,self.add_timeline_button)
-        top.addWidget(media)
-        preview,pl=panel(); self.preview_panel=preview; preview.setObjectName('previewPanel')
-        preview_header=QHBoxLayout(); preview_header.setContentsMargins(0,0,0,0)
-        preview_header.addWidget(label('VORSCHAU','heading')); preview_header.addStretch(); preview_header.addWidget(label('TIMELINE MIX','statusPill')); pl.addLayout(preview_header)
-        self.preview_status=label('Timeline-Vorschau wird beim ersten Abspielen berechnet.','muted'); self.preview_status.setWordWrap(True); pl.addWidget(self.preview_status)
-        preview_options=QHBoxLayout(); self.live_preview_box=QCheckBox('Live-Vorschau'); self.live_preview_box.setChecked(True); self.live_preview_box.setToolTip('Nach einer Ã„nderung automatisch eine neue Vorschau berechnen')
-        self.quick_preview_box=QCheckBox('Schnellvorschau'); self.quick_preview_box.setChecked(True); self.quick_preview_box.setToolTip('Niedrigere AuflÃ¶sung und schnelleres Rendering fÃ¼r die Vorschau')
-        self.gpu_preview_box=QCheckBox('GPU-Decoding'); self.gpu_preview_box.setChecked(self.gpu_preview_info['available']); self.gpu_preview_box.setEnabled(self.gpu_preview_info['available'])
-        self.gpu_preview_box.setToolTip(self.gpu_preview_info['label']+' Â· fÃ¤llt sonst automatisch auf CPU zurÃ¼ck')
-        self.live_preview_box.toggled.connect(self.preview_option_changed); self.quick_preview_box.toggled.connect(self.preview_option_changed); self.gpu_preview_box.toggled.connect(self.preview_option_changed)
-        preview_options.addWidget(self.live_preview_box); preview_options.addWidget(self.quick_preview_box); preview_options.addWidget(self.gpu_preview_box); preview_options.addStretch()
-        performance_options=QHBoxLayout(); self.proxy_box=QCheckBox('Proxy-Vorschau'); self.proxy_box.setEnabled(False)
-        self.proxy_box.setToolTip('Erzeugt lokale, kleinere Vorschau-Dateien. Bei sehr groÃŸen Quellen startet Framecut die Schnellvorschau automatisch im Hintergrund; Originale bleiben fÃ¼r den Export aktiv.')
-        self.proxy_profile_combo=QComboBox()
-        for value,info in PROXY_PROFILES.items(): self.proxy_profile_combo.addItem(info['label'],value)
-        self.proxy_profile_combo.setCurrentIndex(self.proxy_profile_combo.findData(self.proxy_profile)); self.proxy_profile_combo.setEnabled(False)
-        self.proxy_profile_combo.setToolTip('QualitÃ¤t der Proxy-Dateien: 360p ist schneller, 720p detailreicher')
-        self.cache_status=label('Cache wird automatisch begrenzt','muted'); self.cache_clear_button=button('Cache leeren',self.clear_cache)
-        self.proxy_box.toggled.connect(self.proxy_toggled); self.proxy_profile_combo.currentIndexChanged.connect(self.proxy_profile_changed)
-        performance_options.addWidget(self.proxy_box); performance_options.addWidget(label('Profil','muted')); performance_options.addWidget(self.proxy_profile_combo); performance_options.addStretch(); performance_options.addWidget(self.cache_status); performance_options.addWidget(self.cache_clear_button)
-        self.video_stack=QStackedWidget(); self.video_stack.setObjectName('previewCanvas'); self.video_stack.setMinimumSize(330,190)
-        self.placeholder=label('Dein Film beginnt hier.\n\nMedien importieren â†’ in die Timeline ziehen', 'muted')
-        self.placeholder.setAlignment(Qt.AlignCenter); self.video_stack.addWidget(self.placeholder)
-        self.video=VideoView(); self.player.setVideoSink(self.video.sink); self.video_stack.addWidget(self.video)
-        pl.addWidget(self.video_stack,1)
-        self.seek=QSlider(Qt.Horizontal); self.seek.setRange(0,10000); self.seek.sliderMoved.connect(self.seek_slider); pl.addWidget(self.seek)
-        controls=QHBoxLayout(); self.play_button=button('â–¶ Timeline',self.toggle_play); controls.addWidget(self.play_button)
-        controls.addWidget(button('Clip ansehen',self.source_preview)); controls.addStretch()
-        self.cinema_button=button('Vollbild',self.toggle_cinema_preview); self.cinema_button.setIcon(line_icon('view-fullscreen')); self.cinema_button.setObjectName('iconButton'); controls.addWidget(self.cinema_button)
-        self.time_label=label('00:00.0 / 00:00.0','muted'); controls.addWidget(self.time_label); pl.addLayout(controls)
-        source_controls=QHBoxLayout(); source_controls.setContentsMargins(0,0,0,0); source_controls.setSpacing(4)
-        self.source_range_label=label('Quelle: Clip ansehen fÃ¼r In/Out','muted'); self.source_range_label.setObjectName('sourceRangeLabel'); source_controls.addWidget(self.source_range_label,1)
-        self.source_in_button=timeline_tool_button('I','Quell-In am aktuellen Quellbild setzen Â· I',self.set_source_in,object_name='sourceToolButton')
-        self.source_out_button=timeline_tool_button('O','Quell-Out am aktuellen Quellbild setzen Â· O',self.set_source_out,object_name='sourceToolButton')
-        self.source_clear_button=timeline_tool_button('Ã—','Quell-In/Out auf den gesamten Clip zurÃ¼cksetzen',self.clear_source_marks,object_name='sourceToolDanger')
-        self.source_insert_button=timeline_tool_button('â†³','Markierten Quellbereich am Abspielkopf einfÃ¼gen und spÃ¤tere Clips verschieben',self.insert_source_range,'insert-object',object_name='sourceToolButton')
-        self.source_overwrite_button=timeline_tool_button('â–£','Markierten Quellbereich am Abspielkopf Ã¼berschreiben',self.overwrite_source_range,'document-save-as',object_name='sourceToolButton')
-        for widget in (self.source_in_button,self.source_out_button,self.source_clear_button,self.source_insert_button,self.source_overwrite_button): source_controls.addWidget(widget)
-        source_bar=QFrame(); source_bar.setObjectName('previewSubbar'); source_bar.setLayout(source_controls); pl.addWidget(source_bar)
-        work_controls=QHBoxLayout(); work_controls.setContentsMargins(0,0,0,0); work_controls.setSpacing(4)
-        self.work_range_label=label('Arbeitsbereich: gesamte Timeline','muted'); self.work_range_label.setObjectName('sourceRangeLabel'); work_controls.addWidget(self.work_range_label,1)
-        self.work_in_button=timeline_tool_button('I','Arbeitsbereich-In am Abspielkopf setzen Â· Strg+Alt+I',self.set_work_in,object_name='sourceToolButton')
-        self.work_out_button=timeline_tool_button('O','Arbeitsbereich-Out am Abspielkopf setzen Â· Strg+Alt+O',self.set_work_out,object_name='sourceToolButton')
-        self.work_clear_button=timeline_tool_button('Ã—','Arbeitsbereich lÃ¶schen',self.clear_work_area,object_name='sourceToolDanger')
-        for widget in (self.work_in_button,self.work_out_button,self.work_clear_button): work_controls.addWidget(widget)
-        work_bar=QFrame(); work_bar.setObjectName('previewSubbar'); work_bar.setLayout(work_controls); pl.addWidget(work_bar)
-        preview_tools=QFrame(); self.preview_tools=preview_tools; preview_tools.setObjectName('previewToolbar')
-        preview_tools_layout=QVBoxLayout(preview_tools); preview_tools_layout.setContentsMargins(8,4,8,4); preview_tools_layout.setSpacing(1)
-        preview_tools_layout.addLayout(preview_options); preview_tools_layout.addLayout(performance_options); pl.addWidget(preview_tools)
-        top.addWidget(preview)
-        inspector,inspector_outer=panel(); self.inspector_panel=inspector; inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
-        inspector_scroll=QScrollArea(); self.inspector_scroll=inspector_scroll; inspector_scroll.setWidgetResizable(True); inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded); inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        inspector_content=QWidget(); il=QVBoxLayout(inspector_content); il.setContentsMargins(0,0,0,0); il.setSpacing(8)
-        inspector_scroll.setWidget(inspector_content); inspector_outer.addWidget(inspector_scroll)
-        inspector_header=QFrame(); inspector_header.setObjectName('inspectorHeader')
-        inspector_header_layout=QVBoxLayout(inspector_header); inspector_header_layout.setContentsMargins(10,8,10,8); inspector_header_layout.setSpacing(2)
-        inspector_header_layout.addWidget(label('INSPECTOR','eyebrow'))
-        self.clip_name=label('Kein Clip ausgewÃ¤hlt','projectTitle'); self.clip_name.setWordWrap(True); inspector_header_layout.addWidget(self.clip_name)
-        il.addWidget(inspector_header)
-
-        # Context actions keep the most common clip operations next to the
-        # selected object. The permanent timeline toolbar stays compact while
-        # this row changes with the current selection.
-        self.context_toolbar=QFrame(); self.context_toolbar.setObjectName('contextToolbar')
-        context_layout=QHBoxLayout(self.context_toolbar); context_layout.setContentsMargins(5,4,5,4); context_layout.setSpacing(2)
-        self.context_split_button=timeline_tool_button('âœ‚','AusgewÃ¤hlten Clip am Abspielkopf teilen Â· S',self.split,'edit-cut',object_name='contextAction')
-        self.context_duplicate_button=timeline_tool_button('â§‰','Auswahl duplizieren Â· Strg+D',self.duplicate_selection,'edit-copy',object_name='contextAction')
-        self.context_reset_button=timeline_tool_button('â†º','Bild- und Effekteinstellungen zurÃ¼cksetzen',self.reset_transform,'view-refresh',object_name='contextAction')
-        self.context_delete_button=timeline_tool_button('âŒ«','Auswahl entfernen Â· Entf',self.remove,'edit-delete',object_name='contextAction')
-        for action in (self.context_split_button,self.context_duplicate_button,self.context_reset_button,self.context_delete_button): context_layout.addWidget(action)
-        context_layout.addStretch(); il.addWidget(self.context_toolbar)
-
-        def inspector_section(title, expanded=True, advanced=False):
-            section=QFrame(); section.setObjectName('inspectorSection')
-            section_layout=QVBoxLayout(section); section_layout.setContentsMargins(0,0,0,0); section_layout.setSpacing(0)
-            toggle=QToolButton(); toggle.setObjectName('inspectorSectionHeader'); toggle.setText(title); toggle.setCheckable(True); toggle.setChecked(expanded); toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow); toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); toggle.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Fixed)
-            body=QFrame(); body.setObjectName('inspectorSectionBody'); body.setVisible(expanded)
-            body_layout=QVBoxLayout(body); body_layout.setContentsMargins(10,7,10,10); body_layout.setSpacing(7)
-            toggle.toggled.connect(lambda checked, body=body, toggle=toggle: (body.setVisible(checked), toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)))
-            section_layout.addWidget(toggle); section_layout.addWidget(body); il.addWidget(section)
-            self.inspector_sections.append({'section':section,'advanced':advanced,'toggle':toggle,'body':body})
-            return body_layout
-
-        self.position=QDoubleSpinBox(); self.start=QDoubleSpinBox(); self.end=QDoubleSpinBox()
-        for spin in [self.position,self.start,self.end]: spin.setRange(0,864000); spin.setDecimals(3); spin.setSuffix(' s'); spin.setSingleStep(.1)
-        self.track_combo=QComboBox(); self.volume=QDoubleSpinBox(); self.volume.setRange(0,100); self.volume.setDecimals(0); self.volume.setSuffix(' %')
-        self.audio_noise_reduction=QDoubleSpinBox(); self.audio_noise_reduction.setRange(0,30); self.audio_noise_reduction.setDecimals(1); self.audio_noise_reduction.setSingleStep(1); self.audio_noise_reduction.setSuffix(' dB')
-        self.audio_eq_low=QDoubleSpinBox(); self.audio_eq_mid=QDoubleSpinBox(); self.audio_eq_high=QDoubleSpinBox()
-        for spin in (self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high): spin.setRange(-12,12); spin.setDecimals(1); spin.setSingleStep(1); spin.setSuffix(' dB')
-        self.audio_compressor_enabled=QCheckBox('Kompressor aktiv')
-        self.audio_compressor_threshold=QDoubleSpinBox(); self.audio_compressor_threshold.setRange(-60,0); self.audio_compressor_threshold.setDecimals(1); self.audio_compressor_threshold.setSingleStep(1); self.audio_compressor_threshold.setSuffix(' dB')
-        self.audio_compressor_ratio=QDoubleSpinBox(); self.audio_compressor_ratio.setRange(1,20); self.audio_compressor_ratio.setDecimals(1); self.audio_compressor_ratio.setSingleStep(.5); self.audio_compressor_ratio.setSuffix('Ã—')
-        self.audio_ducking=QDoubleSpinBox(); self.audio_ducking.setRange(0,100); self.audio_ducking.setDecimals(0); self.audio_ducking.setSuffix(' %')
-        self.audio_voice_isolation=QDoubleSpinBox(); self.audio_voice_isolation.setRange(0,100); self.audio_voice_isolation.setDecimals(0); self.audio_voice_isolation.setSuffix(' %')
-        self.audio_voice_isolation.setToolTip('Lokale Sprachisolierung: Dialog hervorheben und Hintergrund reduzieren')
-        self.audio_normalize=QCheckBox('Loudness normalisieren')
-        self.audio_normalize_target=QDoubleSpinBox(); self.audio_normalize_target.setRange(-30,-5); self.audio_normalize_target.setDecimals(1); self.audio_normalize_target.setSingleStep(1); self.audio_normalize_target.setSuffix(' LUFS')
-        self.audio_normalize_target.setToolTip('Zielpegel fÃ¼r diesen Clip; -16 LUFS ist ein guter Allround-Wert.')
-        self.audio_channel_mode=QComboBox()
-        channel_titles={'stereo':'Stereo','mono':'Mono','left':'Linker Kanal auf Stereo','right':'Rechter Kanal auf Stereo'}
-        for value in AUDIO_CHANNEL_MODES: self.audio_channel_mode.addItem(channel_titles[value],value)
-        self.audio_pan=QDoubleSpinBox(); self.audio_pan.setRange(-100,100); self.audio_pan.setDecimals(0); self.audio_pan.setSuffix(' %')
-        self.speed=QDoubleSpinBox(); self.speed.setRange(.25,4); self.speed.setDecimals(2); self.speed.setSingleStep(.25); self.speed.setSuffix('Ã—')
-        self.freeze_enabled=QCheckBox('Letztes Bild halten')
-        self.freeze_duration=QDoubleSpinBox(); self.freeze_duration.setRange(0,600); self.freeze_duration.setDecimals(2); self.freeze_duration.setSingleStep(.1); self.freeze_duration.setSuffix(' s')
-        self.reverse_clip=QCheckBox('RÃ¼ckwÃ¤rts abspielen')
-        self.fade_in=QDoubleSpinBox(); self.fade_in.setRange(0,60); self.fade_in.setDecimals(2); self.fade_in.setSingleStep(.1); self.fade_in.setSuffix(' s')
-        self.fade_out=QDoubleSpinBox(); self.fade_out.setRange(0,60); self.fade_out.setDecimals(2); self.fade_out.setSingleStep(.1); self.fade_out.setSuffix(' s')
-        self.text_value=QLineEdit(); self.text_value.setPlaceholderText('Text eingeben')
-        self.text_size=QSpinBox(); self.text_size.setRange(8,240); self.text_size.setValue(56); self.text_size.setSuffix(' px')
-        self.text_color=QLineEdit('#ffffff'); self.text_color.setMaxLength(7); self.text_color.setPlaceholderText('#ffffff')
-        self.text_palette_button=QPushButton('Palette'); self.text_palette_button.clicked.connect(self.choose_text_color)
-        self.text_font=QFontComboBox(); self.text_font.setCurrentFont(QFont('DejaVu Sans'))
-        self.text_font.setToolTip('Schriftfamilie fÃ¼r den Textclip')
-        self.text_bold=QCheckBox('Fett'); self.text_italic=QCheckBox('Kursiv')
-        self.text_outline_width=QDoubleSpinBox(); self.text_outline_width.setRange(0,20); self.text_outline_width.setDecimals(0); self.text_outline_width.setSuffix(' px')
-        self.text_outline_color=QLineEdit('#000000'); self.text_outline_color.setMaxLength(7); self.text_outline_color.setPlaceholderText('#000000')
-        self.text_shadow_size=QDoubleSpinBox(); self.text_shadow_size.setRange(0,40); self.text_shadow_size.setDecimals(0); self.text_shadow_size.setSuffix(' px')
-        self.text_shadow_color=QLineEdit('#000000'); self.text_shadow_color.setMaxLength(7); self.text_shadow_color.setPlaceholderText('#000000')
-        self.text_background_enabled=QCheckBox('Hintergrund anzeigen'); self.text_background_enabled.setChecked(True)
-        self.text_background_color=QLineEdit('#000000'); self.text_background_color.setMaxLength(7); self.text_background_color.setPlaceholderText('#000000')
-        self.text_background_opacity=QDoubleSpinBox(); self.text_background_opacity.setRange(0,100); self.text_background_opacity.setDecimals(0); self.text_background_opacity.setValue(35); self.text_background_opacity.setSuffix(' %')
-        self.text_background_padding=QSpinBox(); self.text_background_padding.setRange(0,80); self.text_background_padding.setValue(16); self.text_background_padding.setSuffix(' px')
-        self.text_animation=QComboBox()
-        for title,value in [('Keine','none'),('Ein-/Ausblenden','fade'),('Von links','slide_left'),('Von rechts','slide_right'),('Von oben','slide_up'),('Von unten','slide_down')]: self.text_animation.addItem(title,value)
-        self.text_animation_duration=QDoubleSpinBox(); self.text_animation_duration.setRange(.05,10); self.text_animation_duration.setDecimals(2); self.text_animation_duration.setSingleStep(.05); self.text_animation_duration.setSuffix(' s')
-        self.text_style_preset=QComboBox()
-        for title,value in [('Titel','title'),('Untertitel','subtitle'),('Lower Third','lower_third')]: self.text_style_preset.addItem(title,value)
-        self.text_style_apply_button=button('Stil anwenden',self.apply_text_style_preset)
-        self.text_x=QDoubleSpinBox(); self.text_x.setRange(0,100); self.text_x.setDecimals(1); self.text_x.setSuffix(' %')
-        self.text_y=QDoubleSpinBox(); self.text_y.setRange(0,100); self.text_y.setDecimals(1); self.text_y.setSuffix(' %')
-        self.transform_scale=QDoubleSpinBox(); self.transform_scale.setRange(.1,4); self.transform_scale.setDecimals(2); self.transform_scale.setSingleStep(.1); self.transform_scale.setSuffix('Ã—')
-        self.transform_x=QDoubleSpinBox(); self.transform_x.setRange(0,100); self.transform_x.setDecimals(1); self.transform_x.setSuffix(' %')
-        self.transform_y=QDoubleSpinBox(); self.transform_y.setRange(0,100); self.transform_y.setDecimals(1); self.transform_y.setSuffix(' %')
-        self.rotation=QDoubleSpinBox(); self.rotation.setRange(-360,360); self.rotation.setDecimals(1); self.rotation.setSingleStep(5); self.rotation.setSuffix('Â°')
-        self.crop_left=QDoubleSpinBox(); self.crop_top=QDoubleSpinBox(); self.crop_right=QDoubleSpinBox(); self.crop_bottom=QDoubleSpinBox()
-        for spin in (self.crop_left,self.crop_top,self.crop_right,self.crop_bottom):
-            spin.setRange(0,95); spin.setDecimals(1); spin.setSingleStep(1); spin.setSuffix(' %')
-        self.flip_horizontal=QCheckBox('Horizontal'); self.flip_vertical=QCheckBox('Vertikal')
-        self.brightness=QDoubleSpinBox(); self.brightness.setRange(-1,1); self.brightness.setDecimals(2); self.brightness.setSingleStep(.05)
-        self.contrast=QDoubleSpinBox(); self.contrast.setRange(0,3); self.contrast.setDecimals(2); self.contrast.setSingleStep(.1); self.contrast.setSuffix('Ã—')
-        self.saturation=QDoubleSpinBox(); self.saturation.setRange(0,3); self.saturation.setDecimals(2); self.saturation.setSingleStep(.1); self.saturation.setSuffix('Ã—')
-        self.color_exposure=QDoubleSpinBox(); self.color_exposure.setRange(-3,3); self.color_exposure.setDecimals(2); self.color_exposure.setSingleStep(.1); self.color_exposure.setSuffix(' EV')
-        self.color_temperature=QDoubleSpinBox(); self.color_temperature.setRange(-100,100); self.color_temperature.setDecimals(0); self.color_temperature.setSingleStep(5); self.color_temperature.setSuffix(' %')
-        self.color_tint=QDoubleSpinBox(); self.color_tint.setRange(-100,100); self.color_tint.setDecimals(0); self.color_tint.setSingleStep(5); self.color_tint.setSuffix(' %')
-        self.color_vibrance=QDoubleSpinBox(); self.color_vibrance.setRange(-100,100); self.color_vibrance.setDecimals(0); self.color_vibrance.setSuffix(' %')
-        self.color_wheel_spins={}
-        for wheel in ('lift','gamma','gain'):
-            for channel in ('r','g','b'):
-                spin=QDoubleSpinBox(); spin.setRange(-100,100); spin.setDecimals(0); spin.setSingleStep(5); spin.setSuffix(' %')
-                self.color_wheel_spins[f'color_{wheel}_{channel}']=spin
-                setattr(self, f'color_{wheel}_{channel}', spin)
-        self.filter_preset=QComboBox()
-        for title,value in [('Kein Filter','none'),('Vivid','vivid'),('Warm','warm'),('Cool','cool'),('Cinematic','cinematic'),('Vintage','vintage'),('Noir','noir')]: self.filter_preset.addItem(title,value)
-        self.lut_path=QLineEdit(); self.lut_path.setPlaceholderText('Optional: .cube / .3dl LUT')
-        self.lut_browse_button=QPushButton('LUT â€¦'); self.lut_browse_button.clicked.connect(self.choose_lut)
-        self.opacity=QDoubleSpinBox(); self.opacity.setRange(0,100); self.opacity.setDecimals(0); self.opacity.setSuffix(' %')
-        self.blur=QDoubleSpinBox(); self.blur.setRange(0,20); self.blur.setDecimals(1); self.blur.setSingleStep(.5); self.blur.setSuffix(' Ïƒ')
-        self.sharpen=QDoubleSpinBox(); self.sharpen.setRange(0,5); self.sharpen.setDecimals(1); self.sharpen.setSingleStep(.25); self.sharpen.setSuffix('Ã—')
-        self.effect_preset=QComboBox()
-        for title,value in [('Clean / Manuell','clean'),('Cinematic','cinematic'),('Dream','dream'),('Noir','noir'),('Vivid','vivid'),('Soft Focus','soft_focus')]:
-            self.effect_preset.addItem(title,value)
-        self.effect_preset_apply_button=button('Preset anwenden',self.apply_effect_preset)
-        self.stabilization=QDoubleSpinBox(); self.stabilization.setRange(0,100); self.stabilization.setDecimals(0); self.stabilization.setSuffix(' %')
-        self.stabilization.setToolTip('Lokale Deshake-Stabilisierung. HÃ¶here Werte suchen stÃ¤rker, kÃ¶nnen aber Bildrand verÃ¤ndern.')
-        self.background_removal_enabled=QCheckBox('Freistellung verwenden')
-        self.background_remove_button=button('Hintergrund entfernen',self.start_background_removal)
-        self.background_clear_button=button('Freistellung zurÃ¼cksetzen',self.clear_background_removal)
-        self.background_remove_status=label('Noch keine Freistellung erzeugt.','muted'); self.background_remove_status.setWordWrap(True)
-        self.track_motion_button=button('Motion-Tracking starten',self.start_motion_tracking)
-        self.mask_track_button=button('Bezier-Maske verfolgen',self.start_mask_tracking)
-        self.clear_tracking_button=button('Tracking lÃ¶schen',self.clear_motion_tracking)
-        self.tracking_status=label('Kein Tracking vorhanden.','muted'); self.tracking_status.setWordWrap(True)
-        self.auto_reframe_enabled=QCheckBox('Auto-Reframe verwenden')
-        self.auto_reframe_format=QComboBox()
-        for value in AUTO_REFRAME_FORMATS:
-            self.auto_reframe_format.addItem(AUTO_REFRAME_FORMAT_LABELS[value],value)
-        self.auto_reframe_button=button('Auto-Reframe analysieren',self.start_auto_reframe)
-        self.auto_reframe_clear_button=button('Reframe lÃ¶schen',self.clear_auto_reframe)
-        self.auto_reframe_status=label('Noch keine Auto-Reframe-Analyse.','muted'); self.auto_reframe_status.setWordWrap(True)
-        self.object_removal_enabled=QCheckBox('Objekt im Bereich entfernen')
-        self.chroma_key_enabled=QCheckBox('Greenscreen aktiv')
-        self.chroma_key_color=QLineEdit('#00ff00'); self.chroma_key_color.setMaxLength(7); self.chroma_key_color.setPlaceholderText('#00ff00')
-        self.chroma_key_similarity=QDoubleSpinBox(); self.chroma_key_similarity.setRange(0,100); self.chroma_key_similarity.setDecimals(0); self.chroma_key_similarity.setSuffix(' %')
-        self.chroma_key_blend=QDoubleSpinBox(); self.chroma_key_blend.setRange(0,100); self.chroma_key_blend.setDecimals(0); self.chroma_key_blend.setSuffix(' %')
-        self.mask_type=QComboBox()
-        for title,value in [('Keine Maske','none'),('Rechteck','rectangle'),('Ellipse','ellipse'),('Bezier / Freiform','bezier')]: self.mask_type.addItem(title,value)
-        self.mask_type.currentIndexChanged.connect(self.mask_type_changed)
-        self.mask_x=QDoubleSpinBox(); self.mask_y=QDoubleSpinBox(); self.mask_width=QDoubleSpinBox(); self.mask_height=QDoubleSpinBox(); self.mask_feather=QDoubleSpinBox()
-        for spin in (self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather): spin.setRange(0,100); spin.setDecimals(1); spin.setSuffix(' %')
-        self.mask_width.setValue(100); self.mask_height.setValue(100)
-        self.mask_points=QLineEdit(); self.mask_points.setPlaceholderText('10,10; 90,10; 90,90; 10,90')
-        self.mask_points.setToolTip('Bezier-Anker als Prozentwerte eingeben: x,y; x,y; â€¦')
-        self.mask_points_apply=button('Punkte Ã¼bernehmen',self.apply_mask_points)
-        self.mask_path_time=QDoubleSpinBox(); self.mask_path_time.setRange(0,864000); self.mask_path_time.setDecimals(2); self.mask_path_time.setSingleStep(.1); self.mask_path_time.setSuffix(' s')
-        self.mask_path_list=QListWidget(); self.mask_path_list.setMaximumHeight(74); self.mask_path_list.setMinimumHeight(36)
-        self.mask_path_set_button=button('Rotoskopie-Punkt setzen',self.set_mask_path_keyframe)
-        self.mask_path_remove_button=button('Rotoskopie-Punkt lÃ¶schen',self.remove_mask_path_keyframe)
-        self.mask_path_list.currentRowChanged.connect(self.mask_path_selected)
-        self.transition_type=QComboBox()
-        for title,value in [('Kein Ãœbergang','none'),('Ãœberblenden','dissolve'),('Slide links','slide_left'),('Slide rechts','slide_right'),('Slide oben','slide_up'),('Slide unten','slide_down'),('Wipe links','wipe_left'),('Wipe rechts','wipe_right'),('Wipe oben','wipe_up'),('Wipe unten','wipe_down'),('Zoom','zoom'),('Dip to Black','dip_to_black'),('Fade to White','fade_white'),('Blur In','blur_in'),('Circle Open','circle_open'),('Circle Close','circle_close'),('Radial','radial'),('Pixelize','pixelize'),('Smooth links','smooth_left'),('Smooth rechts','smooth_right'),('Smooth oben','smooth_up'),('Smooth unten','smooth_down'),('Cover links','cover_left'),('Cover rechts','cover_right'),('Cover oben','cover_up'),('Cover unten','cover_down')]: self.transition_type.addItem(title,value)
-        self.transition_duration=QDoubleSpinBox(); self.transition_duration.setRange(0,30); self.transition_duration.setDecimals(2); self.transition_duration.setSingleStep(.1); self.transition_duration.setSuffix(' s')
-        self.keyframe_time=QDoubleSpinBox(); self.keyframe_time.setRange(0,864000); self.keyframe_time.setDecimals(2); self.keyframe_time.setSingleStep(.1); self.keyframe_time.setSuffix(' s')
-        self.keyframe_curve=QComboBox()
-        for value in KEYFRAME_CURVES: self.keyframe_curve.addItem(KEYFRAME_CURVE_LABELS[value],value)
-        self.keyframe_list=QListWidget(); self.keyframe_list.setObjectName('keyframeList'); self.keyframe_list.setMaximumHeight(96); self.keyframe_list.setMinimumHeight(42)
-        self.keyframe_set_button=button('Keyframe setzen / aktualisieren',self.set_keyframe)
-        self.keyframe_remove_button=button('Keyframe lÃ¶schen',self.remove_keyframe)
-        self.keyframe_list.currentRowChanged.connect(self.keyframe_selected)
-        self.keyframe_graph_property=QComboBox()
-        for title,value in [('Zoom','scale'),('Bild X','x'),('Bild Y','y'),('Rotation','rotation'),('Deckkraft','opacity'),('UnschÃ¤rfe','blur')]:
-            self.keyframe_graph_property.addItem(title,value)
-        self.keyframe_graph=KeyframeGraphWidget()
-        self.keyframe_graph_property.currentIndexChanged.connect(lambda *_: self.refresh_keyframe_graph(self.current_clip()))
-        self.keyframe_graph.point_moved.connect(self.graph_keyframe_moved)
-        self.keyframe_graph.point_added.connect(self.graph_keyframe_added)
-        self.keyframe_graph.point_selected.connect(self.graph_keyframe_selected)
-        self.keyframe_graph.drag_started.connect(self.graph_keyframe_drag_started)
-        self.keyframe_graph.drag_finished.connect(self.graph_keyframe_drag_finished)
-        self.volume_keyframe_time=QDoubleSpinBox(); self.volume_keyframe_time.setRange(0,864000); self.volume_keyframe_time.setDecimals(2); self.volume_keyframe_time.setSingleStep(.1); self.volume_keyframe_time.setSuffix(' s')
-        self.volume_keyframe_curve=QComboBox()
-        for value in KEYFRAME_CURVES: self.volume_keyframe_curve.addItem(KEYFRAME_CURVE_LABELS[value],value)
-        self.volume_keyframe_list=QListWidget(); self.volume_keyframe_list.setMaximumHeight(96); self.volume_keyframe_list.setMinimumHeight(42)
-        self.volume_keyframe_set_button=button('LautstÃ¤rke setzen / aktualisieren',self.set_volume_keyframe)
-        self.volume_keyframe_remove_button=button('LautstÃ¤rke-Keyframe lÃ¶schen',self.remove_volume_keyframe)
-        self.volume_keyframe_list.currentRowChanged.connect(self.volume_keyframe_selected)
-        self.speed_ramp_time=QDoubleSpinBox(); self.speed_ramp_time.setRange(0,864000); self.speed_ramp_time.setDecimals(2); self.speed_ramp_time.setSingleStep(.1); self.speed_ramp_time.setSuffix(' s')
-        self.speed_ramp_value=QDoubleSpinBox(); self.speed_ramp_value.setRange(.25,4); self.speed_ramp_value.setDecimals(2); self.speed_ramp_value.setSingleStep(.25); self.speed_ramp_value.setSuffix('Ã—')
-        self.speed_ramp_list=QListWidget(); self.speed_ramp_list.setMaximumHeight(96); self.speed_ramp_list.setMinimumHeight(42)
-        self.speed_ramp_set_button=button('Speed-Punkt setzen / aktualisieren',self.set_speed_ramp)
-        self.speed_ramp_remove_button=button('Speed-Punkt lÃ¶schen',self.remove_speed_ramp)
-        self.speed_ramp_list.currentRowChanged.connect(self.speed_ramp_selected)
-        self.beat_analyze_button=button('Beats analysieren',self.start_beat_analysis)
-        self.beat_clear_button=button('Beats lÃ¶schen',self.clear_beat_markers)
-        self.beat_status=label('Keine Beat-Marker vorhanden.','muted'); self.beat_status.setWordWrap(True)
-        self.text_cut_button=button('Textschnitt starten',self.start_text_based_cut)
-        self.text_cut_status=label('Pausen und FÃ¼llwÃ¶rter werden lokal entfernt.','muted'); self.text_cut_status.setWordWrap(True)
-        self.auto_cut_button=button('Beat-/Szenen-Auto-Cut',self.start_auto_cut)
-        self.auto_cut_status=label('Noch kein automatischer Schnitt.','muted'); self.auto_cut_status.setWordWrap(True)
-        self.multicam_sync_button=button('Multi-Kamera synchronisieren',self.sync_multicam)
-        self.multicam_switch_button=button('Als aktive Kamera verwenden',self.switch_multicam_angle)
-        self.multicam_status=label('Keine Multi-Kamera-Gruppe.','muted'); self.multicam_status.setWordWrap(True)
-        def configure_form(layout):
-            layout.setVerticalSpacing(5); layout.setHorizontalSpacing(9)
-            layout.setLabelAlignment(Qt.AlignLeft|Qt.AlignVCenter)
-            layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-            layout.setRowWrapPolicy(QFormLayout.WrapLongRows)
-            return layout
-
-        clip_form=configure_form(QFormLayout())
-        for name,widget in [('Spur',self.track_combo),('Position',self.position),('Quellstart',self.start),('Quellende',self.end)]: clip_form.addRow(name,widget)
-        timing_form=configure_form(QFormLayout())
-        for name,widget in [('Geschwindigkeit',self.speed),('Freeze-Frame',self.freeze_enabled),('Freeze-Dauer',self.freeze_duration),('Reverse',self.reverse_clip),('Einblenden',self.fade_in),('Ausblenden',self.fade_out),('LautstÃ¤rke',self.volume)]: timing_form.addRow(name,widget)
-        text_form=configure_form(QFormLayout())
-        color_row=QHBoxLayout(); color_row.setContentsMargins(0,0,0,0); color_row.setSpacing(5); color_row.addWidget(self.text_color,1); color_row.addWidget(self.text_palette_button)
-        for name,widget in [('Text',self.text_value),('TextgrÃ¶ÃŸe',self.text_size),('Schrift',self.text_font)]: text_form.addRow(name,widget)
-        text_form.addRow('Textfarbe',color_row)
-        for name,widget in [('Text X',self.text_x),('Text Y',self.text_y)]: text_form.addRow(name,widget)
-        text_style_form=configure_form(QFormLayout())
-        style_row=QHBoxLayout(); style_row.setContentsMargins(0,0,0,0); style_row.addWidget(self.text_bold); style_row.addWidget(self.text_italic); style_row.addStretch(); text_style_form.addRow('Schnitt',style_row)
-        text_style_form.addRow('Kontur',self.text_outline_width); text_style_form.addRow('Konturfarbe',self.text_outline_color)
-        text_style_form.addRow('Schatten',self.text_shadow_size); text_style_form.addRow('Schattenfarbe',self.text_shadow_color)
-        text_style_form.addRow('Hintergrund',self.text_background_enabled); text_style_form.addRow('Hintergrundfarbe',self.text_background_color)
-        text_style_form.addRow('Hintergrunddeckkraft',self.text_background_opacity); text_style_form.addRow('Hintergrundrand',self.text_background_padding)
-        preset_row=QHBoxLayout(); preset_row.setContentsMargins(0,0,0,0); preset_row.addWidget(self.text_style_preset,1); preset_row.addWidget(self.text_style_apply_button)
-        text_style_form.addRow('Stilvorlage',preset_row)
-        text_style_form.addRow('Animation',self.text_animation); text_style_form.addRow('Anim.-Dauer',self.text_animation_duration)
-        clip_section=inspector_section('CLIP Â· POSITION',True); clip_section.addLayout(clip_form)
-        timing_section=inspector_section('TIMING Â· AUDIO-BASIS',True); timing_section.addLayout(timing_form)
-        text_section=inspector_section('TEXT Â· INHALT UND POSITION',True); text_section.addLayout(text_form)
-        text_style_section=inspector_section('TEXT Â· STIL UND ANIMATION',False); text_style_section.addLayout(text_style_form)
-        transform_form=configure_form(QFormLayout())
-        transform_form.addRow('Zoom',self.transform_scale)
-        transform_form.addRow('Bild X',self.transform_x); transform_form.addRow('Bild Y',self.transform_y)
-        transform_form.addRow('Rotation',self.rotation)
-        transform_form.addRow('Crop links',self.crop_left); transform_form.addRow('Crop oben',self.crop_top)
-        transform_form.addRow('Crop rechts',self.crop_right); transform_form.addRow('Crop unten',self.crop_bottom)
-        flip_row=QHBoxLayout(); flip_row.setContentsMargins(0,0,0,0); flip_row.addWidget(self.flip_horizontal); flip_row.addWidget(self.flip_vertical); flip_row.addStretch()
-        transform_form.addRow('Spiegeln',flip_row)
-        transform_section=inspector_section('BILD Â· TRANSFORMATION',True); transform_section.addLayout(transform_form)
-        audio_form=configure_form(QFormLayout()); audio_form.addRow('RauschunterdrÃ¼ckung',self.audio_noise_reduction)
-        audio_form.addRow('EQ Tiefen',self.audio_eq_low); audio_form.addRow('EQ Mitten',self.audio_eq_mid); audio_form.addRow('EQ HÃ¶hen',self.audio_eq_high)
-        audio_form.addRow('Kompressor',self.audio_compressor_enabled); audio_form.addRow('Kompressor-Schwelle',self.audio_compressor_threshold); audio_form.addRow('Kompressor-Ratio',self.audio_compressor_ratio)
-        audio_form.addRow('Audio-Ducking',self.audio_ducking); audio_form.addRow('Sprachisolierung',self.audio_voice_isolation); audio_form.addRow('KanÃ¤le',self.audio_channel_mode); audio_form.addRow('Panorama',self.audio_pan)
-        audio_form.addRow('Clip-Loudness',self.audio_normalize); audio_form.addRow('Zielpegel',self.audio_normalize_target)
-        beat_buttons=QHBoxLayout(); beat_buttons.setContentsMargins(0,0,0,0); beat_buttons.addWidget(self.beat_analyze_button,1); beat_buttons.addWidget(self.beat_clear_button,1)
-        audio_form.addRow('Beat-Sync',beat_buttons); audio_form.addRow('',self.beat_status)
-        audio_form.addRow('Textschnitt',self.text_cut_button); audio_form.addRow('',self.text_cut_status)
-        auto_cut_row=QHBoxLayout(); auto_cut_row.setContentsMargins(0,0,0,0); auto_cut_row.addWidget(self.auto_cut_button,1)
-        audio_form.addRow('Auto-Cut',auto_cut_row); audio_form.addRow('',self.auto_cut_status)
-        multicam_row=QHBoxLayout(); multicam_row.setContentsMargins(0,0,0,0); multicam_row.addWidget(self.multicam_sync_button,1); multicam_row.addWidget(self.multicam_switch_button,1)
-        audio_form.addRow('Multi-Kamera',multicam_row); audio_form.addRow('',self.multicam_status)
-        audio_section=inspector_section('AUDIO Â· MIX UND SMART TOOLS',False,True); audio_section.addLayout(audio_form)
-        color_form=configure_form(QFormLayout()); color_form.addRow('Helligkeit',self.brightness); color_form.addRow('Kontrast',self.contrast); color_form.addRow('SÃ¤ttigung',self.saturation); color_form.addRow('Filter',self.filter_preset)
-        effect_preset_row=QHBoxLayout(); effect_preset_row.setContentsMargins(0,0,0,0); effect_preset_row.addWidget(self.effect_preset,1); effect_preset_row.addWidget(self.effect_preset_apply_button); color_form.addRow('Effekt-Preset',effect_preset_row)
-        lut_row=QHBoxLayout(); lut_row.setContentsMargins(0,0,0,0); lut_row.addWidget(self.lut_path,1); lut_row.addWidget(self.lut_browse_button); color_form.addRow('LUT',lut_row)
-        color_section=inspector_section('FARBE Â· KORREKTUR',True); color_section.addLayout(color_form)
-        grading_form=configure_form(QFormLayout()); grading_form.addRow('Belichtung',self.color_exposure); grading_form.addRow('Temperatur',self.color_temperature); grading_form.addRow('TÃ¶nung',self.color_tint); grading_form.addRow('Vibrance',self.color_vibrance)
-        for title,wheel in (('Lift / Schatten','lift'),('Gamma / Mitten','gamma'),('Gain / Lichter','gain')):
-            row=QHBoxLayout(); row.setContentsMargins(0,0,0,0)
-            for channel,title_channel in (('r','R'),('g','G'),('b','B')):
-                spin=self.color_wheel_spins[f'color_{wheel}_{channel}']; spin.setToolTip(f'{title} Â· {title_channel}')
-                row.addWidget(spin,1)
-            grading_form.addRow(title,row)
-        grading_section=inspector_section('FARBE Â· 3-WEGE-GRADING',False,True); grading_section.addLayout(grading_form)
-        effects_form=configure_form(QFormLayout()); effects_form.addRow('Deckkraft',self.opacity); effects_form.addRow('UnschÃ¤rfe',self.blur); effects_form.addRow('SchÃ¤rfe',self.sharpen); effects_form.addRow('Stabilisierung',self.stabilization); effects_form.addRow('Greenscreen',self.chroma_key_enabled); effects_form.addRow('Key-Farbe',self.chroma_key_color); effects_form.addRow('Ã„hnlichkeit',self.chroma_key_similarity); effects_form.addRow('Weichheit',self.chroma_key_blend)
-        effects_section=inspector_section('EFFEKTE Â· VIDEO',True); effects_section.addLayout(effects_form)
-        mask_form=configure_form(QFormLayout()); mask_form.addRow('Maskentyp',self.mask_type); mask_form.addRow('Maske X',self.mask_x); mask_form.addRow('Maske Y',self.mask_y); mask_form.addRow('Maskenbreite',self.mask_width); mask_form.addRow('MaskenhÃ¶he',self.mask_height); mask_form.addRow('Maskenweichheit',self.mask_feather)
-        mask_points_row=QHBoxLayout(); mask_points_row.setContentsMargins(0,0,0,0); mask_points_row.addWidget(self.mask_points,1); mask_points_row.addWidget(self.mask_points_apply); mask_form.addRow('Bezier-Punkte',mask_points_row)
-        mask_section=inspector_section('MASKEN Â· ROTOSKOPIE',False,True); mask_section.addLayout(mask_form)
-        mask_path_form=configure_form(QFormLayout()); mask_path_form.addRow('Rotoskopie-Zeit',self.mask_path_time)
-        mask_path_buttons=QHBoxLayout(); mask_path_buttons.setContentsMargins(0,0,0,0); mask_path_buttons.addWidget(self.mask_path_set_button,1); mask_path_buttons.addWidget(self.mask_path_remove_button,1)
-        mask_section.addLayout(mask_path_form); mask_section.addLayout(mask_path_buttons); mask_section.addWidget(self.mask_path_list)
-        ai_form=configure_form(QFormLayout())
-        background_buttons=QHBoxLayout(); background_buttons.setContentsMargins(0,0,0,0); background_buttons.addWidget(self.background_remove_button,1); background_buttons.addWidget(self.background_clear_button,1)
-        tracking_buttons=QHBoxLayout(); tracking_buttons.setContentsMargins(0,0,0,0); tracking_buttons.addWidget(self.track_motion_button,1); tracking_buttons.addWidget(self.clear_tracking_button,1)
-        tracking_buttons.addWidget(self.mask_track_button,1)
-        auto_reframe_buttons=QHBoxLayout(); auto_reframe_buttons.setContentsMargins(0,0,0,0); auto_reframe_buttons.addWidget(self.auto_reframe_button,1); auto_reframe_buttons.addWidget(self.auto_reframe_clear_button,1)
-        ai_form.addRow('Hintergrund',background_buttons); ai_form.addRow('',self.background_removal_enabled); ai_form.addRow('',self.background_remove_status)
-        ai_form.addRow('Tracking',tracking_buttons); ai_form.addRow('',self.tracking_status); ai_form.addRow('Objekt entfernen',self.object_removal_enabled)
-        ai_form.addRow('Auto-Reframe',self.auto_reframe_format); ai_form.addRow('',self.auto_reframe_enabled)
-        ai_form.addRow('',auto_reframe_buttons); ai_form.addRow('',self.auto_reframe_status)
-        ai_section=inspector_section('KI-WERKZEUGE Â· LOKAL',False,True); ai_section.addLayout(ai_form)
-        transition_form=configure_form(QFormLayout()); transition_form.addRow('Ãœbergang',self.transition_type); transition_form.addRow('Dauer',self.transition_duration)
-        transition_section=inspector_section('ÃœBERGÃ„NGE',False); transition_section.addLayout(transition_form)
-        keyframe_section=inspector_section('ANIMATION Â· KEYFRAMES UND SPEED-RAMPING',False,True)
-        keyframe_form=configure_form(QFormLayout()); keyframe_form.addRow('Zeit im Clip',self.keyframe_time); keyframe_form.addRow('Kurve',self.keyframe_curve); keyframe_section.addLayout(keyframe_form)
-        keyframe_buttons=QHBoxLayout(); keyframe_buttons.setContentsMargins(0,0,0,0); keyframe_buttons.addWidget(self.keyframe_set_button,1); keyframe_buttons.addWidget(self.keyframe_remove_button,1)
-        keyframe_section.addLayout(keyframe_buttons)
-        keyframe_section.addWidget(self.keyframe_list)
-        graph_form=configure_form(QFormLayout()); graph_form.addRow('Kurve anzeigen',self.keyframe_graph_property); keyframe_section.addLayout(graph_form); keyframe_section.addWidget(self.keyframe_graph)
-        volume_keyframe_form=configure_form(QFormLayout()); volume_keyframe_form.addRow('Zeit im Clip',self.volume_keyframe_time); volume_keyframe_form.addRow('Kurve',self.volume_keyframe_curve); keyframe_section.addLayout(volume_keyframe_form)
-        volume_keyframe_buttons=QHBoxLayout(); volume_keyframe_buttons.setContentsMargins(0,0,0,0); volume_keyframe_buttons.addWidget(self.volume_keyframe_set_button,1); volume_keyframe_buttons.addWidget(self.volume_keyframe_remove_button,1)
-        keyframe_section.addLayout(volume_keyframe_buttons)
-        keyframe_section.addWidget(self.volume_keyframe_list)
-        speed_ramp_form=configure_form(QFormLayout()); speed_ramp_form.addRow('Quellzeit',self.speed_ramp_time); speed_ramp_form.addRow('Geschwindigkeit',self.speed_ramp_value); keyframe_section.addLayout(speed_ramp_form)
-        speed_ramp_buttons=QHBoxLayout(); speed_ramp_buttons.setContentsMargins(0,0,0,0); speed_ramp_buttons.addWidget(self.speed_ramp_set_button,1); speed_ramp_buttons.addWidget(self.speed_ramp_remove_button,1)
-        keyframe_section.addLayout(speed_ramp_buttons)
-        keyframe_section.addWidget(self.speed_ramp_list)
-        actions_section=inspector_section('AKTIONEN',True)
-        actions_section.addWidget(button('Bild zurÃ¼cksetzen',self.reset_transform)); actions_section.addWidget(button('Ãœbernehmen',self.apply_properties,True)); actions_section.addWidget(button('Audio aus Video extrahieren',self.extract_audio))
-        hint=label('Rechtsklick = Aktionen Â· Mitte ziehen = verschieben Â· RÃ¤nder = kÃ¼rzen\nShift = ohne Einrasten Â· Strg-Klick = Mehrfachauswahl Â· Leertaste = Play/Pause','subtle'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
-        top.addWidget(inspector); top.setSizes([310,760,360]); top.setStretchFactor(0,0); top.setStretchFactor(1,1); top.setStretchFactor(2,0); vertical.addWidget(top)
-        bottom,bl=panel(); self.timeline_panel=bottom; bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
-        bar=QHBoxLayout(); bar.setContentsMargins(10,5,10,5); bar.setSpacing(6)
-        bar.addWidget(label('TIMELINE','heading')); bar.addSpacing(2); bar.addWidget(timeline_separator())
-
-        # Keep the primary editing actions visible, but give them enough
-        # hierarchy that the toolbar reads as a toolset instead of a glyph
-        # soup. Less frequent actions live in the two popup groups below.
-        undo_button=timeline_tool_button('â†¶','RÃ¼ckgÃ¤ngig Â· Strg+Z',self.undo,'edit-undo')
-        redo_button=timeline_tool_button('â†·','Wiederholen Â· Strg+Shift+Z',self.redo,'edit-redo')
-        split_button=timeline_tool_button('âœ‚','Am Abspielkopf teilen Â· Strg+B',self.split,'edit-cut')
-        remove_button=timeline_tool_button('âŒ«','Auswahl entfernen Â· Entf',self.remove,'edit-delete',object_name='timelineToolDanger')
-        copy_button=timeline_tool_button('â§‰','Auswahl kopieren Â· Strg+C',self.copy_selection,'edit-copy')
-        paste_button=timeline_tool_button('âŽ˜','EinfÃ¼gen Â· Strg+V',self.paste_selection,'edit-paste')
-        insert_button=timeline_tool_button('â†³','Insert einfÃ¼gen Â· Strg+Shift+V',self.insert_selection,'insert-object')
-        overwrite_button=timeline_tool_button('â–£','Overwrite einfÃ¼gen',self.overwrite_selection,'document-save-as')
-
-        trim_menu=QMenu(self); trim_menu.setTitle('Professionelle Trim-Werkzeuge')
-        trim_menu.addAction('Ripple-In zum Abspielkopf Â· Q',self.ripple_trim_in)
-        trim_menu.addAction('Ripple-Out zum Abspielkopf Â· W',self.ripple_trim_out)
-        trim_menu.addSeparator()
-        trim_menu.addAction('Roll-Schnitt zum Abspielkopf Â· R',self.roll_to_playhead)
-        trim_menu.addSeparator()
-        trim_menu.addAction('Slide links Â· Alt+â†',lambda:self.slide_selected(-1))
-        trim_menu.addAction('Slide rechts Â· Alt+â†’',lambda:self.slide_selected(1))
-        trim_menu.addAction('Slip links Â· Umschalt+Alt+â†',lambda:self.slip_selected(-1))
-        trim_menu.addAction('Slip rechts Â· Umschalt+Alt+â†’',lambda:self.slip_selected(1))
-        trim_button=timeline_menu_button('âŸ·','Professionelle Trim-Werkzeuge',trim_menu,'edit-cut')
-
-        marker_menu=QMenu(self); marker_menu.setTitle('Marker')
-        marker_menu.addAction('Marker hinzufÃ¼gen',lambda:self.add_marker('marker'))
-        marker_menu.addAction('Kapitel hinzufÃ¼gen',lambda:self.add_marker('chapter'))
-        marker_menu.addSeparator(); marker_menu.addAction('Kapitel exportieren â€¦',self.export_chapters)
-        marker_button=timeline_menu_button('âš‘','Marker oder Kapitel hinzufÃ¼gen',marker_menu,'bookmark-new')
-
-        add_menu=QMenu(self); add_menu.setTitle('Timeline-Element hinzufÃ¼gen')
-        add_menu.addAction('Text hinzufÃ¼gen',self.add_text)
-        add_menu.addAction('Adjustment-Layer hinzufÃ¼gen',self.add_adjustment_layer)
-        add_menu.addSeparator()
-        add_menu.addAction('Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog)
-        add_menu.addAction('Automatische Untertitel â€¦',self.automatic_subtitle_dialog)
-        add_button=timeline_menu_button('+','Element hinzufÃ¼gen',add_menu,'list-add')
-
-        more_menu=QMenu(self); more_menu.setTitle('Weitere Timeline-Aktionen')
-        more_menu.addAction('Duplizieren Â· Strg+D',self.duplicate_selection)
-        more_menu.addAction('Ripple lÃ¶schen Â· Strg+Shift+Entf',self.ripple_delete)
-        more_menu.addSeparator()
-        more_menu.addAction('Gruppieren Â· Strg+G',self.group_selection)
-        more_menu.addAction('Gruppe lÃ¶sen Â· Strg+Shift+G',self.ungroup_selection)
-        more_menu.addAction('Compound-Clip erstellen',self.create_compound)
-        more_menu.addAction('Compound-Clip auflÃ¶sen',self.dissolve_compound)
-        more_menu.addSeparator()
-        more_menu.addAction('Multi-Kamera synchronisieren',self.sync_multicam)
-        more_menu.addAction('Audio-Sync fÃ¼r Auswahl',self.sync_audio_selection)
-        more_menu.addAction('Aktive Kamera wechseln',self.switch_multicam_angle)
-        more_menu.addAction('Attribute kopieren Â· Ctrl+Alt+C',self.copy_attributes)
-        more_menu.addAction('Attribute einfÃ¼gen Â· Ctrl+Alt+V',self.paste_attributes)
-        more_menu.addAction('Keyframes kopieren Â· Ctrl+Alt+K',self.copy_keyframes)
-        more_menu.addAction('Keyframes einfÃ¼gen Â· Ctrl+Alt+Shift+K',self.paste_keyframes)
-        more_menu.addSeparator()
-        more_menu.addAction('LÃ¼cken auf aktueller Spur schlieÃŸen',self.close_selected_track_gaps)
-        more_menu.addAction('Standbild am Abspielkopf einfÃ¼gen',self.add_freeze_frame)
-        more_menu.addAction('Aktuelles Bild als PNG speichern',self.start_frame_capture)
-        more_menu.addAction('Textschnitt Â· Pausen/FÃ¼llwÃ¶rter',self.start_text_based_cut)
-        more_menu.addAction('Beat-/Szenen-Auto-Cut',self.start_auto_cut)
-        more_button=timeline_menu_button('â‹¯','Weitere Timeline-Aktionen',more_menu,'view-more')
-
-        bar.addWidget(timeline_tool_group('VERLAUF',[undo_button,redo_button]))
-        bar.addWidget(timeline_tool_group('TRIMMEN',[trim_button]))
-        bar.addWidget(timeline_tool_group('BEARBEITEN',[split_button,remove_button,copy_button,paste_button]))
-        bar.addWidget(timeline_tool_group('EINFÃœGEN',[insert_button,overwrite_button]))
-        bar.addWidget(timeline_tool_group('MARKER',[marker_button]))
-        bar.addWidget(timeline_tool_group('ADD',[add_button]))
-        self.subtitle_export_button=timeline_tool_button('â‡©','Untertitel exportieren',theme_name='document-export')
-        self.subtitle_export_button.clicked.connect(self.export_subtitles)
-        bar.addWidget(timeline_tool_group('EXPORT',[self.subtitle_export_button]))
-        bar.addWidget(timeline_tool_group('MEHR',[more_button]))
-        bar.addStretch()
-        self.snap_box=timeline_tool_button('âŒ','Einrasten ein/aus',toggle=True,theme_name='snap-to-grid')
-        self.snap_box.setChecked(True); self.snap_box.toggled.connect(lambda b:setattr(self.timeline,'snap',b))
-        bar.addWidget(timeline_tool_group('AUSRICHTEN',[self.snap_box]))
-        self.total=label('','muted'); self.total.setObjectName('timelineTotal'); bar.addWidget(self.total); bl.addLayout(bar)
-
-        row=QHBoxLayout(); row.setContentsMargins(10,0,10,6); row.setSpacing(6)
-        self.autosave_label=label('Autosave bereit','muted'); row.addWidget(self.autosave_label); row.addStretch()
-        self.video_tracks=QSpinBox(); self.video_tracks.setRange(1,10); self.video_tracks.setValue(2); self.video_tracks.setToolTip('Anzahl der Video-Spuren'); self.video_tracks.valueChanged.connect(self.track_counts_changed)
-        self.audio_tracks=QSpinBox(); self.audio_tracks.setRange(1,10); self.audio_tracks.setValue(2); self.audio_tracks.setToolTip('Anzahl der Audio-Spuren'); self.audio_tracks.valueChanged.connect(self.track_counts_changed)
-        row.addWidget(timeline_track_group(self.video_tracks,self.audio_tracks))
-        fit_button=timeline_tool_button('â›¶','Timeline einpassen',self.fit_timeline,'view-fullscreen')
-        zoom_icon=timeline_icon_label('âŒ•','Timeline-Zoom')
-        self.zoom_slider=QSlider(Qt.Horizontal); self.zoom_slider.setToolTip('Timeline-Zoom'); self.zoom_slider.setRange(2,200); self.zoom_slider.setValue(60); self.zoom_slider.setFixedWidth(120); self.zoom_slider.valueChanged.connect(self.zoom)
-        row.addWidget(timeline_tool_group('ANSICHT',[fit_button,zoom_icon,self.zoom_slider])); bl.addLayout(row)
-        self.timeline=Timeline(); self.timeline.library_catalog={item.item_id:item for item in library_items()}
-        self.timeline.selection_changed.connect(self.timeline_selection_changed); self.timeline.seek.connect(self.set_playhead)
-        self.timeline.context_requested.connect(self.show_context_menu)
-        self.timeline.track_context_requested.connect(self.show_track_context_menu)
-        self.timeline.marker_context_requested.connect(self.show_marker_context_menu)
-        self.timeline.commit.connect(self.commit_drag); self.timeline.add_asset.connect(self.drop_asset); self.timeline.library_action.connect(self.handle_library_drop); self.timeline.delete_selected.connect(self.remove)
-        self.timeline.track_mute_requested.connect(self.toggle_track_mute); self.timeline.track_lock_requested.connect(self.toggle_track_lock)
-        self.timeline.zoom_request.connect(lambda n:self.zoom_slider.setValue(self.zoom_slider.value()+n*5))
-        self.timeline.gesture_done.connect(self.resume_autosave)
-        self.scroll=QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setWidget(self.timeline); bl.addWidget(self.scroll)
-        self.timeline.pan_request.connect(self.pan_timeline)
-        self.text_value.editingFinished.connect(self.apply_properties)
-        self.text_color.editingFinished.connect(self.apply_properties)
-        for field in (self.position,self.start,self.end,self.speed,self.freeze_duration,self.fade_in,self.fade_out,self.volume,
-                      self.audio_noise_reduction,self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high,self.audio_compressor_threshold,
-                      self.audio_compressor_ratio,self.audio_ducking,self.audio_pan,self.audio_normalize_target,self.text_size,self.text_x,self.text_y,
-                      self.text_outline_width,self.text_outline_color,self.text_shadow_size,self.text_shadow_color,self.text_background_color,
-                      self.text_background_opacity,self.text_background_padding,self.text_animation_duration,
-                      self.transform_scale,self.transform_x,self.transform_y,self.rotation,self.crop_left,self.crop_top,self.crop_right,self.crop_bottom,
-                      self.brightness,self.contrast,self.saturation,self.lut_path,self.opacity,self.blur,self.sharpen,self.stabilization,
-                      self.audio_voice_isolation,
-                      self.chroma_key_color,self.chroma_key_similarity,self.chroma_key_blend,
-                      self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather):
-            field.editingFinished.connect(self.apply_properties)
-        self.flip_horizontal.clicked.connect(self.apply_properties); self.flip_vertical.clicked.connect(self.apply_properties)
-        self.freeze_enabled.clicked.connect(self.apply_properties); self.reverse_clip.clicked.connect(self.apply_properties)
-        self.audio_compressor_enabled.clicked.connect(self.apply_properties)
-        self.audio_normalize.clicked.connect(self.apply_properties)
-        self.audio_voice_isolation.editingFinished.connect(self.apply_properties)
-        self.background_removal_enabled.clicked.connect(self.apply_properties)
-        self.object_removal_enabled.clicked.connect(self.apply_properties)
-        self.audio_channel_mode.activated.connect(lambda *_: self.apply_properties())
-        self.text_bold.clicked.connect(self.apply_properties); self.text_italic.clicked.connect(self.apply_properties)
-        self.text_background_enabled.clicked.connect(self.apply_properties)
-        self.text_font.activated.connect(lambda *_: self.apply_properties())
-        self.text_animation.activated.connect(lambda *_: self.apply_properties())
-        self.filter_preset.activated.connect(lambda *_: self.apply_properties()); self.chroma_key_enabled.clicked.connect(self.apply_properties)
-        self.mask_type.activated.connect(lambda *_: self.apply_properties())
-        self.transition_type.activated.connect(lambda *_: self.apply_properties()); self.transition_duration.editingFinished.connect(self.apply_properties)
-        vertical.addWidget(bottom); vertical.setStretchFactor(0,5); vertical.setStretchFactor(1,3); vertical.setChildrenCollapsible(False); vertical.setSizes([560,340]); outer.addWidget(vertical,1); self.setCentralWidget(root)
-        self.refresh_media()
-        self.update_source_monitor_controls()
-        self.set_edit_mode()
-        self.apply_workspace_preset()
-
-    def error(self,message): self.present_error(message)
-
-    def update_project_identity(self):
-        """Keep the compact header in sync with the active project."""
-        if not hasattr(self,'project_title_label'):
-            return
-        name=Path(self.project_path).stem if self.project_path else 'Neues Projekt'
-        self.project_title_label.setText(name)
-        self.project_meta_label.setText('Gespeichert' if self.project_path else 'Lokales Projekt')
-        saved=self.autosave_revision==self.revision and self.last_autosave is not None
-        self.autosave_pill.setText('â— Wiederherstellbar' if self.dirty and saved else 'â— Sicherung folgt' if self.dirty else 'â— Gespeichert' if self.project_path else 'â— Bereit')
-        self.autosave_pill.setToolTip('Autosave ist eine Wiederherstellungskopie. Strg+S speichert deine Projektdatei.')
-        self.autosave_pill.setProperty('dirty',bool(self.dirty))
-        self.autosave_pill.style().unpolish(self.autosave_pill); self.autosave_pill.style().polish(self.autosave_pill); self.autosave_pill.update()
-
-    def set_edit_mode(self, *_):
-        """Switch between a calm beginner inspector and the full toolset."""
-        if not hasattr(self, 'edit_mode_combo'):
-            return
-        mode=self.edit_mode_combo.currentData() or 'simple'
-        self.edit_mode=str(mode)
-        for entry in getattr(self, 'inspector_sections', []):
-            entry['section'].setVisible(self.edit_mode == 'pro' or not entry['advanced'])
-        if hasattr(self, 'statusBar'):
-            self.statusBar().showMessage(
-                'Einfach-Modus Â· hÃ¤ufige Einstellungen sichtbar' if self.edit_mode == 'simple'
-                else 'Pro-Modus Â· alle Inspector-Werkzeuge sichtbar', 2500)
-
-    def apply_workspace_preset(self, *_):
-        """Apply a task-oriented layout without creating another editor mode."""
-        if not hasattr(self, 'workspace_preset_combo') or not hasattr(self, 'top'):
-            return
-        preset=self.workspace_preset_combo.currentData() or 'edit'
-        self.workspace_preset=str(preset)
-        if self.focus_mode:
-            return
-        sizes={
-            'edit':[300, 820, 350],
-            'shorts':[230, 930, 290],
-            'audio':[250, 650, 470],
-            'color':[190, 820, 480],
-            'captions':[280, 720, 430],
-        }.get(preset,[300,820,350])
-        self.top.setSizes(sizes)
-        if hasattr(self, 'vertical'):
-            self.vertical.setSizes([560,340] if preset != 'audio' else [500,400])
-        labels={'edit':'Schnitt-Layout','shorts':'Shorts-Layout','audio':'Audio-Layout','color':'Farb-Layout','captions':'Untertitel-Layout'}
-        if hasattr(self, 'statusBar'):
-            self.statusBar().showMessage(f'{labels.get(preset,"Arbeitsbereich")} aktiviert.',2500)
-
-    def toggle_focus_mode(self):
-        """Give the preview and timeline the full width with one safe toggle."""
-        if not hasattr(self, 'top'):
-            return
-        self.focus_mode=not self.focus_mode
-        if self.focus_mode: self._normal_sizes=self.top.sizes()
-        self.media_panel.setVisible(not self.focus_mode)
-        self.inspector_panel.setVisible(not self.focus_mode)
-        self.focus_button.setText('Fokus schlieÃŸen' if self.focus_mode else 'Fokus')
-        self.focus_button.setToolTip('Seitenbereiche wieder einblenden Â· Strg+Shift+F' if self.focus_mode else 'Vorschau und Timeline vergrÃ¶ÃŸern Â· Strg+Shift+F')
-        if self.focus_mode:
-            self.top.setSizes([0, 1200, 0])
-            self.statusBar().showMessage('Fokusmodus Â· Vorschau und Timeline maximiert',3000)
-        else:
-            if self._normal_sizes: self.top.setSizes(self._normal_sizes)
-            else: self.apply_workspace_preset()
-            self.statusBar().showMessage('Fokusmodus beendet Â· Arbeitsbereich wiederhergestellt',3000)
-
-    def update_context_toolbar(self):
-        if not hasattr(self, 'context_toolbar'):
-            return
-        clip=self.current_clip()
-        available=clip is not None and not self.worker and not self.selection_locked()
-        self.context_toolbar.setVisible(bool(clip))
-        for action in (self.context_split_button,self.context_duplicate_button,self.context_reset_button,self.context_delete_button):
-            action.setEnabled(available)
-        self.context_reset_button.setEnabled(bool(available and len(self.selection)==1 and clip.kind=='video'))
-        self.context_reset_button.setProperty('disabledReason','WÃ¤hle genau einen entsperrten Videoclip aus.')
-
-    def set_media_view(self, *_):
-        """Switch the media browser between visual cards and a compact list."""
-        if not hasattr(self, 'media_view_combo') or not hasattr(self, 'media_list'):
-            return
-        list_view=self.media_view_combo.currentData() == 'list'
-        self.media_list.setViewMode(QListWidget.ListMode if list_view else QListWidget.IconMode)
-        self.media_list.setWrapping(not list_view)
-        self.media_list.setSpacing(1 if list_view else 4)
-        self.media_list.setUniformItemSizes(list_view)
-        self.media_list.setIconSize(QSize(44,36) if list_view else QSize(124,72))
-        self.media_list.setGridSize(QSize(0,0) if list_view else QSize(150,108))
-        self.refresh_media()
-
-    def toggle_asset_favorite(self):
-        item=self.media_list.currentItem() if hasattr(self, 'media_list') else None
-        if item is None:
-            return self.statusBar().showMessage('WÃ¤hle zuerst ein Medium aus.',2500)
-        index=item.data(MediaList.ASSET_INDEX_ROLE)
-        uid=str(Path(self.assets[index].path).resolve())
-        if uid in self.favorite_assets:
-            self.favorite_assets.remove(uid); message='Favorit entfernt.'
-        else:
-            self.favorite_assets.add(uid); message='Medium als Favorit markiert.'
-        self.refresh_media()
-        self.statusBar().showMessage(message,2500)
-
-    def update_media_favorite_button(self):
-        if not hasattr(self, 'media_favorite_button'):
-            return
-        item=self.media_list.currentItem()
-        uid=str(Path(self.assets[item.data(MediaList.ASSET_INDEX_ROLE)].path).resolve()) if item is not None else None
-        favorite=uid in self.favorite_assets if uid is not None else False
-        self.media_favorite_button.setEnabled(item is not None)
-        self.media_favorite_button.setText('â˜…' if favorite else 'â˜†')
-        self.media_favorite_button.setToolTip('Favorit entfernen' if favorite else 'AusgewÃ¤hltes Medium als Favorit markieren')
-        self.media_favorite_button.setAccessibleName(self.media_favorite_button.toolTip())
-
-    def update_color_button(self,color):
-        self.text_palette_button.setStyleSheet(f'QPushButton {{ background: {color}; color: #101216; border: 1px solid #e9edf2; }} QPushButton:hover {{ background: {color}; }}')
-
-    def choose_text_color(self):
-        initial=QColor(self.text_color.text().strip())
-        if not initial.isValid(): initial=QColor('#ffffff')
-        color=QColorDialog.getColor(initial,self,'Textfarbe auswÃ¤hlen')
-        if color.isValid():
-            self.text_color.setText(color.name())
-            self.update_color_button(color.name())
-            if self.current_clip() and self.current_clip().kind=='text': self.apply_properties()
-
-    def choose_lut(self):
-        """Select a portable .cube/.3dl LUT for the current video clip."""
-        path,_=QFileDialog.getOpenFileName(self,'LUT auswÃ¤hlen','',
-                                           'LUT (*.cube *.3dl);;Alle Dateien (*)')
-        if not path:
-            return
-        self.lut_path.setText(str(Path(path).resolve()))
-        if self.current_clip() and self.current_clip().kind=='video':
-            self.apply_properties()
-
-    def pan_timeline(self,delta):
-        bar=self.scroll.horizontalScrollBar()
-        bar.setValue(bar.value()-int(delta))
-
-    def work_area_bounds(self):
-        """Return the effective export range or the complete timeline."""
-        total=length(self.clips)
-        start=0.0 if self.work_in is None else max(0.0,min(total,float(self.work_in)))
-        end=total if self.work_out is None else max(0.0,min(total,float(self.work_out)))
-        if end-start < MIN_CLIP:
-            return 0.0,total
-        return start,end
-
-    def update_work_area_controls(self):
-        if not hasattr(self,'work_range_label'):
-            return
-        total=length(self.clips)
-        if self.work_in is None and self.work_out is None:
-            self.work_range_label.setText('Arbeitsbereich: gesamte Timeline')
-            self.work_range_label.setToolTip('Strg+Alt+I/O setzen den Exportbereich.')
-            return
-        start,end=self.work_area_bounds()
-        self.work_range_label.setText(f'Arbeitsbereich: {start:.2f}â€“{end:.2f} s')
-        self.work_range_label.setToolTip(f'{end-start:.2f} s von {total:.2f} s Â· Exportdialog kann diesen Bereich verwenden.')
-
-    def set_work_in(self):
-        if self.worker:
-            return
-        self.work_in=max(0.0,min(length(self.clips),float(self.playhead)))
-        if self.work_out is not None and self.work_out <= self.work_in+MIN_CLIP:
-            self.work_out=None
-        self.update_work_area_controls()
-        self.statusBar().showMessage(f'Arbeitsbereich-In: {self.work_in:.2f} s',2500)
-
-    def set_work_out(self):
-        if self.worker:
-            return
-        self.work_out=max(0.0,min(length(self.clips),float(self.playhead)))
-        if self.work_in is not None and self.work_out <= self.work_in+MIN_CLIP:
-            self.work_in=None
-        self.update_work_area_controls()
-        self.statusBar().showMessage(f'Arbeitsbereich-Out: {self.work_out:.2f} s',2500)
-
-    def clear_work_area(self):
-        self.work_in=None; self.work_out=None; self.update_work_area_controls()
-        self.statusBar().showMessage('Arbeitsbereich gelÃ¶scht Â· gesamte Timeline aktiv',2500)
-
-    def preview_size(self):
-        """Return the actual preview size used for the current UI settings."""
-        w,h=PRESETS[self.preset.currentText()]
-        max_w,max_h=(640,360) if self.quick_preview_box.isChecked() else (854,480)
-        ratio=min(max_w/w,max_h/h)
-        return (max(2,int(w*ratio)//2*2),max(2,int(h*ratio)//2*2))
-
-    def update_cache_status(self):
-        if not hasattr(self,'cache_status'):
-            return
-        used=cache_size(self.cache_root)
-        self.cache_status.setText(f'Cache {used/1024/1024:.0f} / {self.cache_limit_bytes/1024/1024:.0f} MB')
-        self.cache_status.setToolTip(str(self.cache_root))
-
-    def trim_cache(self, keep=()):
-        result=prune_cache(self.cache_root,self.cache_limit_bytes,keep)
-        self.update_cache_status()
-        return result
-
-    def clear_cache(self):
-        if self.worker:
-            return
-        answer=QMessageBox.question(self,'Cache leeren',
-            'Nur erzeugte Vorschauen, Poster und Wellenformen werden gelÃ¶scht. Projektdateien und Originalmedien bleiben erhalten.',
-            QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
-        if answer!=QMessageBox.Yes:
-            return
-        self.cancel_preview(wait=True); self.player.stop(); self.player.setSource(QUrl())
-        self.preview_path=None; self.preview_signature=None; self.preview_revision=-1
-        self.thumbnails.clear(); self.waveforms.clear()
-        prune_cache(self.cache_root,0)
-        self.prepare_visuals(self.assets); self.refresh(); self.update_cache_status()
-        self.statusBar().showMessage('Cache geleert Â· Projekt und Originalmedien bleiben unverÃ¤ndert',5000)
-
-    def proxy_profile_changed(self,*_):
-        profile=self.proxy_profile_combo.currentData() or '360p'
-        if profile not in PROXY_PROFILES:
-            profile='360p'
-        self.proxy_profile=profile
-        if self.proxy_enabled and not self.worker:
-            self.proxy_map={}; self.preview_queued=True
-            if self._direct_preview_clips():
-                self.activate_direct_preview(play=self.player.playbackState()==QMediaPlayer.PlayingState)
-            self.start_proxy_generation()
-
-    def preview_signature_for_current(self):
-        return (self.revision, self.preview_size(), bool(self.proxy_enabled), self.proxy_profile,
-                bool(self.gpu_preview_box.isChecked()),
-                tuple(sorted(self.proxy_map.items())),
-                tuple(sorted((track, tuple(sorted(state.items()))) for track,state in self.track_states.items())),
-                tuple(sorted(self.master_mixer.items())))
-
-    @staticmethod
-    def _direct_value(value, expected, tolerance=1e-7):
-        try:
-            return abs(float(value)-float(expected)) <= tolerance
-        except (TypeError, ValueError):
-            return value == expected
-
-    def _direct_clip_is_plain(self, clip):
-        """Whether a clip can be decoded directly without a composition render."""
-        if (not clip.enabled or clip.kind != 'video' or clip.source_type != 'video'
-                or not clip.path or not Path(clip.path).is_file()):
-            return False
-        if not all((self._direct_value(getattr(clip, name), expected)
-                    for name, expected in (
-                        ('speed', 1.0), ('volume', 1.0), ('fade_in', 0.0), ('fade_out', 0.0),
-                        ('video_scale', 1.0), ('video_x', .5), ('video_y', .5),
-                        ('crop_left', 0.0), ('crop_top', 0.0), ('crop_right', 0.0), ('crop_bottom', 0.0),
-                        ('rotation', 0.0), ('brightness', 0.0), ('contrast', 1.0), ('saturation', 1.0),
-                        ('color_exposure', 0.0), ('color_temperature', 0.0), ('color_tint', 0.0),
-                        ('color_vibrance', 0.0), ('color_lift_r', 0.0), ('color_lift_g', 0.0),
-                        ('color_lift_b', 0.0), ('color_gamma_r', 0.0), ('color_gamma_g', 0.0),
-                        ('color_gamma_b', 0.0), ('color_gain_r', 0.0), ('color_gain_g', 0.0),
-                        ('color_gain_b', 0.0), ('opacity', 1.0), ('blur', 0.0), ('sharpen', 0.0),
-                        ('stabilization', 0.0), ('chroma_key_similarity', .1),
-                        ('chroma_key_blend', .1), ('mask_x', 0.0), ('mask_y', 0.0),
-                        ('mask_width', 1.0), ('mask_height', 1.0), ('mask_feather', 0.0),
-                        ('audio_noise_reduction', 0.0), ('audio_eq_low', 0.0),
-                        ('audio_eq_mid', 0.0), ('audio_eq_high', 0.0),
-                        ('audio_compressor_threshold', -18.0), ('audio_compressor_ratio', 4.0),
-                        ('audio_ducking', 0.0), ('audio_voice_isolation', 0.0),
-                        ('audio_pan', 0.0), ('audio_normalize_target', -16.0))
-                    )):
-            return False
-        if (clip.freeze_frame or clip.reverse or clip.flip_horizontal or clip.flip_vertical
-                or clip.chroma_key_enabled or clip.background_removal_enabled
-                or clip.object_removal_enabled or clip.auto_reframe_enabled
-                or clip.mask_type != 'none' or clip.effect_preset != 'clean'
-                or clip.filter_preset != 'none' or clip.lut_path
-                or clip.transition_type != 'none' or clip.transition_duration > 1e-7
-                or clip.audio_compressor_enabled or clip.audio_normalize
-                or clip.audio_channel_mode != 'stereo'
-                or clip.speed_keyframes or clip.keyframes or clip.volume_keyframes
-                or clip.tracking_keyframes or clip.auto_reframe_keyframes
-                or clip.mask_points or clip.mask_path_keyframes):
-            return False
-        return True
-
-    def _direct_preview_clips(self):
-        """Return a contiguous, single-track timeline suitable for direct play."""
-        if not self.clips:
-            return ()
-        tracks={clip.track for clip in self.clips}
-        if len(tracks) != 1:
-            return ()
-        track=next(iter(tracks))
-        if track <= 0:
-            return ()
-        state=self.track_states.get(track, {})
-        if (state.get('muted') or state.get('solo')
-                or not self._direct_value(state.get('volume',1.0),1.0)
-                or not self._direct_value(state.get('pan',0.0),0.0)):
-            return ()
-        if (not self._direct_value(self.master_mixer.get('volume',1.0),1.0)
-                or not self._direct_value(self.master_mixer.get('pan',0.0),0.0)
-                or self.master_mixer.get('loudness_normalization',False)):
-            return ()
-        ordered=tuple(sorted(self.clips,key=lambda clip:(clip.position,clip.uid)))
-        expected=0.0
-        for clip in ordered:
-            if abs(float(clip.position)-expected) > 1e-5 or not self._direct_clip_is_plain(clip):
-                return ()
-            expected=clip.finish
-        return ordered
-
-    def direct_preview_signature_for_current(self):
-        return (self.revision, bool(self.proxy_enabled), self.proxy_profile,
-                tuple(sorted(self.proxy_map.items())))
-
-    def direct_preview_is_current(self):
-        return bool(self.direct_preview and self.direct_preview_revision == self.revision
-                    and self.direct_preview_signature == self.direct_preview_signature_for_current())
-
-    def _direct_clip_at(self, position, clips=None):
-        clips=clips or self._direct_preview_clips()
-        if not clips:
-            return None
-        position=float(position)
-        for index, clip in enumerate(clips):
-            if clip.position-1e-6 <= position < clip.finish-1e-6:
-                return index,clip
-            if index == len(clips)-1 and clip.position-1e-6 <= position <= clip.finish+1e-6:
-                return index,clip
-        return None
-
-    def _direct_source_path(self, clip):
-        if self.proxy_enabled and clip.path:
-            return self.proxy_map.get(str(Path(clip.path).resolve()),clip.path)
-        return clip.path
-
-    def _load_direct_clip_at_playhead(self, play=False):
-        clips=self._direct_preview_clips()
-        selected=self._direct_clip_at(self.playhead,clips)
-        if selected is None:
-            self.direct_clip_uid=None
-            self.player.pause()
-            return
-        _,clip=selected
-        self.direct_clip_uid=clip.uid
-        source=self._direct_source_path(clip)
-        source_time=clip.start+max(0.0,min(clip.length,self.playhead-clip.position))
-        self.mode='timeline'; self.video_stack.setCurrentIndex(1)
-        self.pending_seek=(round(source_time*1000),bool(play))
-        url=QUrl.fromLocalFile(str(source))
-        if self.player.source()==url:
-            self.pending_seek=None
-            self.player.setPosition(round(source_time*1000))
-            if play:
-                self.player.play()
-        else:
-            self.player.stop(); self.player.setSource(url)
-
-    def activate_direct_preview(self, play=None):
-        """Switch to instant source playback when the timeline needs no render."""
-        clips=self._direct_preview_clips()
-        if not clips:
-            self.direct_preview=False; self.direct_preview_revision=-1
-            self.direct_preview_signature=None; self.direct_clip_uid=None
-            return False
-        if play is None:
-            play=self.player.playbackState()==QMediaPlayer.PlayingState
-        self.direct_preview=True; self.direct_preview_revision=self.revision
-        self.direct_preview_signature=self.direct_preview_signature_for_current()
-        self.mode='timeline'; self.audio.setVolume(1); self.player.setPlaybackRate(1.0)
-        self.preview_status.setText('DIRECT-SCHNITT Â· sofort abspielbar Â· keine Neu-Berechnung nÃ¶tig')
-        self._load_direct_clip_at_playhead(bool(play))
-        return True
-
-    def preview_is_current(self):
-        if self.direct_preview_is_current():
-            return True
-        return bool(self.preview_path and self.preview_signature == self.preview_signature_for_current()
-                    and Path(self.preview_path).is_file())
-
-    def cancel_preview(self, wait=False):
-        worker=self.preview_worker
-        if not worker:
-            return
-        worker.cancel.set()
-        if wait:
-            worker.wait()
-            if self.preview_worker is worker:
-                self.preview_worker=None
-            worker.deleteLater()
-
-    def show_context_menu(self,uid,global_pos):
-        if uid:
-            self.select_clip(uid)
-        clip=self.current_clip() if uid else None
-        menu=QMenu(self)
-        if clip:
-            inspect=menu.addAction('Clip ausgewÃ¤hlt Â· Einstellungen rechts')
-            inspect.setEnabled(False)
-            menu.addSeparator()
-            menu.addAction('Kopieren',self.copy_selection)
-            menu.addAction('Attribute kopieren Â· Ctrl+Alt+C',self.copy_attributes)
-            menu.addAction('Attribute einfÃ¼gen Â· Ctrl+Alt+V',self.paste_attributes)
-            if clip.kind == 'video' and clip.source_type != 'adjustment':
-                menu.addAction('Keyframes kopieren Â· Ctrl+Alt+K',self.copy_keyframes)
-                menu.addAction('Keyframes einfÃ¼gen Â· Ctrl+Alt+Shift+K',self.paste_keyframes)
-            menu.addAction('Duplizieren',self.duplicate_selection)
-            menu.addAction('Insert einfÃ¼gen',self.insert_selection)
-            menu.addAction('Overwrite einfÃ¼gen',self.overwrite_selection)
-            menu.addAction('Ripple lÃ¶schen',self.ripple_delete)
-            if len(self.selected_clips()) >= 2:
-                menu.addAction('Gruppieren',self.group_selection)
-            if any(value.group_id for value in self.selected_clips()):
-                menu.addAction('Gruppe lÃ¶sen',self.ungroup_selection)
-            if len(self.selected_clips()) >= 2:
-                menu.addAction('Compound-Clip erstellen',self.create_compound)
-            if any(value.compound_id for value in self.selected_clips()):
-                menu.addAction('Compound-Clip auflÃ¶sen',self.dissolve_compound)
-            menu.addSeparator()
-            if clip.kind!='text' and clip.source_type!='adjustment':
-                menu.addAction('â–¶ Clip ansehen',self.source_preview)
-            if clip.kind in ('video','audio') and clip.source_type in ('video','audio'):
-                source_menu=menu.addMenu('Quellmonitor')
-                source_menu.addAction('Quell-In setzen Â· I',self.set_source_in)
-                source_menu.addAction('Quell-Out setzen Â· O',self.set_source_out)
-                source_menu.addAction('Quellmarken lÃ¶schen',self.clear_source_marks)
-                source_menu.addSeparator()
-                source_menu.addAction('Markierten Bereich als Insert einfÃ¼gen',self.insert_source_range)
-                source_menu.addAction('Markierten Bereich als Overwrite einfÃ¼gen',self.overwrite_source_range)
-            if clip.kind=='text':
-                menu.addAction('Text im Inspector bearbeiten',self.focus_text_editor)
-            menu.addAction('Am Abspielkopf teilen',self.split)
-            if clip.kind in ('video','audio') and clip.source_type in ('video','audio'):
-                trim_menu=menu.addMenu('Professionelle Trim-Werkzeuge')
-                trim_menu.addAction('Ripple-In zum Abspielkopf Â· Q',self.ripple_trim_in)
-                trim_menu.addAction('Ripple-Out zum Abspielkopf Â· W',self.ripple_trim_out)
-                trim_menu.addAction('Roll-Schnitt zum Abspielkopf Â· R',self.roll_to_playhead)
-                trim_menu.addSeparator()
-                trim_menu.addAction('Slide links Â· Alt+â†',lambda:self.slide_selected(-1))
-                trim_menu.addAction('Slide rechts Â· Alt+â†’',lambda:self.slide_selected(1))
-                trim_menu.addAction('Slip links Â· Umschalt+Alt+â†',lambda:self.slip_selected(-1))
-                trim_menu.addAction('Slip rechts Â· Umschalt+Alt+â†’',lambda:self.slip_selected(1))
-            if clip.kind=='video' and clip.source_type in ('video','image'):
-                ai_menu=menu.addMenu('KI-Werkzeuge')
-                ai_menu.addAction('Hintergrund entfernen',self.start_background_removal)
-                if clip.background_removed_path:
-                    ai_menu.addAction('Freistellung deaktivieren',self.clear_background_removal)
-                ai_menu.addSeparator()
-                ai_menu.addAction('Motion-Tracking starten',self.start_motion_tracking).setEnabled(clip.source_type=='video')
-                ai_menu.addAction('Bezier-Maske automatisch verfolgen',self.start_mask_tracking).setEnabled(
-                    clip.source_type=='video' and clip.mask_type=='bezier' and len(clip.mask_points)>=3)
-                if clip.tracking_keyframes:
-                    ai_menu.addAction('Tracking lÃ¶schen',self.clear_motion_tracking)
-                ai_menu.addAction('Auto-Reframe analysieren',self.start_auto_reframe).setEnabled(clip.source_type=='video')
-                if clip.auto_reframe_keyframes:
-                    ai_menu.addAction('Auto-Reframe lÃ¶schen',self.clear_auto_reframe)
-                ai_menu.addAction('Objekt entfernen aktivieren',lambda:self.set_object_removal_enabled(True))
-            if clip.kind in ('video','audio') and clip.has_audio and clip.source_type != 'adjustment':
-                beat_menu=menu.addMenu('Beat-Sync')
-                beat_menu.addAction('Beats analysieren',self.start_beat_analysis)
-                beat_menu.addAction('Textbasierter Schnitt Â· Pausen/FÃ¼llwÃ¶rter',self.start_text_based_cut)
-                if clip.kind == 'video' and clip.source_type == 'video':
-                    beat_menu.addAction('Beat-/Szenen-Auto-Cut',self.start_auto_cut)
-                if any(marker.get('kind') == 'beat' for marker in self.markers):
-                    beat_menu.addAction('Beat-Marker lÃ¶schen',self.clear_beat_markers)
-            if clip.multicam_group:
-                menu.addAction('Als aktive Kamera verwenden',self.switch_multicam_angle)
-            speed_menu=None
-            if clip.kind in ('video','audio') and clip.source_type!='adjustment':
-                speed_menu=menu.addMenu('Geschwindigkeit')
-                for value in (.25,.5,1,2,4):
-                    speed_menu.addAction(f'{value:g}Ã—',lambda checked=False,v=value:self.set_speed(v))
-            if clip.kind in ('video','audio') and clip.source_type!='adjustment':
-                volume_menu=menu.addMenu('LautstÃ¤rke')
-                volume_menu.addAction('100 %',lambda:self.set_volume(1.0))
-                volume_menu.addAction('50 %',lambda:self.set_volume(.5))
-                volume_menu.addAction('Stumm',lambda:self.set_volume(0.0))
-            if clip.kind=='video' and clip.has_audio:
-                menu.addAction('Audio aus Video extrahieren',self.extract_audio)
-            if clip.kind=='video':
-                menu.addAction('Bildtransformation zurÃ¼cksetzen',self.reset_transform)
-                menu.addAction('Standbild am Abspielkopf einfÃ¼gen',self.add_freeze_frame)
-                menu.addAction('Aktuelles Bild als PNG speichern',self.start_frame_capture)
-            if clip.kind in ('video','audio') and clip.source_type!='adjustment':
-                transition_menu=menu.addMenu('Ãœbergang')
-                transition_menu.addAction('Ãœberblenden Â· 0,5 s',lambda:self.set_transition('dissolve',.5))
-                transition_menu.addAction('Ãœberblenden Â· 1,0 s',lambda:self.set_transition('dissolve',1.0))
-                transition_menu.addSeparator()
-                for title,kind in (('Slide links','slide_left'),('Slide rechts','slide_right'),
-                                   ('Slide oben','slide_up'),('Slide unten','slide_down'),
-                                   ('Wipe links','wipe_left'),('Wipe rechts','wipe_right'),
-                                   ('Wipe oben','wipe_up'),('Wipe unten','wipe_down'),
-                                   ('Zoom','zoom'),('Dip to Black','dip_to_black'),
-                                   ('Fade to White','fade_white'),('Blur In','blur_in'),
-                                   ('Circle Open','circle_open'),('Circle Close','circle_close'),
-                                   ('Radial','radial'),('Pixelize','pixelize'),
-                                   ('Smooth links','smooth_left'),('Smooth rechts','smooth_right'),
-                                   ('Smooth oben','smooth_up'),('Smooth unten','smooth_down'),
-                                   ('Cover links','cover_left'),('Cover rechts','cover_right'),
-                                   ('Cover oben','cover_up'),('Cover unten','cover_down')):
-                    transition_menu.addAction(f'{title} Â· 0,5 s',lambda checked=False,k=kind:self.set_transition(k,.5))
-                transition_menu.addAction('Ãœbergang entfernen',lambda:self.set_transition('none',0.0))
-            menu.addSeparator()
-            menu.addAction('Clip entfernen',self.remove)
-        else:
-            menu.addAction('Arbeitsbereich-In setzen Â· Ctrl+Alt+I',self.set_work_in)
-            menu.addAction('Arbeitsbereich-Out setzen Â· Ctrl+Alt+O',self.set_work_out)
-            menu.addAction('Arbeitsbereich lÃ¶schen',self.clear_work_area)
-            menu.addAction('LÃ¼cken auf aktueller Spur schlieÃŸen',self.close_selected_track_gaps)
-            menu.addSeparator()
-            menu.addAction('+ Text',self.add_text)
-            menu.addAction('+ Adjustment-Layer',self.add_adjustment_layer)
-            menu.addAction('+ Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog)
-            menu.addAction('+ Automatische Untertitel',self.automatic_subtitle_dialog)
-            menu.addAction('Medien importieren',self.import_dialog)
-            menu.addAction('Bildsequenz importieren',self.import_sequence_dialog)
-            menu.addAction('AusgewÃ¤hltes Medium am Spurende hinzufÃ¼gen',self.add_selected_asset)
-            menu.addAction('EinfÃ¼gen',self.paste_selection)
-            menu.addAction('Insert einfÃ¼gen',self.insert_selection)
-            menu.addAction('Overwrite einfÃ¼gen',self.overwrite_selection)
-        menu.exec(global_pos)
-
-    def _marker_at_time(self, time):
-        return min(self.markers, key=lambda value: abs(float(value['time'])-float(time)), default=None)
-
-    def add_marker(self, kind='marker'):
-        if self.worker or not self.clips:
-            return self.statusBar().showMessage('FÃ¼ge zuerst Medien zur Timeline hinzu.',3000)
-        default = f"{'Kapitel' if kind == 'chapter' else 'Marker'} {sum(value['kind'] == kind for value in self.markers) + 1}"
-        title = 'Kapitel hinzufÃ¼gen' if kind == 'chapter' else 'Marker hinzufÃ¼gen'
-        text, ok = QInputDialog.getText(self, title, 'Name:', text=default)
-        if not ok or not text.strip():
-            return
-        marker = {'time': round(self.playhead, 6), 'label': text.strip(), 'kind': kind}
-        self.checkpoint()
-        self.markers = normalize_markers([value for value in self.markers
-                                          if not (value['kind'] == kind and abs(value['time']-self.playhead) <= .01)] + [marker],
-                                         length(self.clips))
-        self.changed()
-        self.statusBar().showMessage(f"{('Kapitel' if kind == 'chapter' else 'Marker')} bei {self.playhead:.2f} s gesetzt.",3000)
-
-    def edit_marker(self, time):
-        marker = self._marker_at_time(time)
-        if not marker or self.worker:
-            return
-        text, ok = QInputDialog.getText(self, 'Marker bearbeiten', 'Name:', text=marker['label'])
-        if not ok or not text.strip():
-            return
-        self.checkpoint()
-        self.markers = normalize_markers([dict(value, label=text.strip()) if value is marker else value for value in self.markers],
-                                         length(self.clips))
-        self.changed()
-
-    def remove_marker(self, time):
-        marker = self._marker_at_time(time)
-        if not marker or self.worker:
-            return
-        self.checkpoint()
-        self.markers = [value for value in self.markers if value is not marker]
-        self.changed()
-        self.statusBar().showMessage('Marker entfernt.',3000)
-
-    def show_marker_context_menu(self, time, global_pos):
-        marker = self._marker_at_time(time)
-        if not marker:
-            return
-        menu = QMenu(self)
-        menu.addAction(f"{marker['label']} Â· {marker['time']:.2f} s").setEnabled(False)
-        menu.addAction('Zum Marker',lambda:self.set_playhead(marker['time']))
-        menu.addAction('Bearbeiten â€¦',lambda:self.edit_marker(marker['time']))
-        menu.addAction('LÃ¶schen',lambda:self.remove_marker(marker['time']))
-        menu.exec(global_pos)
-
-    def focus_text_editor(self):
-        self.text_value.setFocus()
-        self.text_value.selectAll()
-
-    def set_speed(self,value):
-        clip=self.current_clip()
-        if len(self.selection)>1:
-            return self.statusBar().showMessage('Inspector-Ã„nderungen sind bei Mehrfachauswahl deaktiviert.',3000)
-        if not clip or clip.kind not in ('video','audio') or self.worker or not self.require_unlocked(clip):return
-        candidate=replace(clip,speed=float(value))
-        try:
-            proposed=[candidate if c.uid==clip.uid else c for c in self.clips]
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed()
-        except Exception as exc:
-            self.error(exc)
-
-    def set_volume(self,value):
-        clip=self.current_clip()
-        if len(self.selection)>1:
-            return self.statusBar().showMessage('Inspector-Ã„nderungen sind bei Mehrfachauswahl deaktiviert.',3000)
-        if not clip or clip.kind not in ('video','audio') or self.worker or not self.require_unlocked(clip):return
-        candidate=replace(clip,volume=float(value))
-        self.checkpoint(); self.clips=[candidate if c.uid==clip.uid else c for c in self.clips]; self.changed()
-
-    def set_transition(self,kind,duration):
-        clip=self.current_clip()
-        if len(self.selection)>1:
-            return self.statusBar().showMessage('Inspector-Ã„nderungen sind bei Mehrfachauswahl deaktiviert.',3000)
-        if not clip or clip.kind not in ('video','audio') or self.worker or not self.require_unlocked(clip):return
-        candidate=replace(clip,transition_type=kind,transition_duration=float(duration) if kind!='none' else 0.0)
-        try:
-            proposed=[candidate if item.uid==clip.uid else item for item in self.clips]
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed()
-        except Exception as exc:
-            self.error(exc)
-
-    def current_clip(self): return next((c for c in self.clips if c.uid==self.current),None)
-
-    def selected_clips(self):
-        selected = set(self.selection or ([self.current] if self.current else []))
-        return [clip for clip in self.clips if clip.uid in selected]
-
-    def _clone_clip(self, clip, uid=None, group_id=None):
-        return replace(clip, uid=uid or uuid.uuid4().hex,
-                       group_id=clip.group_id if group_id is None else group_id,
-                       keyframes=[dict(frame) for frame in clip.keyframes],
-                       volume_keyframes=[dict(frame) for frame in clip.volume_keyframes],
-                       speed_keyframes=[dict(frame) for frame in clip.speed_keyframes],
-                       tracking_keyframes=[dict(point) for point in clip.tracking_keyframes],
-                       auto_reframe_keyframes=[dict(point) for point in clip.auto_reframe_keyframes],
-                       mask_points=[dict(point) for point in clip.mask_points],
-                       mask_path_keyframes=[dict(frame, points=[dict(point) for point in frame.get('points', [])])
-                                            for frame in clip.mask_path_keyframes],
-                       source_paths=list(clip.source_paths))
-
-    def set_selection(self, uids, anchor=None, expand_groups=False):
-        previous_current=self.current
-        available = {clip.uid: clip for clip in self.clips}
-        result = []
-        for uid in uids:
-            if uid in available and uid not in result:
-                result.append(uid)
-        if expand_groups:
-            groups = {available[uid].group_id for uid in result if available[uid].group_id}
-            compounds = {available[uid].compound_id for uid in result if available[uid].compound_id}
-            for clip in self.clips:
-                if ((clip.group_id in groups and clip.group_id)
-                        or (clip.compound_id in compounds and clip.compound_id)) and clip.uid not in result:
-                    result.append(clip.uid)
-        self.selection = result
-        self.current = anchor if anchor in result else (result[-1] if result else None)
-        if self.mode=='source' and self.current!=previous_current:
-            self.player.pause(); self.pending_seek=None; self.player.setSource(QUrl()); self.mode='timeline'
-            self.source_clip_uid=None; self.source_in=None; self.source_out=None
-            self.video_stack.setCurrentIndex(0); self.placeholder.setText('Clip ausgewÃ¤hlt Â· â€žClip ansehenâ€œ startet die Quellvorschau.')
-        self.fill_inspector()
-        self.timeline.set_selection(self.selection, self.current)
-        self.update_source_monitor_controls()
-
-    def timeline_selection_changed(self, payload):
-        if not isinstance(payload, (list, tuple)):
-            return
-        self.set_selection(list(payload), self.timeline.current, expand_groups=False)
-
-    def select_all(self):
-        if self.worker:
-            return
-        ids=[clip.uid for clip in self.clips]
-        self.set_selection(ids, ids[-1] if ids else None)
-        self.statusBar().showMessage(f'{len(ids)} Clips ausgewÃ¤hlt.',3000)
-
-    def selection_locked(self):
-        return any(self.track_locked(clip.track) for clip in self.selected_clips())
-
-    def _inspector_controls(self):
-        return (self.track_combo,self.position,self.start,self.end,self.speed,self.freeze_enabled,self.freeze_duration,self.reverse_clip,self.fade_in,self.fade_out,self.volume,
-                self.text_value,self.text_size,self.text_color,self.text_palette_button,self.text_font,self.text_bold,self.text_italic,
-                self.text_outline_width,self.text_outline_color,self.text_shadow_size,self.text_shadow_color,
-                self.text_background_enabled,self.text_background_color,self.text_background_opacity,self.text_background_padding,
-                self.text_animation,self.text_animation_duration,self.text_x,self.text_y,
-                self.audio_noise_reduction,self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high,self.audio_compressor_enabled,
-                self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_voice_isolation,self.audio_channel_mode,self.audio_pan,
-                self.audio_normalize,self.audio_normalize_target,
-                self.transform_scale,self.transform_x,self.transform_y,self.rotation,self.crop_left,self.crop_top,
-                self.crop_right,self.crop_bottom,self.flip_horizontal,self.flip_vertical,self.brightness,self.contrast,
-                self.saturation,self.filter_preset,self.effect_preset,self.effect_preset_apply_button,self.lut_path,self.lut_browse_button,self.opacity,self.blur,self.sharpen,self.stabilization,
-                self.chroma_key_enabled,self.chroma_key_color,self.chroma_key_similarity,self.chroma_key_blend,
-                self.background_removal_enabled,self.background_remove_button,self.background_clear_button,
-                self.track_motion_button,self.mask_track_button,self.clear_tracking_button,self.object_removal_enabled,
-                self.auto_reframe_enabled,self.auto_reframe_format,self.auto_reframe_button,self.auto_reframe_clear_button,
-                self.mask_type,self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather,self.mask_points,
-                self.mask_points_apply,self.mask_path_time,self.mask_path_list,self.mask_path_set_button,self.mask_path_remove_button,
-                self.color_exposure,self.color_temperature,self.color_tint,self.color_vibrance,
-                *self.color_wheel_spins.values(),
-                self.keyframe_graph_property,self.keyframe_graph,
-                self.beat_analyze_button,self.beat_clear_button,
-                self.text_cut_button,self.auto_cut_button,self.multicam_sync_button,self.multicam_switch_button,
-                self.transition_type,self.transition_duration,
-                self.keyframe_time,self.keyframe_curve,self.keyframe_list,self.keyframe_set_button,self.keyframe_remove_button,
-                self.volume_keyframe_time,self.volume_keyframe_curve,self.volume_keyframe_list,self.volume_keyframe_set_button,
-                self.volume_keyframe_remove_button,self.speed_ramp_time,self.speed_ramp_value,self.speed_ramp_list,
-                self.speed_ramp_set_button,self.speed_ramp_remove_button)
-
-    def copy_selection(self):
-        clips = self.selected_clips()
-        if not clips:
-            return self.statusBar().showMessage('Kein Clip ausgewÃ¤hlt.',3000)
-        self.clipboard = [self._clone_clip(clip, uid=clip.uid) for clip in clips]
-        self.statusBar().showMessage(f"{len(clips)} Clip{'s' if len(clips) != 1 else ''} kopiert.",3000)
-
-    def copy_attributes(self):
-        """Copy only editable look/audio attributes from the active clip."""
-        clip=self.current_clip()
-        if not clip:
-            return self.statusBar().showMessage('WÃ¤hle zuerst einen Clip aus.',3000)
-        if clip.kind == 'video':
-            fields=VIDEO_ATTRIBUTE_FIELDS
-        elif clip.kind == 'audio':
-            fields=AUDIO_ATTRIBUTE_FIELDS
-        elif clip.kind == 'text':
-            fields=TEXT_ATTRIBUTE_FIELDS
-        else:
-            return self.statusBar().showMessage('FÃ¼r diesen Clip gibt es keine Attribute.',3000)
-        self.attribute_clipboard={
-            'kind':clip.kind,
-            'fields':{field:([dict(item) for item in getattr(clip,field)]
-                             if isinstance(getattr(clip,field),list)
-                             else getattr(clip,field)) for field in fields},
-        }
-        self.statusBar().showMessage('Clip-Attribute kopiert Â· Zielclip(s) auswÃ¤hlen und EinfÃ¼gen ausfÃ¼hren.',4000)
-
-    def paste_attributes(self):
-        """Paste copied look/audio attributes onto the current selection."""
-        if self.worker or not self.attribute_clipboard:
-            return self.statusBar().showMessage('Keine Clip-Attribute kopiert.',3000)
-        source_kind=self.attribute_clipboard.get('kind')
-        targets=[clip for clip in self.selected_clips() if clip.kind == source_kind]
-        if not targets:
-            return self.statusBar().showMessage('WÃ¤hle mindestens einen Clip desselben Typs aus.',4000)
-        if any(not self.require_unlocked(clip) for clip in targets):
-            return
-        fields=self.attribute_clipboard.get('fields',{})
-        proposed=list(self.clips)
-        for target in targets:
-            values={field:([dict(item) for item in value] if isinstance(value,list) else value)
-                    for field,value in fields.items() if hasattr(target,field)}
-            candidate=replace(target,**values)
-            proposed=[candidate if item.uid==target.uid else item for item in proposed]
-        try:
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
-            self.statusBar().showMessage(f'Attribute auf {len(targets)} Clip(s) angewendet.',3500)
-        except Exception as exc:
-            self.error(exc)
-
-    def copy_keyframes(self):
-        clip=self.current_clip()
-        if not clip or clip.kind != 'video' or clip.source_type == 'adjustment':
-            return self.statusBar().showMessage('WÃ¤hle einen normalen Videoclip fÃ¼r Keyframes aus.',3500)
-        try:
-            self.keyframe_clipboard=copy_keyframe_bundle(clip)
-            self.statusBar().showMessage('Keyframes kopiert Â· Zielclip(s) auswÃ¤hlen und Keyframes einfÃ¼gen.',4000)
-        except Exception as exc:
-            self.error(exc)
-
-    def paste_keyframes(self):
-        if self.worker or not self.keyframe_clipboard:
-            return self.statusBar().showMessage('Keine Keyframes kopiert.',3000)
-        targets=[clip for clip in self.selected_clips()
-                 if clip.kind == 'video' and clip.source_type != 'adjustment']
-        if not targets:
-            return self.statusBar().showMessage('WÃ¤hle mindestens einen normalen Videoclip aus.',3500)
-        if any(not self.require_unlocked(clip) for clip in targets):
-            return
-        try:
-            proposed=list(self.clips)
-            for target in targets:
-                candidate=paste_keyframe_bundle(target,self.keyframe_clipboard)
-                proposed=[candidate if item.uid==target.uid else item for item in proposed]
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
-            self.statusBar().showMessage(f'Keyframes auf {len(targets)} Clip(s) angewendet.',3500)
-        except Exception as exc:
-            self.error(exc)
-
-    def _clipboard_candidates(self, anchor):
-        if not self.clipboard:
-            return []
-        minimum = min(clip.position for clip in self.clipboard)
-        group_map = {}
-        compound_map = {}
-        multicam_map = {}
-        candidates = []
-        for clip in self.clipboard:
-            track = clip.track
-            if track not in self.tracks:
-                compatible = [value for value in self.tracks if (value > 0) == (clip.kind in ('video','text'))]
-                if not compatible:
-                    raise ValueError('FÃ¼r einen eingefÃ¼gten Clip fehlt eine passende Spur.')
-                track = min(compatible, key=abs)
-            if self.track_locked(track):
-                raise ValueError('Eine Zielspur ist gesperrt.')
-            group_id = ''
-            if clip.group_id:
-                group_id = group_map.setdefault(clip.group_id, uuid.uuid4().hex)
-            value = self._clone_clip(clip, group_id=group_id)
-            compound_id = ''
-            if clip.compound_id:
-                compound_id = compound_map.setdefault(clip.compound_id, uuid.uuid4().hex)
-            multicam_group = ''
-            if clip.multicam_group:
-                multicam_group = multicam_map.setdefault(clip.multicam_group, uuid.uuid4().hex)
-            candidates.append(replace(value,compound_id=compound_id,multicam_group=multicam_group))
-            candidates[-1] = replace(candidates[-1], position=max(0.0, anchor + clip.position - minimum), track=track)
-        return candidates
-
-    def _free_paste_candidates(self, candidates):
-        """Shift a pasted group right until every target track is collision-free."""
-        if not candidates:
-            return []
-        shift = 0.0
-        for _ in range(200):
-            proposed = [replace(clip, position=clip.position + shift) for clip in candidates]
-            try:
-                validate_timeline(self.clips + proposed, self.tracks)
-                return proposed
-            except ValueError:
-                conflicts = []
-                proposed_ids = {clip.uid for clip in proposed}
-                for candidate in proposed:
-                    for existing in self.clips:
-                        if existing.track == candidate.track and existing.uid not in proposed_ids and candidate.position < existing.finish - 1e-7 and candidate.finish > existing.position + 1e-7:
-                            conflicts.append(existing.finish - candidate.position)
-                if not conflicts:
-                    raise
-                shift += max(conflicts)
-        raise ValueError('Kein freier Platz fÃ¼r die eingefÃ¼gten Clips gefunden.')
-
-    def paste_selection(self, ripple=False, anchor=None):
-        if self.worker:
-            return
-        if not self.clipboard:
-            return self.statusBar().showMessage('Nichts kopiert.',3000)
-        if anchor is None:
-            anchor = self.playhead
-        try:
-            candidates = self._clipboard_candidates(max(0.0, float(anchor)))
-            if ripple:
-                return self._insert_candidates_ripple(candidates)
-            candidates = self._free_paste_candidates(candidates)
-            self.checkpoint(); self.clips.extend(candidates); self.selection=[clip.uid for clip in candidates]
-            self.current=candidates[-1].uid if candidates else None; self.changed()
-            self.statusBar().showMessage(f"{len(candidates)} Clip{'s' if len(candidates) != 1 else ''} eingefÃ¼gt.",3000)
-        except Exception as exc:
-            self.error(exc)
-
-    def insert_selection(self):
-        """Insert the clipboard at the playhead and ripple later clips right."""
-        if not self.clipboard:
-            self.copy_selection()
-        if self.clipboard:
-            self.paste_selection(ripple=True)
-
-    def overwrite_selection(self):
-        """Overwrite the timeline at the playhead without shifting later clips."""
-        if self.worker:
-            return
-        if not self.clipboard:
-            self.copy_selection()
-        if not self.clipboard:
-            return
-        try:
-            candidates = self._clipboard_candidates(max(0.0, float(self.playhead)))
-            self._overwrite_candidates(candidates)
-        except Exception as exc:
-            self.error(exc)
-
-    def duplicate_selection(self):
-        clips = self.selected_clips()
-        if not clips:
-            return self.statusBar().showMessage('Kein Clip ausgewÃ¤hlt.',3000)
-        self.clipboard = [self._clone_clip(clip, uid=clip.uid) for clip in clips]
-        anchor = max(clip.finish for clip in clips) + 0.05
-        self.paste_selection(anchor=anchor)
-
-    def group_selection(self):
-        clips = self.selected_clips()
-        if len(clips) < 2:
-            return self.statusBar().showMessage('WÃ¤hle mindestens zwei Clips zum Gruppieren.',3000)
-        if self.selection_locked():
-            return self.statusBar().showMessage('Eine ausgewÃ¤hlte Spur ist gesperrt.',3000)
-        group_id = uuid.uuid4().hex
-        self.checkpoint(); selected = {clip.uid for clip in clips}
-        self.clips = [replace(clip, group_id=group_id) if clip.uid in selected else clip for clip in self.clips]
-        self.changed(); self.statusBar().showMessage(f'{len(clips)} Clips gruppiert.',3000)
-
-    def ungroup_selection(self):
-        clips = self.selected_clips()
-        grouped = [clip for clip in clips if clip.group_id]
-        if not grouped:
-            return self.statusBar().showMessage('Die Auswahl enthÃ¤lt keine Gruppe.',3000)
-        if self.selection_locked():
-            return self.statusBar().showMessage('Eine ausgewÃ¤hlte Spur ist gesperrt.',3000)
-        selected = {clip.uid for clip in grouped}
-        self.checkpoint(); self.clips = [replace(clip, group_id='') if clip.uid in selected else clip for clip in self.clips]
-        self.changed(); self.statusBar().showMessage('Gruppe gelÃ¶st.',3000)
-
-    def create_compound(self):
-        clips=self.selected_clips()
-        if len(clips)<2:
-            return self.statusBar().showMessage('WÃ¤hle mindestens zwei Clips fÃ¼r einen Compound-Clip.',3000)
-        if self.selection_locked():
-            return self.statusBar().showMessage('Eine ausgewÃ¤hlte Spur ist gesperrt.',3000)
-        name,ok=QInputDialog.getText(self,'Compound-Clip erstellen','Name:',text='Compound Clip')
-        if not ok or not name.strip():
-            return
-        compound_id=uuid.uuid4().hex; selected={clip.uid for clip in clips}; name=name.strip()[:48]
-        self.checkpoint()
-        self.clips=[replace(clip,compound_id=compound_id,compound_name=name) if clip.uid in selected else clip for clip in self.clips]
-        self.changed(); self.statusBar().showMessage(f'Compound-Clip â€ž{name}â€œ Â· {len(clips)} Clips gebÃ¼ndelt.',4000)
-
-    def dissolve_compound(self):
-        clips=self.selected_clips()
-        compounds={clip.compound_id for clip in clips if clip.compound_id}
-        if not compounds:
-            return self.statusBar().showMessage('Die Auswahl enthÃ¤lt keinen Compound-Clip.',3000)
-        if self.selection_locked():
-            return self.statusBar().showMessage('Eine ausgewÃ¤hlte Spur ist gesperrt.',3000)
-        self.checkpoint()
-        self.clips=[replace(clip,compound_id='',compound_name='') if clip.compound_id in compounds else clip for clip in self.clips]
-        self.changed(); self.statusBar().showMessage('Compound-Clip gelÃ¶st Â· Einzelclips bleiben erhalten.',4000)
-
-    def sync_multicam(self):
-        clips=self.selected_clips()
-        if len(clips)<2 or any(clip.kind!='video' or clip.source_type!='video' for clip in clips):
-            return self.error('WÃ¤hle mindestens zwei normale Videoclips fÃ¼r Multi-Kamera.')
-        if any(not clip.has_audio for clip in clips):
-            return self.error('FÃ¼r die Multi-Kamera-Synchronisation braucht jeder Winkel eine Audiospur.')
-        if len({clip.track for clip in clips}) != len(clips):
-            return self.error('Lege jeden Kamera-Winkel auf eine eigene Videospur.')
-        if any(self.track_locked(clip.track) for clip in clips):
-            return self.error('Eine ausgewÃ¤hlte Kamera-Spur ist gesperrt.')
-        selected=[replace(clip) for clip in clips]; group_id=uuid.uuid4().hex
-        def operation(progress,cancel):
-            offsets={}
-            for index,clip in enumerate(selected):
-                if cancel.is_set():
-                    raise ExportCancelled()
-                value=detect_audio_onset(clip.path,clip.start,clip.end,
-                                         lambda item,base=index:progress(int((base+item/100)/len(selected)*100)),cancel)
-                offsets[clip.uid]=float(value)
-            target=max(clip.position+offsets[clip.uid] for clip in selected)
-            return {'offsets':offsets,'target':target}
-        self.start_job('Multi-Kamera wird per Audio synchronisiert â€¦',operation,
-                       lambda result:self.multicam_sync_done(result,selected,group_id))
-
-    def multicam_sync_done(self,result,selected,group_id):
-        if not result['ok']:
-            return self.job_error(result)
-        current={clip.uid:clip for clip in self.clips}
-        if any(clip.uid not in current for clip in selected):
-            return self.statusBar().showMessage('Eine Kamera wurde wÃ¤hrend der Analyse entfernt.',5000)
-        offsets=result['value']['offsets']; target=float(result['value']['target'])
-        try:
-            proposed=[]
-            for value in self.clips:
-                match=next((clip for clip in selected if clip.uid==value.uid),None)
-                if match is None:
-                    proposed.append(value); continue
-                position=max(0.0,round(target-float(offsets.get(value.uid,0.0)),6))
-                angle=f'Angle {selected.index(match)+1}'
-                proposed.append(replace(value,position=position,multicam_group=group_id,
-                                        camera_angle=angle,multicam_active=selected.index(match)==0))
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.selection=[clip.uid for clip in selected]; self.current=selected[0].uid; self.changed()
-            self.statusBar().showMessage(f'Multi-Kamera synchronisiert Â· {len(selected)} Winkel Â· {target:.2f} s Referenz.',6000)
-        except Exception as exc:
-            self.error(exc)
-
-    def switch_multicam_angle(self):
-        c=self.current_clip()
-        if not c or not c.multicam_group:
-            return self.error('WÃ¤hle einen Clip aus einer Multi-Kamera-Gruppe.')
-        members=[value for value in self.clips if value.multicam_group==c.multicam_group]
-        if any(self.track_locked(value.track) for value in members):
-            return self.error('Eine Kamera-Spur ist gesperrt.')
-        proposed=[replace(value,multicam_active=(value.uid==c.uid)) if value.multicam_group==c.multicam_group else value for value in self.clips]
-        try:
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
-            self.statusBar().showMessage(f'{c.camera_angle or "Kamera"} ist jetzt aktiv.',4000)
-        except Exception as exc:
-            self.error(exc)
-
-    def sync_audio_selection(self):
-        """Align any selected video/audio sources by their first audio onset."""
-        clips=self.selected_clips()
-        if len(clips)<2 or any(clip.kind not in ('video','audio') or clip.source_type not in ('video','audio')
-                               for clip in clips):
-            return self.error('WÃ¤hle mindestens zwei normale Video- oder Audioclips fÃ¼r Audio-Sync.')
-        if any(not clip.has_audio for clip in clips):
-            return self.error('Jeder ausgewÃ¤hlte Clip braucht eine Audiospur.')
-        if any(self.track_locked(clip.track) for clip in clips):
-            return self.error('Eine ausgewÃ¤hlte Spur ist gesperrt.')
-        selected=[replace(clip) for clip in clips]
-        def operation(progress,cancel):
-            offsets={}
-            for index,clip in enumerate(selected):
-                if cancel.is_set():
-                    raise ExportCancelled()
-                offsets[clip.uid]=float(detect_audio_onset(
-                    clip.path,clip.start,clip.end,
-                    lambda value,base=index: progress(int((base+value/100)/len(selected)*100)),cancel))
-            target=max(clip.position+offsets[clip.uid] for clip in selected)
-            return {'offsets':offsets,'target':target}
-        self.start_job('Audio-Sync wird analysiert â€¦',operation,
-                       lambda result:self.audio_sync_done(result,selected))
-
-    def audio_sync_done(self,result,selected):
-        if not result['ok']:
-            return self.job_error(result)
-        offsets=result['value']['offsets']; target=float(result['value']['target'])
-        selected_ids={clip.uid for clip in selected}
-        try:
-            proposed=[replace(value,position=max(0.0,round(target-float(offsets.get(value.uid,0.0)),6)))
-                      if value.uid in selected_ids else value for value in self.clips]
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed()
-            self.statusBar().showMessage(f'Audio-Sync abgeschlossen Â· {len(selected)} Clips ausgerichtet.',5000)
-        except Exception as exc:
-            self.error(exc)
-
-    def close_selected_track_gaps(self):
-        clip=self.current_clip()
-        if not clip or self.worker:
-            return self.statusBar().showMessage('WÃ¤hle einen Clip auf der zu bereinigenden Spur aus.',3500)
-        track=clip.track
-        if self.track_locked(track):
-            return self.statusBar().showMessage('Die Spur ist gesperrt.',3000)
-        try:
-            proposed,removed=close_track_gaps(self.clips,track)
-            if removed < MIN_CLIP:
-                return self.statusBar().showMessage('Auf dieser Spur gibt es keine schlieÃŸbare LÃ¼cke.',3500)
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed()
-            self.statusBar().showMessage(f'LÃ¼cken auf Spur geschlossen Â· {removed:.2f} s eingespart.',4000)
-        except Exception as exc:
-            self.error(exc)
-
-    def add_freeze_frame(self):
-        """Create a short still overlay from the current source frame."""
-        clip=self.current_clip()
-        if (not clip or clip.kind != 'video' or clip.source_type not in ('video','image')
-                or self.worker):
-            return self.statusBar().showMessage('WÃ¤hle einen normalen Videoclip fÃ¼r ein Standbild aus.',3500)
-        if self.track_locked(clip.track):
-            return self.statusBar().showMessage('Die ausgewÃ¤hlte Spur ist gesperrt.',3000)
-        local=max(0.0,min(clip.length,self.playhead-clip.position))
-        source_time=min(clip.duration-0.001,max(0.0,clip.start+local*clip.speed))
-        frame_step=max(1.0/120.0,min(0.2,self._frame_step(clip)))
-        source_end=min(clip.duration,source_time+frame_step)
-        if source_end-source_time < MIN_CLIP:
-            source_time=max(0.0,clip.duration-MIN_CLIP); source_end=clip.duration
-        track=max((value for value in self.tracks if value>0),default=0)+1
-        candidate=replace(clip,uid=uuid.uuid4().hex,start=source_time,end=source_end,
-                          position=self.playhead,track=track,freeze_frame=True,
-                          freeze_duration=2.0,transition_type='none',transition_duration=0.0,
-                          keyframes=[],volume_keyframes=[],speed_keyframes=[],
-                          tracking_keyframes=[],auto_reframe_keyframes=[],mask_path_keyframes=[])
-        candidate=replace(candidate,compound_id='',compound_name='',multicam_group='',camera_angle='',multicam_active=True)
-        try:
-            proposed_tracks=list(self.tracks)+[track]
-            validate_timeline(self.clips+[candidate],proposed_tracks)
-            self.checkpoint(); self.tracks=proposed_tracks; self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks)
-            self.track_names[track]='Standbild'
-            self.clips.append(candidate); self.selection=[candidate.uid]; self.current=candidate.uid; self.changed()
-            self.statusBar().showMessage('Standbild eingefÃ¼gt Â· 2 Sekunden Freeze-Frame',4000)
-        except Exception as exc:
-            self.error(exc)
-
-    def start_frame_capture(self):
-        clip=self.current_clip()
-        if not clip or clip.kind != 'video' or clip.source_type not in ('video','image') or self.worker:
-            return self.statusBar().showMessage('WÃ¤hle einen normalen Videoclip fÃ¼r den Frame-Export aus.',3500)
-        default_name='Frame-'+self._source_clock(self.playhead-clip.position).replace(':','-')+'.png'
-        path,_=QFileDialog.getSaveFileName(self,'Aktuelles Bild speichern',default_name,'PNG (*.png)',options=QFileDialog.DontConfirmOverwrite)
-        if not path:
-            return
-        target=Path(path).resolve()
-        if target.exists() and QMessageBox.question(self,'Bild ersetzen?',f'{target}\nÃ¼berschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
-            return
-        local=max(0.0,min(clip.length,self.playhead-clip.position))
-        source_time=min(clip.duration-0.001,max(0.0,clip.start+local*clip.speed))
-        def operation(progress,cancel):
-            if cancel.is_set():
-                raise ExportCancelled()
-            progress(15)
-            value=capture_frame(clip.path,source_time,target)
-            progress(100)
-            return value
-        self.start_job('Frame wird gespeichert â€¦',operation,
-                       lambda result:self.statusBar().showMessage(
-                           f'Frame gespeichert: {result["value"]}',5000) if result['ok'] else self.job_error(result))
-
-    def export_chapters(self):
-        chapters=[marker for marker in self.markers if marker.get('kind') == 'chapter']
-        if not chapters:
-            return self.error('Setze zuerst mindestens einen Kapitelmarker.')
-        default='Kapitel.ffmeta'
-        if self.project_path:
-            default=str(Path(self.project_path).with_suffix('.ffmeta'))
-        path,_=QFileDialog.getSaveFileName(self,'Kapitel exportieren',default,'FFmpeg-Metadaten (*.ffmeta);;Alle Dateien (*)',options=QFileDialog.DontConfirmOverwrite)
-        if not path:
-            return
-        if not path.lower().endswith('.ffmeta'):
-            path+='.ffmeta'
-        target=Path(path).resolve()
-        if target.exists() and QMessageBox.question(self,'Kapitel ersetzen?',f'{target}\nÃ¼berschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
-            return
-        try:
-            write_chapter_file(target,self.markers,length(self.clips))
-            self.statusBar().showMessage(f'{len(chapters)} Kapitel exportiert Â· {target.name}',5000)
-        except Exception as exc:
-            self.error(exc)
-
-    def _insert_candidates_ripple(self, candidates):
-        if not candidates:
-            return
-        for track in {clip.track for clip in candidates}:
-            if self.track_locked(track):
-                raise ValueError('Eine Zielspur ist gesperrt.')
-        insert_at=min(clip.position for clip in candidates)
-        global_span=max(clip.finish for clip in candidates)-insert_at
-        if any(self.track_locked(clip.track) for clip in self.clips if clip.finish > insert_at-1e-7):
-            raise ValueError('Eine betroffene Spur ist gesperrt.')
-        moved = []
-        inserted_ids = {clip.uid for clip in candidates}
-        for clip in self.clips:
-            if clip.uid not in inserted_ids and clip.finish > insert_at-1e-7:
-                moved.append(replace(clip, position=clip.position + global_span))
-            else:
-                moved.append(clip)
-        proposed = moved + candidates
-        validate_timeline(proposed, self.tracks)
-        markers=[]
-        for marker in self.markers:
-            value=dict(marker)
-            if value['time'] >= insert_at-1e-7:
-                value['time'] += global_span
-            markers.append(value)
-        self.checkpoint(); self.clips=proposed; self.markers=normalize_markers(markers,length(proposed)); self.selection=[clip.uid for clip in candidates]; self.current=candidates[-1].uid; self.changed()
-        self.statusBar().showMessage(f"{len(candidates)} Clip{'s' if len(candidates) != 1 else ''} mit Ripple eingefÃ¼gt.",3000)
-
-    def _overwrite_candidates(self, candidates):
-        """Trim or remove covered clips, then place candidates at fixed time."""
-        if not candidates:
-            return
-        for candidate in candidates:
-            if self.track_locked(candidate.track):
-                raise ValueError('Eine Zielspur ist gesperrt.')
-        working=list(self.clips)
-        candidates=sorted(candidates,key=lambda value:(value.track,value.position))
-        candidate_ids={value.uid for value in candidates}
-
-        def clear_transition(value):
-            return replace(value, transition_type='none', transition_duration=0.0)
-
-        for candidate in candidates:
-            updated=[]
-            for existing in working:
-                if (existing.uid in candidate_ids or existing.track != candidate.track
-                        or existing.finish <= candidate.position+1e-7
-                        or existing.position >= candidate.finish-1e-7):
-                    updated.append(existing)
-                    continue
-                if self.track_locked(existing.track):
-                    raise ValueError('Eine betroffene Spur ist gesperrt.')
-                left_span=candidate.position-existing.position
-                right_span=existing.finish-candidate.finish
-                if left_span >= MIN_CLIP-1e-7 and right_span >= MIN_CLIP-1e-7:
-                    left,right=split_clip(existing,candidate.position)
-                    right=edited_clip(right,'left',candidate.finish-right.position)
-                    updated.extend([clear_transition(left),clear_transition(right)])
-                elif left_span >= MIN_CLIP-1e-7:
-                    updated.append(clear_transition(edited_clip(existing,'right',candidate.position-existing.finish)))
-                elif right_span >= MIN_CLIP-1e-7:
-                    updated.append(clear_transition(edited_clip(existing,'left',candidate.finish-existing.position)))
-                # If neither side is long enough, the old clip is fully covered.
-            working=updated
-        proposed=working+candidates
-        validate_timeline(proposed,self.tracks)
-        self.checkpoint(); self.clips=proposed; self.selection=[clip.uid for clip in candidates]; self.current=candidates[-1].uid; self.changed()
-        self.statusBar().showMessage(f"{len(candidates)} Clip{'s' if len(candidates) != 1 else ''} Ã¼berschrieben.",3000)
-
-    def ripple_insert(self):
-        self.paste_selection(ripple=True)
-
-    def ripple_delete(self):
-        clips = self.selected_clips()
-        if not clips:
-            return self.statusBar().showMessage('Kein Clip ausgewÃ¤hlt.',3000)
-        if self.selection_locked():
-            return self.statusBar().showMessage('Eine ausgewÃ¤hlte Spur ist gesperrt.',3000)
-        removed = {clip.uid for clip in clips}
-        for clip in self.clips:
-            if clip.uid in removed:
-                continue
-            shift = sum(value.length for value in clips if value.track == clip.track and value.finish <= clip.position + 1e-7)
-            if shift and self.track_locked(clip.track):
-                return self.statusBar().showMessage('Eine betroffene Spur ist gesperrt.',3000)
-        proposed = []
-        for clip in self.clips:
-            if clip.uid in removed:
-                continue
-            shift = sum(value.length for value in clips if value.track == clip.track and value.finish <= clip.position + 1e-7)
-            proposed.append(replace(clip, position=max(0.0, clip.position-shift)) if shift else clip)
-        try:
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.selection=[]; self.current=None; self.changed()
-            self.statusBar().showMessage(f'{len(clips)} Clips gelÃ¶scht und die Spur geschlossen.',3000)
-        except Exception as exc:
-            self.error(exc)
-
-    def track_locked(self, track):
-        return bool(self.track_states.get(track, {}).get('locked', False))
-
-    def require_unlocked(self, clip):
-        if clip is not None and self.track_locked(clip.track):
-            self.statusBar().showMessage('Diese Spur ist gesperrt.',3000)
-            return False
-        return True
-
-    def toggle_track_mute(self, track):
-        if self.worker or track not in self.tracks:
-            return
-        self.checkpoint()
-        state=self.track_states.setdefault(track, {'muted':False,'locked':False,'solo':False,'volume':1.0,'pan':0.0})
-        state['muted']=not state.get('muted',False)
-        self.track_states=normalize_track_states(self.track_states,self.tracks)
-        self.changed()
-        self.statusBar().showMessage(f"Spur {'stummgeschaltet' if state['muted'] else 'wieder hÃ¶rbar'}: {('Video ' + str(track)) if track > 0 else ('Audio ' + str(-track))}",3000)
-
-    def toggle_track_lock(self, track):
-        if self.worker or track not in self.tracks:
-            return
-        self.checkpoint()
-        state=self.track_states.setdefault(track, {'muted':False,'locked':False,'solo':False,'volume':1.0,'pan':0.0})
-        state['locked']=not state.get('locked',False)
-        self.track_states=normalize_track_states(self.track_states,self.tracks)
-        self.changed()
-        self.statusBar().showMessage(f"Spur {'gesperrt' if state['locked'] else 'entsperrt'}: {('Video ' + str(track)) if track > 0 else ('Audio ' + str(-track))}",3000)
-
-    def open_mixer(self):
-        if self.worker:
-            return
-        if self.mixer_dialog is not None:
-            self.mixer_dialog.raise_(); self.mixer_dialog.activateWindow(); return
-        self.mixer_dialog=MixerDialog(self)
-        self.mixer_dialog.show()
-
-    def command_definitions(self):
-        """Return the high-value actions exposed by Ctrl+K."""
-        return [
-            ('Neues Projekt', 'Ctrl+N', self.new_project),
-            ('Projekt Ã¶ffnen', 'Ctrl+O', self.open_project),
-            ('Projekt speichern', 'Ctrl+S', self.save),
-            ('Medien importieren', 'Ctrl+I', self.import_dialog),
-            ('Fokusmodus umschalten', 'Ctrl+Shift+F', self.toggle_focus_mode),
-            ('Bearbeitungsverlauf Ã¶ffnen', 'Ctrl+Alt+Z', self.show_history),
-            ('Projekt-Statuszentrale Ã¶ffnen', 'â€”', self.show_project_status),
-            ('Zum vorherigen Schnitt', 'â†‘', lambda:self.jump_cut(-1)),
-            ('Zum nÃ¤chsten Schnitt', 'â†“', lambda:self.jump_cut(1)),
-            ('Einfach-Modus aktivieren', 'â€”', lambda: self.edit_mode_combo.setCurrentIndex(self.edit_mode_combo.findData('simple'))),
-            ('Pro-Modus aktivieren', 'â€”', lambda: self.edit_mode_combo.setCurrentIndex(self.edit_mode_combo.findData('pro'))),
-            ('Schnitt-Layout aktivieren', 'â€”', lambda: self.workspace_preset_combo.setCurrentIndex(self.workspace_preset_combo.findData('edit'))),
-            ('Shorts-Layout aktivieren', 'â€”', lambda: self.workspace_preset_combo.setCurrentIndex(self.workspace_preset_combo.findData('shorts'))),
-            ('Audio-Layout aktivieren', 'â€”', lambda: self.workspace_preset_combo.setCurrentIndex(self.workspace_preset_combo.findData('audio'))),
-            ('Medien-Favorit umschalten', 'â€”', self.toggle_asset_favorite),
-            ('Timeline abspielen / pausieren', 'Leertaste', self.toggle_play),
-            ('Vollbildvorschau Ã¶ffnen / schlieÃŸen', 'F11', self.toggle_cinema_preview),
-            ('Clip teilen', 'S / Ctrl+B', self.split),
-            ('Ripple-In zum Abspielkopf', 'Q', self.ripple_trim_in),
-            ('Ripple-Out zum Abspielkopf', 'W', self.ripple_trim_out),
-            ('Roll-Schnitt zum Abspielkopf', 'R', self.roll_to_playhead),
-            ('Quell-In setzen', 'I', self.set_source_in),
-            ('Quell-Out setzen', 'O', self.set_source_out),
-            ('Quellmarken lÃ¶schen', 'â€”', self.clear_source_marks),
-            ('Quellbereich als Insert einfÃ¼gen', 'â€”', self.insert_source_range),
-            ('Quellbereich als Overwrite einfÃ¼gen', 'â€”', self.overwrite_source_range),
-            ('Arbeitsbereich-In setzen', 'Ctrl+Alt+I', self.set_work_in),
-            ('Arbeitsbereich-Out setzen', 'Ctrl+Alt+O', self.set_work_out),
-            ('Arbeitsbereich lÃ¶schen', 'â€”', self.clear_work_area),
-            ('Attribute kopieren', 'Ctrl+Alt+C', self.copy_attributes),
-            ('Attribute einfÃ¼gen', 'Ctrl+Alt+V', self.paste_attributes),
-            ('Keyframes kopieren', 'Ctrl+Alt+K', self.copy_keyframes),
-            ('Keyframes einfÃ¼gen', 'Ctrl+Alt+Shift+K', self.paste_keyframes),
-            ('Audio-Sync fÃ¼r Auswahl', 'â€”', self.sync_audio_selection),
-            ('LÃ¼cken auf aktueller Spur schlieÃŸen', 'â€”', self.close_selected_track_gaps),
-            ('Standbild am Abspielkopf einfÃ¼gen', 'â€”', self.add_freeze_frame),
-            ('Aktuelles Bild als PNG speichern', 'â€”', self.start_frame_capture),
-            ('Kapitel exportieren', 'â€”', self.export_chapters),
-            ('Slide-Schnitt links', 'Alt+â†', lambda: self.slide_selected(-1)),
-            ('Slide-Schnitt rechts', 'Alt+â†’', lambda: self.slide_selected(1)),
-            ('Slip-Schnitt links', 'Umschalt+Alt+â†', lambda: self.slip_selected(-1)),
-            ('Slip-Schnitt rechts', 'Umschalt+Alt+â†’', lambda: self.slip_selected(1)),
-            ('Auswahl entfernen', 'Entf', self.remove),
-            ('RÃ¼ckgÃ¤ngig', 'Ctrl+Z', self.undo),
-            ('Wiederholen', 'Ctrl+Shift+Z', self.redo),
-            ('Textclip hinzufÃ¼gen', '+ Text', self.add_text),
-            ('Adjustment-Layer hinzufÃ¼gen', '+ Adjustment-Layer', self.add_adjustment_layer),
-            ('Automatische Untertitel erstellen', 'â€”', self.automatic_subtitle_dialog),
-            ('Textbasierter Schnitt Â· Pausen und FÃ¼llwÃ¶rter entfernen', 'â€”', self.start_text_based_cut),
-            ('KI-Hintergrund entfernen', 'â€”', self.start_background_removal),
-            ('Motion-Tracking starten', 'â€”', self.start_motion_tracking),
-            ('Bezier-Maske automatisch verfolgen', 'â€”', self.start_mask_tracking),
-            ('Tracking lÃ¶schen', 'â€”', self.clear_motion_tracking),
-            ('KI-Auto-Reframe analysieren', 'â€”', self.start_auto_reframe),
-            ('Auto-Reframe lÃ¶schen', 'â€”', self.clear_auto_reframe),
-            ('Beat-Sync analysieren', 'â€”', self.start_beat_analysis),
-            ('Beat-/Szenen-Auto-Cut', 'â€”', self.start_auto_cut),
-            ('Beat-Marker lÃ¶schen', 'â€”', self.clear_beat_markers),
-            ('Objektentfernung aktivieren', 'â€”', lambda: self.set_object_removal_enabled(True)),
-            ('Compound-Clip erstellen', 'â€”', self.create_compound),
-            ('Compound-Clip auflÃ¶sen', 'â€”', self.dissolve_compound),
-            ('Multi-Kamera synchronisieren', 'â€”', self.sync_multicam),
-            ('Als aktive Kamera verwenden', 'â€”', self.switch_multicam_angle),
-            ('Audio-Mixer Ã¶ffnen', 'â€”', self.open_mixer),
-            ('Render-Queue Ã¶ffnen', 'â€”', self.show_render_queue),
-            ('Timeline einpassen', 'â€”', self.fit_timeline),
-            ('Nach Updates suchen', 'â€”', self.check_for_updates),
-        ]
-
-    def open_command_palette(self):
-        if self.worker:
-            return
-        dialog=CommandPaletteDialog(self)
-        dialog.exec()
-
-    def toggle_cinema_preview(self):
-        if self.worker:
-            return
-        if self.cinema_dialog is not None:
-            self.cinema_dialog.close()
-            return
-        self.cinema_dialog=CinemaPreviewDialog(self)
-        self.cinema_button.setText('Ã— Cinema schlieÃŸen')
-        self.cinema_dialog.showFullScreen()
-
-    def start_voiceover_recording(self):
-        """Record a WAV through Qt Multimedia and place it at the playhead."""
-        if self.worker or self.voiceover_recorder is not None:
-            return
-        path,_=QFileDialog.getSaveFileName(self,'Voice-over aufnehmen','voice-over.wav','WAV-Audio (*.wav)')
-        if not path:
-            return
-        if not path.lower().endswith('.wav'):
-            path += '.wav'
-        target=Path(path).resolve()
-        if target.exists() and QMessageBox.question(self,'Aufnahme ersetzen?',f'{target}\nÃ¼berschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
-            return
-        dialog=QDialog(self); dialog.setWindowTitle('Voice-over aufnehmen'); dialog.setMinimumWidth(420)
-        layout=QVBoxLayout(dialog); layout.setContentsMargins(18,16,18,16); layout.setSpacing(10)
-        layout.addWidget(label('VOICE-OVER Â· AUFNAHME','heading'))
-        status=label('Mikrofon wird gestartet â€¦','muted'); status.setWordWrap(True); layout.addWidget(status)
-        destination=label(str(target),'muted'); destination.setWordWrap(True); layout.addWidget(destination)
-        timer_label=label('00:00','heading'); layout.addWidget(timer_label)
-        actions=QHBoxLayout(); stop=QPushButton('Aufnahme stoppen'); close=QPushButton('Abbrechen'); actions.addStretch(); actions.addWidget(stop); actions.addWidget(close); layout.addLayout(actions)
-        self.voiceover_dialog=dialog; self.voiceover_target=target; self.voiceover_started_at=0.0
-        self.voiceover_capture=QMediaCaptureSession(self); self.voiceover_input=QAudioInput(self); self.voiceover_recorder=QMediaRecorder(self)
-        self.voiceover_capture.setAudioInput(self.voiceover_input); self.voiceover_capture.setRecorder(self.voiceover_recorder)
-        media_format=QMediaFormat(); media_format.setFileFormat(QMediaFormat.FileFormat.Wave); media_format.setAudioCodec(QMediaFormat.AudioCodec.Wave)
-        self.voiceover_recorder.setMediaFormat(media_format); self.voiceover_recorder.setOutputLocation(QUrl.fromLocalFile(str(target)))
-        self.voiceover_stopping=False
-        clock=QTimer(dialog); clock.setInterval(100); clock.timeout.connect(lambda: timer_label.setText(f'{max(0,self.voiceover_recorder.duration()/1000):.1f} s')); clock.start()
-        def recorder_error(*_):
-            status.setText('Aufnahmefehler: '+self.voiceover_recorder.errorString())
-            stop.setEnabled(False)
-        def recorder_state(state):
-            if state == QMediaRecorder.RecorderState.RecordingState:
-                status.setText('Aufnahme lÃ¤uft â€¦ sprich jetzt.'); stop.setEnabled(True)
-            elif state == QMediaRecorder.RecorderState.StoppedState and self.voiceover_stopping:
-                QTimer.singleShot(150,lambda:self.finish_voiceover_recording(dialog))
-        self.voiceover_recorder.errorOccurred.connect(recorder_error)
-        self.voiceover_recorder.recorderStateChanged.connect(recorder_state)
-        stop.clicked.connect(lambda:(setattr(self,'voiceover_stopping',True),self.voiceover_recorder.stop()))
-        close.clicked.connect(lambda:(setattr(self,'voiceover_stopping',True),self.voiceover_recorder.stop()))
-        dialog.finished.connect(lambda *_: clock.stop())
-        self.voiceover_stopping=True
-        self.voiceover_recorder.record()
-        dialog.show()
-
-    def finish_voiceover_recording(self, dialog):
-        target=self.voiceover_target
-        recorder=self.voiceover_recorder
-        actual=recorder.actualLocation().toLocalFile() if recorder is not None else ''
-        if actual:
-            target=Path(actual).resolve()
-        self.voiceover_capture=None; self.voiceover_input=None; self.voiceover_recorder=None; self.voiceover_target=None; self.voiceover_stopping=False
-        if dialog is not None:
-            dialog.close(); dialog.deleteLater(); self.voiceover_dialog=None
-        if not target or not target.is_file() or target.stat().st_size <= 44:
-            return self.error('Die Voice-over-Aufnahme enthÃ¤lt keine Audiodaten.')
-        self.import_voiceover_file(target)
-
-    def import_voiceover_file(self, path):
-        try:
-            audio=import_clip(path)
-            track_candidates=[track for track in sorted((value for value in self.tracks if value < 0), reverse=True)
-                              if not self.track_locked(track)]
-            position=max(0.0,min(self.playhead,length(self.clips)))
-            candidate=None; chosen_tracks=list(self.tracks)
-            for track in track_candidates:
-                value=replace(audio,uid=uuid.uuid4().hex,position=position,track=track)
-                try:
-                    validate_timeline(self.clips+[value],self.tracks); candidate=value; break
-                except ValueError:
-                    continue
-            if candidate is None:
-                track=min(self.tracks+[0])-1; chosen_tracks.append(track)
-                candidate=replace(audio,uid=uuid.uuid4().hex,position=position,track=track)
-                validate_timeline(self.clips+[candidate],chosen_tracks)
-            self.checkpoint(); self.tracks=chosen_tracks
-            self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks)
-            self.assets.append(audio); self.clips.append(candidate); self.selection=[candidate.uid]; self.current=candidate.uid
-            self.prepare_visuals([audio]); self.changed()
-            self.statusBar().showMessage(f'Voice-over aufgenommen Â· auf {self.default_track_name(candidate.track)} gelegt.',5000)
-        except Exception as exc:
-            self.error(exc)
-
-    def snapshot(self):
-        clone=lambda c: replace(c, keyframes=[dict(frame) for frame in c.keyframes],
-                                volume_keyframes=[dict(frame) for frame in c.volume_keyframes],
-                                speed_keyframes=[dict(frame) for frame in c.speed_keyframes],
-                                tracking_keyframes=[dict(point) for point in c.tracking_keyframes],
-                                auto_reframe_keyframes=[dict(point) for point in c.auto_reframe_keyframes],
-                                mask_points=[dict(point) for point in c.mask_points],
-                                mask_path_keyframes=[dict(frame, points=[dict(point) for point in frame.get('points', [])])
-                                                     for frame in c.mask_path_keyframes],
-                                source_paths=list(c.source_paths))
-        return ([clone(c) for c in self.clips],
-                list(self.tracks),self.current,
-                {track:dict(state) for track,state in self.track_states.items()},
-                dict(self.track_names),list(self.selection),[clone(c) for c in self.assets],
-                [dict(marker) for marker in self.markers],dict(self.master_mixer))
-
-    def checkpoint(self,title=None):
-        caller=inspect.currentframe().f_back.f_code.co_name
-        self.history.append(self.snapshot()); self.history=self.history[-80:]; self.future.clear()
-        self.history_labels.append(title or HISTORY_NAMES.get(caller,'Bearbeitung'))
-        self.history_labels=self.history_labels[-80:]; self.future_labels.clear()
-
-    def changed(self):
-        self.compare_released()
-        direct_was_playing=self.direct_preview_is_current() and self.player.playbackState()==QMediaPlayer.PlayingState
-        self.dirty=True; self.revision+=1; self.preview_revision=-1; self.preview_signature=None
-        self.preview_queued=True; self.preview_play_requested=False
-        if self.preview_worker:
-            # Cancel an obsolete render. The current frame stays visible while
-            # the newer render is prepared in the background.
-            self.preview_worker.cancel.set()
-        self.transport_timer.stop(); self.transport_rate=0.0; self.transport_rate_pending=None
-        self.direct_preview=False; self.direct_preview_revision=-1; self.direct_preview_signature=None
-        self.player.pause(); self.player.setPlaybackRate(1.0); self.mode='timeline'; self.pending_seek=None
-        self.source_clip_uid=None; self.source_in=None; self.source_out=None
-        if self.preview_path and Path(self.preview_path).is_file():
-            self.preview_status.setText('Vorschau wird im Hintergrund aktualisiert â€¦')
-        else:
-            self.video_stack.setCurrentIndex(0)
-            self.placeholder.setText('Timeline geÃ¤ndert\n\nâ–¶ Timeline berechnet eine neue Vorschau.\nâ€žClip ansehenâ€œ zeigt sofort die einzelne Quelle.')
-            self.preview_status.setText('Vorschau wird nach kurzer Pause im Hintergrund berechnet â€¦')
-        self.setWindowTitle(f'Framecut {APP_VERSION} Â· '+(Path(self.project_path).stem if self.project_path else 'Neues Projekt')+' *')
-        self.autosave_label.setText('Ã„nderungen Â· Autosave folgt â€¦'); self.autosave_timer.start()
-        self.update_project_identity()
-        self.update_source_monitor_controls()
-        direct_ready=self.activate_direct_preview(play=direct_was_playing)
-        if direct_ready:
-            self.preview_queued=False
-            self.live_preview_timer.stop()
-        elif hasattr(self,'live_preview_box') and self.live_preview_box.isChecked() and self.clips:
-            self.live_preview_timer.start()
-        self.refresh()
-        self.refresh_history()
-        QTimer.singleShot(0,self.ensure_missing_proxies)
-
-    def preset_changed(self,*_): self.changed()
-
-    def undo(self):
-        if self.history and not self.worker:
-            self.future_labels.append(self.history_labels.pop() if self.history_labels else 'Bearbeitung')
-            self.future.append(self.snapshot()); self.clips,self.tracks,self.current,self.track_states,self.track_names,self.selection,self.assets,self.markers,self.master_mixer=self.history.pop(); self.refresh_media(); self.prepare_visuals(self.assets); self.changed()
-
-    def redo(self):
-        if self.future and not self.worker:
-            self.history_labels.append(self.future_labels.pop() if self.future_labels else 'Bearbeitung')
-            self.history.append(self.snapshot()); self.clips,self.tracks,self.current,self.track_states,self.track_names,self.selection,self.assets,self.markers,self.master_mixer=self.future.pop(); self.refresh_media(); self.prepare_visuals(self.assets); self.changed()
-
-    def refresh(self):
-        self.timeline.refresh(self.clips,self.tracks,self.current,self.track_states,self.track_names,self.selection,self.markers)
-        self.timeline.set_visuals(self.thumbnails,self.waveforms)
-        self.video_tracks.blockSignals(True); self.video_tracks.setValue(len([t for t in self.tracks if t>0])); self.video_tracks.blockSignals(False)
-        self.audio_tracks.blockSignals(True); self.audio_tracks.setValue(len([t for t in self.tracks if t<0])); self.audio_tracks.blockSignals(False)
-        self.total.setText(f'{len(self.clips)} Clips Â· {length(self.clips):.1f} s')
-        self.update_work_area_controls()
-        self.playhead=max(0,self.playhead); self.timeline.set_playhead(self.playhead)
-        self.update_time(); self.fill_inspector()
-        if self.mixer_dialog is not None:
-            self.mixer_dialog.refresh_from_editor()
-
-    def refresh_keyframe_list(self, clip):
-        self.keyframe_list.blockSignals(True)
-        self.keyframe_list.clear()
-        for keyframe in clip.keyframes:
-            opacity=float(keyframe.get('opacity',clip.opacity))*100
-            blur=float(keyframe.get('blur',clip.blur))
-            curve=KEYFRAME_CURVE_LABELS.get(keyframe.get('curve','linear'),'Linear')
-            item=QListWidgetItem(f"{float(keyframe['time']):.2f} s   Â·   Zoom {float(keyframe['scale']):.2f}Ã—   Â·   X {float(keyframe['x'])*100:.0f}%   Â·   Y {float(keyframe['y'])*100:.0f}%   Â·   {float(keyframe['rotation']):.0f}Â°   Â·   Deckkraft {opacity:.0f}%   Â·   UnschÃ¤rfe {blur:.1f}   Â·   {curve}")
-            item.setData(Qt.UserRole,float(keyframe['time']))
-            self.keyframe_list.addItem(item)
-        self.keyframe_list.clearSelection()
-        self.keyframe_list.setCurrentRow(-1)
-        self.keyframe_list.blockSignals(False)
-
-    def refresh_keyframe_graph(self, clip):
-        if not clip or clip.kind != 'video':
-            self.keyframe_graph.set_data([], 1.0, 'scale', 1.0)
-            return
-        field=self.keyframe_graph_property.currentData() or 'scale'
-        defaults={'scale':clip.video_scale,'x':clip.video_x,'y':clip.video_y,
-                  'rotation':clip.rotation,'opacity':clip.opacity,'blur':clip.blur}
-        self.keyframe_graph.set_data(clip.keyframes,clip.length,field,defaults[field])
-
-    def graph_keyframe_drag_started(self):
-        c=self.current_clip()
-        if c and c.kind=='video' and not self.worker and self.require_unlocked(c):
-            self.checkpoint()
-
-    def graph_keyframe_moved(self,index,time,value):
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker or index < 0 or index >= len(c.keyframes) or not self.require_unlocked(c):
-            return
-        field=self.keyframe_graph_property.currentData() or 'scale'
-        frames=[dict(frame) for frame in c.keyframes]
-        frames[index]['time']=round(max(0.0,min(c.length,float(time))),6)
-        frames[index][field]=round(float(value),6)
-        frames.sort(key=lambda frame:float(frame.get('time',0.0)))
-        candidate=replace(c,keyframes=frames)
-        try:
-            validate_timeline([candidate if item.uid==c.uid else item for item in self.clips],self.tracks)
-            self.clips=[candidate if item.uid==c.uid else item for item in self.clips]
-            self.dirty=True; self.revision+=1; self.preview_revision=-1; self.preview_signature=None; self.preview_queued=True
-            self.timeline.refresh(self.clips,self.tracks,self.current,self.track_states,self.track_names,self.selection,self.markers)
-        except Exception:
-            self.keyframe_graph.set_data(c.keyframes,c.length,field,getattr(c,{'scale':'video_scale','x':'video_x','y':'video_y','rotation':'rotation','opacity':'opacity','blur':'blur'}[field]))
-
-    def graph_keyframe_drag_finished(self):
-        if self.current_clip() and not self.worker:
-            self.changed()
-
-    def graph_keyframe_selected(self,index):
-        if 0 <= index < self.keyframe_list.count():
-            self.keyframe_list.setCurrentRow(index)
-
-    def graph_keyframe_added(self,time,value):
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):
-            return
-        field=self.keyframe_graph_property.currentData() or 'scale'
-        self.keyframe_time.setValue(time)
-        controls={'scale':self.transform_scale,'x':self.transform_x,'y':self.transform_y,
-                  'rotation':self.rotation,'opacity':self.opacity,'blur':self.blur}
-        control=controls[field]
-        control.setValue(value*100 if field in ('x','y','opacity') else value)
-        self.set_keyframe()
-
-    def parse_mask_points(self, text):
-        points=[]
-        for token in str(text).replace('\n',';').split(';'):
-            token=token.strip()
-            if not token:
-                continue
-            values=[value.strip() for value in token.split(',')]
-            if len(values) != 2:
-                raise ValueError('Bezier-Punkte mÃ¼ssen als x,y; x,y eingegeben werden.')
-            try:
-                x,y=(float(values[0])/100,float(values[1])/100)
-            except ValueError as exc:
-                raise ValueError('Bezier-Punkte enthalten keine gÃ¼ltigen Zahlen.') from exc
-            if not 0 <= x <= 1 or not 0 <= y <= 1:
-                raise ValueError('Bezier-Punkte mÃ¼ssen zwischen 0 und 100 % liegen.')
-            points.append({'x':round(x,6),'y':round(y,6)})
-        if len(points) < 3:
-            raise ValueError('Eine Bezier-Maske braucht mindestens drei Punkte.')
-        return points
-
-    def mask_type_changed(self, *_):
-        enabled=self.mask_type.currentData() == 'bezier' and bool(self.current_clip() and self.current_clip().kind == 'video')
-        clip=self.current_clip()
-        self.mask_track_button.setEnabled(enabled and bool(clip and clip.source_type == 'video') and not self.worker)
-        for field in (self.mask_points,self.mask_points_apply,self.mask_path_time,self.mask_path_list,
-                      self.mask_path_set_button,self.mask_path_remove_button):
-            field.setEnabled(enabled and not self.worker)
-
-    def apply_mask_points(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):
-            return
-        try:
-            points=self.parse_mask_points(self.mask_points.text())
-            candidate=replace(c,mask_type='bezier',mask_points=points)
-            validate_timeline([candidate if item.uid==c.uid else item for item in self.clips],self.tracks)
-            self.checkpoint(); self.clips=[candidate if item.uid==c.uid else item for item in self.clips]; self.changed()
-        except Exception as exc:
-            self.error(exc)
-
-    def refresh_mask_path_list(self, clip):
-        self.mask_path_list.blockSignals(True); self.mask_path_list.clear()
-        if clip:
-            self.mask_path_time.setMaximum(max(.01,clip.length))
-            for frame in clip.mask_path_keyframes:
-                item=QListWidgetItem(f"{float(frame['time']):.2f} s Â· {len(frame.get('points',[]))} Punkte")
-                item.setData(Qt.UserRole,float(frame['time'])); self.mask_path_list.addItem(item)
-        self.mask_path_list.setCurrentRow(-1); self.mask_path_list.blockSignals(False)
-
-    def mask_path_selected(self,row):
-        c=self.current_clip()
-        if not c or row<0 or row>=len(c.mask_path_keyframes):
-            return
-        frame=c.mask_path_keyframes[row]; self.mask_path_time.setValue(float(frame['time']))
-        self.mask_points.setText('; '.join(f"{float(point['x'])*100:.1f},{float(point['y'])*100:.1f}" for point in frame.get('points',[])))
-
-    def set_mask_path_keyframe(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):
-            return
-        try:
-            points=self.parse_mask_points(self.mask_points.text())
-            time=round(max(0.0,min(c.length,self.mask_path_time.value())),6)
-            frame={'time':time,'points':points}
-            frames=[dict(item,points=[dict(point) for point in item.get('points',[])]) for item in c.mask_path_keyframes]
-            replaced=False
-            for index,item in enumerate(frames):
-                if abs(float(item['time'])-time) <= .01:
-                    frames[index]=frame; replaced=True; break
-            if not replaced: frames.append(frame)
-            frames.sort(key=lambda item:float(item['time']))
-            candidate=replace(c,mask_type='bezier',mask_points=points,mask_path_keyframes=frames)
-            validate_timeline([candidate if item.uid==c.uid else item for item in self.clips],self.tracks)
-            self.checkpoint(); self.clips=[candidate if item.uid==c.uid else item for item in self.clips]; self.changed()
-        except Exception as exc:
-            self.error(exc)
-
-    def remove_mask_path_keyframe(self):
-        c=self.current_clip(); row=self.mask_path_list.currentRow()
-        if not c or c.kind!='video' or self.worker or row<0 or row>=len(c.mask_path_keyframes) or not self.require_unlocked(c):
-            return
-        frames=[dict(item,points=[dict(point) for point in item.get('points',[])]) for index,item in enumerate(c.mask_path_keyframes) if index != row]
-        candidate=replace(c,mask_path_keyframes=frames)
-        self.checkpoint(); self.clips=[candidate if item.uid==c.uid else item for item in self.clips]; self.changed()
-
-    def keyframe_selected(self,row):
-        c=self.current_clip()
-        if not c or c.kind!='video' or row<0:return
-        item=self.keyframe_list.item(row)
-        if item is None:return
-        time=float(item.data(Qt.UserRole))
-        frame=min(c.keyframes,key=lambda value:abs(float(value['time'])-time))
-        self.keyframe_time.setValue(time)
-        self.transform_scale.setValue(float(frame['scale']))
-        self.transform_x.setValue(float(frame['x'])*100)
-        self.transform_y.setValue(float(frame['y'])*100)
-        self.rotation.setValue(float(frame['rotation']))
-        self.opacity.setValue(float(frame.get('opacity',c.opacity))*100)
-        self.blur.setValue(float(frame.get('blur',c.blur)))
-        curve_index=self.keyframe_curve.findData(frame.get('curve','linear'))
-        self.keyframe_curve.setCurrentIndex(curve_index if curve_index >= 0 else 0)
-
-    def set_keyframe(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):return
-        time=round(max(0.0,min(c.length,self.keyframe_time.value())),6)
-        frame={'time':time,'scale':round(self.transform_scale.value(),6),
-               'x':round(self.transform_x.value()/100,6),'y':round(self.transform_y.value()/100,6),
-               'rotation':round(self.rotation.value(),6),
-               'opacity':round(self.opacity.value()/100,6),
-               'blur':round(self.blur.value(),6),
-               'curve':self.keyframe_curve.currentData() or 'linear'}
-        frames=[dict(value) for value in c.keyframes]
-        replaced=False
-        for index,value in enumerate(frames):
-            if abs(float(value['time'])-time)<=0.01:
-                frames[index]=frame; replaced=True; break
-        if not replaced:frames.append(frame)
-        frames.sort(key=lambda value:float(value['time']))
-        candidate=replace(c,keyframes=frames)
-        try:
-            proposed=[candidate if value.uid==c.uid else value for value in self.clips]
-            validate_timeline(proposed,self.tracks)
-            if candidate==c:return
-            self.checkpoint(); self.clips=proposed; self.changed()
-            self.statusBar().showMessage(f'Keyframe bei {time:.2f} s gesetzt.',3000)
-        except Exception as exc:self.error(exc)
-
-    def remove_keyframe(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):return
-        row=self.keyframe_list.currentRow()
-        if row<0 or row>=len(c.keyframes):return
-        frames=[dict(value) for index,value in enumerate(c.keyframes) if index!=row]
-        candidate=replace(c,keyframes=frames)
-        self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
-
-    def refresh_volume_keyframe_list(self, clip):
-        self.volume_keyframe_list.blockSignals(True)
-        self.volume_keyframe_list.clear()
-        for keyframe in clip.volume_keyframes:
-            curve=KEYFRAME_CURVE_LABELS.get(keyframe.get('curve','linear'),'Linear')
-            item=QListWidgetItem(f"{float(keyframe['time']):.2f} s   Â·   LautstÃ¤rke {float(keyframe['volume'])*100:.0f}%   Â·   {curve}")
-            item.setData(Qt.UserRole,float(keyframe['time']))
-            self.volume_keyframe_list.addItem(item)
-        self.volume_keyframe_list.clearSelection()
-        self.volume_keyframe_list.setCurrentRow(-1)
-        self.volume_keyframe_list.blockSignals(False)
-
-    def volume_keyframe_selected(self,row):
-        c=self.current_clip()
-        if not c or c.kind not in ('video','audio') or not c.has_audio or row<0:return
-        item=self.volume_keyframe_list.item(row)
-        if item is None:return
-        time=float(item.data(Qt.UserRole))
-        frame=min(c.volume_keyframes,key=lambda value:abs(float(value['time'])-time))
-        self.volume_keyframe_time.setValue(time)
-        self.volume.setValue(float(frame['volume'])*100)
-        curve_index=self.volume_keyframe_curve.findData(frame.get('curve','linear'))
-        self.volume_keyframe_curve.setCurrentIndex(curve_index if curve_index >= 0 else 0)
-
-    def set_volume_keyframe(self):
-        c=self.current_clip()
-        if not c or c.kind not in ('video','audio') or not c.has_audio or self.worker or not self.require_unlocked(c):return
-        time=round(max(0.0,min(c.length,self.volume_keyframe_time.value())),6)
-        frame={'time':time,'volume':round(self.volume.value()/100,6),
-               'curve':self.volume_keyframe_curve.currentData() or 'linear'}
-        frames=[dict(value) for value in c.volume_keyframes]
-        replaced=False
-        for index,value in enumerate(frames):
-            if abs(float(value['time'])-time)<=0.01:
-                frames[index]=frame; replaced=True; break
-        if not replaced:frames.append(frame)
-        frames.sort(key=lambda value:float(value['time']))
-        candidate=replace(c,volume_keyframes=frames)
-        try:
-            proposed=[candidate if value.uid==c.uid else value for value in self.clips]
-            validate_timeline(proposed,self.tracks)
-            if candidate==c:return
-            self.checkpoint(); self.clips=proposed; self.changed()
-            self.statusBar().showMessage(f'LautstÃ¤rke-Keyframe bei {time:.2f} s gesetzt.',3000)
-        except Exception as exc:self.error(exc)
-
-    def remove_volume_keyframe(self):
-        c=self.current_clip()
-        if not c or c.kind not in ('video','audio') or not c.has_audio or self.worker or not self.require_unlocked(c):return
-        row=self.volume_keyframe_list.currentRow()
-        if row<0 or row>=len(c.volume_keyframes):return
-        frames=[dict(value) for index,value in enumerate(c.volume_keyframes) if index!=row]
-        candidate=replace(c,volume_keyframes=frames)
-        self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
-
-    def refresh_speed_ramp_list(self, clip):
-        self.speed_ramp_list.blockSignals(True); self.speed_ramp_list.clear()
-        for keyframe in clip.speed_keyframes:
-            item=QListWidgetItem(f"{float(keyframe['time']):.2f} s   Â·   {float(keyframe['speed']):.2f}Ã—")
-            item.setData(Qt.UserRole,float(keyframe['time'])); self.speed_ramp_list.addItem(item)
-        self.speed_ramp_list.clearSelection(); self.speed_ramp_list.setCurrentRow(-1); self.speed_ramp_list.blockSignals(False)
-
-    def speed_ramp_selected(self,row):
-        c=self.current_clip()
-        if not c or c.kind!='video' or row<0:return
-        item=self.speed_ramp_list.item(row)
-        if item is None:return
-        time=float(item.data(Qt.UserRole)); frame=min(c.speed_keyframes,key=lambda value:abs(float(value['time'])-time))
-        self.speed_ramp_time.setMaximum(max(.01,c.end-c.start)); self.speed_ramp_time.setValue(time); self.speed_ramp_value.setValue(float(frame['speed']))
-
-    def set_speed_ramp(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):return
-        # Preserve the point while committing any other pending inspector
-        # edits (freeze/reverse/filter/mask) before the list refreshes.
-        requested_time=self.speed_ramp_time.value(); requested_speed=self.speed_ramp_value.value()
-        self.apply_properties()
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):return
-        time=round(max(0.0,min(c.end-c.start,requested_time)),6)
-        frame={'time':time,'speed':round(requested_speed,6)}
-        frames=[dict(value) for value in c.speed_keyframes]; replaced=False
-        for index,value in enumerate(frames):
-            if abs(float(value['time'])-time)<=.01: frames[index]=frame; replaced=True; break
-        if not replaced:frames.append(frame)
-        frames.sort(key=lambda value:float(value['time']))
-        candidate=replace(c,speed_keyframes=frames)
-        try:
-            proposed=[candidate if value.uid==c.uid else value for value in self.clips]; validate_timeline(proposed,self.tracks)
-            if candidate==c:return
-            self.checkpoint(); self.clips=proposed; self.changed(); self.statusBar().showMessage(f'Speed-Punkt bei {time:.2f} s gesetzt.',3000)
-        except Exception as exc:self.error(exc)
-
-    def remove_speed_ramp(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):return
-        row=self.speed_ramp_list.currentRow()
-        if row<0 or row>=len(c.speed_keyframes):return
-        frames=[dict(value) for index,value in enumerate(c.speed_keyframes) if index!=row]
-        candidate=replace(c,speed_keyframes=frames)
-        self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
-
-    def fill_inspector(self):
-        if self._inspector_filling: return
-        self._inspector_filling=True
-        scroll=self.inspector_scroll.verticalScrollBar(); old_scroll=scroll.value()
-        try:
-            self._fill_inspector_values(); self.refresh_inline()
-            clip=self.current_clip()
-            for control in self._inspector_controls():
-                if self.worker or self.selection_locked(): control.setEnabled(False)
-                reason=('WÃ¤hle zuerst einen Clip aus.' if not clip else
-                        'WÃ¤hle fÃ¼r diese Einstellung genau einen Clip aus.' if len(self.selection)>1 else
-                        'Entsperre die Spur, um diesen Clip zu bearbeiten.' if self.selection_locked() else
-                        'Die laufende Analyse muss zuerst abgeschlossen oder abgebrochen werden.' if self.worker else
-                        'FÃ¼r diesen Cliptyp oder Zustand nicht verfÃ¼gbar; prÃ¼fe die Auswahl und zugehÃ¶rigen Optionen.')
-                control.setProperty('disabledReason',reason if not control.isEnabled() else '')
-        finally:
-            self._inspector_filling=False
-            scroll.setValue(old_scroll)
-
-    def _fill_inspector_values(self):
-        self.update_context_toolbar()
-        c=self.current_clip(); self.track_combo.clear()
-        if len(self.selection)>1:
-            self.clip_name.setText(f'{len(self.selection)} Clips ausgewÃ¤hlt')
-            for field in self._inspector_controls():
-                field.setEnabled(False)
-            self.auto_reframe_status.setText('Auto-Reframe ist bei Mehrfachauswahl deaktiviert.')
-            self.keyframe_list.clear(); self.volume_keyframe_list.clear(); self.speed_ramp_list.clear()
-            return
-        if not c:
-            self.clip_name.setText('Kein Clip ausgewÃ¤hlt')
-            for field in self._inspector_controls(): field.setEnabled(False)
-            self.auto_reframe_status.setText('Kein Clip ausgewÃ¤hlt.')
-            self.keyframe_list.clear()
-            self.volume_keyframe_list.clear(); self.speed_ramp_list.clear()
-            return
-        self.clip_name.setText('Adjustment-Layer' if c.source_type=='adjustment' else c.text if c.kind=='text' else Path(c.path).name)
-        for t in sorted(self.tracks,reverse=True):
-            if (t>0)==(c.kind in ('video','text')): self.track_combo.addItem(f'Video {t}' if t>0 else f'Audio {-t}',t)
-        self.track_combo.setCurrentIndex(self.track_combo.findData(c.track))
-        self.position.setValue(c.position); self.start.setValue(c.start); self.end.setValue(c.end); self.speed.setValue(c.speed); self.fade_in.setValue(c.fade_in); self.fade_out.setValue(c.fade_out); self.volume.setValue(c.volume*100)
-        is_text=c.kind=='text'
-        is_video=c.kind=='video'
-        is_adjustment=c.source_type=='adjustment'
-        is_transitionable=c.kind in ('video','audio') and not is_adjustment
-        is_audioable=c.kind in ('video','audio') and c.has_audio
-        self.speed.setEnabled(not is_text and not is_adjustment)
-        self.freeze_enabled.setEnabled(is_video and not is_adjustment); self.freeze_duration.setEnabled(is_video and not is_adjustment and c.freeze_frame); self.reverse_clip.setEnabled(is_video and not is_adjustment)
-        self.fade_in.setEnabled(not is_text and not is_adjustment); self.fade_out.setEnabled(not is_text and not is_adjustment)
-        for field in (self.text_value,self.text_size,self.text_color,self.text_palette_button,self.text_font,self.text_bold,self.text_italic,
-                      self.text_outline_width,self.text_outline_color,self.text_shadow_size,self.text_shadow_color,
-                      self.text_background_enabled,self.text_background_color,self.text_background_opacity,self.text_background_padding,
-                      self.text_animation,self.text_animation_duration,self.text_style_preset,self.text_style_apply_button,self.text_x,self.text_y): field.setEnabled(is_text)
-        for field in (self.transform_scale,self.transform_x,self.transform_y,self.rotation,self.crop_left,self.crop_top,self.crop_right,self.crop_bottom,self.flip_horizontal,self.flip_vertical): field.setEnabled(is_video and not is_adjustment)
-        for field in (self.brightness,self.contrast,self.saturation,self.filter_preset,self.effect_preset,self.effect_preset_apply_button,
-                      self.opacity,self.blur,self.sharpen): field.setEnabled(is_video)
-        for field in (self.color_exposure,self.color_temperature,self.color_tint,self.color_vibrance,*self.color_wheel_spins.values()):
-            field.setEnabled(is_video and not is_adjustment)
-        for field in (self.lut_path,self.lut_browse_button,
-                      self.opacity,self.blur,self.sharpen,self.chroma_key_enabled,self.chroma_key_color,self.chroma_key_similarity,
-                      self.chroma_key_blend,self.mask_type,self.mask_x,self.mask_y,self.mask_width,self.mask_height,self.mask_feather): field.setEnabled(is_video and not is_adjustment)
-        self.opacity.setEnabled(is_video); self.blur.setEnabled(is_video); self.sharpen.setEnabled(is_video)
-        self.stabilization.setEnabled(is_video and not is_adjustment)
-        for field in (self.mask_points,self.mask_points_apply,self.mask_path_time,self.mask_path_list,
-                      self.mask_path_set_button,self.mask_path_remove_button):
-            field.setEnabled(is_video and not is_adjustment and c.mask_type == 'bezier')
-        self.mask_type.setEnabled(is_video and not is_adjustment)
-        background_source = is_video and not is_adjustment and c.source_type in ('video','image')
-        tracking_source = is_video and not is_adjustment and c.source_type == 'video'
-        self.background_remove_button.setEnabled(background_source)
-        self.background_clear_button.setEnabled(background_source and bool(c.background_removed_path))
-        self.background_removal_enabled.setEnabled(background_source and bool(c.background_removed_path))
-        self.track_motion_button.setEnabled(tracking_source)
-        self.mask_track_button.setEnabled(tracking_source and c.mask_type == 'bezier' and len(c.mask_points) >= 3)
-        self.clear_tracking_button.setEnabled(tracking_source and bool(c.tracking_keyframes))
-        auto_reframe_source = tracking_source
-        self.auto_reframe_enabled.setEnabled(auto_reframe_source)
-        self.auto_reframe_format.setEnabled(auto_reframe_source)
-        self.auto_reframe_button.setEnabled(auto_reframe_source)
-        self.auto_reframe_clear_button.setEnabled(auto_reframe_source and bool(c.auto_reframe_keyframes))
-        self.object_removal_enabled.setEnabled(is_video and not is_adjustment)
-        self.text_cut_button.setEnabled(is_audioable and c.source_type in ('video','audio') and not self.worker)
-        self.auto_cut_button.setEnabled(is_video and c.source_type == 'video' and not self.worker)
-        self.multicam_sync_button.setEnabled(False)
-        self.multicam_switch_button.setEnabled(is_video and bool(c.multicam_group) and not self.worker)
-        for field in (self.keyframe_time,self.keyframe_curve,self.keyframe_list,self.keyframe_set_button,self.keyframe_remove_button,
-                      self.keyframe_graph_property,self.keyframe_graph): field.setEnabled(is_video and not is_adjustment)
-        for field in (self.volume_keyframe_time,self.volume_keyframe_curve,self.volume_keyframe_list,self.volume_keyframe_set_button,self.volume_keyframe_remove_button): field.setEnabled(is_audioable)
-        for field in (self.audio_noise_reduction,self.audio_eq_low,self.audio_eq_mid,self.audio_eq_high,self.audio_compressor_enabled,
-                      self.audio_compressor_threshold,self.audio_compressor_ratio,self.audio_ducking,self.audio_voice_isolation,self.audio_channel_mode,self.audio_pan,
-                      self.audio_normalize,self.audio_normalize_target): field.setEnabled(is_audioable)
-        for field in (self.speed_ramp_time,self.speed_ramp_value,self.speed_ramp_list,self.speed_ramp_set_button,self.speed_ramp_remove_button): field.setEnabled(is_video and not is_adjustment)
-        self.transition_type.setEnabled(is_transitionable); self.transition_duration.setEnabled(is_transitionable)
-        self.text_value.setText(c.text if is_text else '')
-        self.text_size.setValue(c.font_size if is_text else 56)
-        self.text_color.setText(c.color if is_text else '#ffffff')
-        self.update_color_button(c.color if is_text else '#ffffff')
-        self.text_font.setCurrentText(c.font_family if is_text else 'DejaVu Sans')
-        self.text_bold.setChecked(c.font_bold if is_text else False); self.text_italic.setChecked(c.font_italic if is_text else False)
-        self.text_outline_width.setValue(c.outline_width if is_text else 0); self.text_outline_color.setText(c.outline_color if is_text else '#000000')
-        self.text_shadow_size.setValue(c.shadow_size if is_text else 0); self.text_shadow_color.setText(c.shadow_color if is_text else '#000000')
-        self.text_background_enabled.setChecked(c.background_enabled if is_text else True); self.text_background_color.setText(c.background_color if is_text else '#000000')
-        self.text_background_opacity.setValue(c.background_opacity*100 if is_text else 35); self.text_background_padding.setValue(c.background_padding if is_text else 16)
-        animation_index=self.text_animation.findData(c.text_animation if is_text else 'none')
-        self.text_animation.setCurrentIndex(animation_index if animation_index >= 0 else 0)
-        self.text_animation_duration.setValue(c.text_animation_duration if is_text else .35)
-        self.text_x.setValue(c.x*100 if is_text else 50); self.text_y.setValue(c.y*100 if is_text else 50)
-        self.transform_scale.setValue(c.video_scale if is_video else 1.0)
-        self.transform_x.setValue(c.video_x*100 if is_video else 50); self.transform_y.setValue(c.video_y*100 if is_video else 50)
-        self.rotation.setValue(c.rotation if is_video else 0)
-        self.crop_left.setValue(c.crop_left*100 if is_video else 0); self.crop_top.setValue(c.crop_top*100 if is_video else 0)
-        self.crop_right.setValue(c.crop_right*100 if is_video else 0); self.crop_bottom.setValue(c.crop_bottom*100 if is_video else 0)
-        self.flip_horizontal.setChecked(c.flip_horizontal if is_video else False); self.flip_vertical.setChecked(c.flip_vertical if is_video else False)
-        self.brightness.setValue(c.brightness if is_video else 0); self.contrast.setValue(c.contrast if is_video else 1); self.saturation.setValue(c.saturation if is_video else 1)
-        self.opacity.setValue(c.opacity*100 if is_video else 100); self.blur.setValue(c.blur if is_video else 0); self.sharpen.setValue(c.sharpen if is_video else 0)
-        effect_index=self.effect_preset.findData(c.effect_preset if is_video else 'clean')
-        self.effect_preset.setCurrentIndex(effect_index if effect_index >= 0 else 0)
-        self.stabilization.setValue(c.stabilization*100 if is_video else 0)
-        self.background_removal_enabled.setChecked(c.background_removal_enabled if is_video else False)
-        self.background_remove_status.setText(
-            'Freistellung aktiv Â· transparente lokale Datei wird verwendet.'
-            if c.background_removal_enabled and c.background_removed_path
-            else 'Freistellung erzeugt noch keine lokale Datei.')
-        self.tracking_status.setText(
-            f'{len(c.tracking_keyframes)} Tracking-Punkte vorhanden.' if c.tracking_keyframes
-            else 'Kein Tracking vorhanden.')
-        auto_format_index=self.auto_reframe_format.findData(c.auto_reframe_format if auto_reframe_source else 'project')
-        self.auto_reframe_format.setCurrentIndex(auto_format_index if auto_format_index >= 0 else 0)
-        if c.auto_reframe_keyframes:
-            detected=sum(1 for point in c.auto_reframe_keyframes if float(point.get('score', 0.0)) > 0)
-            self.auto_reframe_status.setText(
-                f'{len(c.auto_reframe_keyframes)} Fokus-Punkte vorhanden Â· '
-                f'{detected} mit Gesichtserkennung.')
-        else:
-            self.auto_reframe_status.setText('Noch keine Auto-Reframe-Analyse.')
-        self.auto_reframe_enabled.setChecked(c.auto_reframe_enabled if auto_reframe_source else False)
-        self.object_removal_enabled.setChecked(c.object_removal_enabled if is_video else False)
-        self.color_exposure.setValue(c.color_exposure if is_video else 0)
-        self.color_temperature.setValue(c.color_temperature*100 if is_video else 0)
-        self.color_tint.setValue(c.color_tint*100 if is_video else 0)
-        self.color_vibrance.setValue(c.color_vibrance*100 if is_video else 0)
-        for key, spin in self.color_wheel_spins.items():
-            spin.setValue(getattr(c,key)*100 if is_video else 0)
-        mask_title_points='; '.join(f"{float(point['x'])*100:.1f},{float(point['y'])*100:.1f}" for point in c.mask_points)
-        self.mask_points.setText(mask_title_points if is_video else '')
-        self.refresh_mask_path_list(c if is_video else None)
-        self.audio_noise_reduction.setValue(c.audio_noise_reduction if is_audioable else 0)
-        self.audio_eq_low.setValue(c.audio_eq_low if is_audioable else 0); self.audio_eq_mid.setValue(c.audio_eq_mid if is_audioable else 0); self.audio_eq_high.setValue(c.audio_eq_high if is_audioable else 0)
-        self.audio_compressor_enabled.setChecked(c.audio_compressor_enabled if is_audioable else False)
-        self.audio_compressor_threshold.setValue(c.audio_compressor_threshold if is_audioable else -18); self.audio_compressor_ratio.setValue(c.audio_compressor_ratio if is_audioable else 4)
-        self.audio_ducking.setValue(c.audio_ducking*100 if is_audioable else 0)
-        self.audio_voice_isolation.setValue(c.audio_voice_isolation*100 if is_audioable else 0)
-        self.audio_normalize.setChecked(c.audio_normalize if is_audioable else False)
-        self.audio_normalize_target.setValue(c.audio_normalize_target if is_audioable else -16)
-        channel_index=self.audio_channel_mode.findData(c.audio_channel_mode if is_audioable else 'stereo')
-        self.audio_channel_mode.setCurrentIndex(channel_index if channel_index >= 0 else 0); self.audio_pan.setValue(c.audio_pan*100 if is_audioable else 0)
-        self.freeze_enabled.setChecked(c.freeze_frame if is_video else False); self.freeze_duration.setValue(c.freeze_duration if is_video else 0)
-        self.reverse_clip.setChecked(c.reverse if is_video else False)
-        filter_index=self.filter_preset.findData(c.filter_preset if is_video else 'none')
-        self.filter_preset.setCurrentIndex(filter_index if filter_index >= 0 else 0)
-        self.lut_path.setText(c.lut_path if is_video else '')
-        self.chroma_key_enabled.setChecked(c.chroma_key_enabled if is_video else False)
-        self.chroma_key_color.setText(c.chroma_key_color if is_video else '#00ff00')
-        self.chroma_key_similarity.setValue(c.chroma_key_similarity*100 if is_video else 10)
-        self.chroma_key_blend.setValue(c.chroma_key_blend*100 if is_video else 10)
-        mask_index=self.mask_type.findData(c.mask_type if is_video else 'none')
-        self.mask_type.setCurrentIndex(mask_index if mask_index >= 0 else 0)
-        self.mask_x.setValue(c.mask_x*100 if is_video else 0); self.mask_y.setValue(c.mask_y*100 if is_video else 0)
-        self.mask_width.setValue(c.mask_width*100 if is_video else 100); self.mask_height.setValue(c.mask_height*100 if is_video else 100)
-        self.mask_feather.setValue(c.mask_feather*100 if is_video else 0)
-        transition_index=self.transition_type.findData(c.transition_type)
-        self.transition_type.setCurrentIndex(transition_index if transition_index >= 0 else 0)
-        self.transition_duration.setValue(c.transition_duration if is_transitionable else 0)
-        if is_video:
-            self.keyframe_time.setMaximum(max(0.01,c.length))
-            local_time=max(0.0,min(c.length,self.playhead-c.position))
-            self.keyframe_time.setValue(local_time)
-            self.keyframe_curve.setCurrentIndex(self.keyframe_curve.findData('linear'))
-            self.refresh_keyframe_list(c)
-            self.refresh_keyframe_graph(c)
-            self.speed_ramp_time.setMaximum(max(0.01,c.end-c.start))
-            self.speed_ramp_time.setValue(max(0.0,min(c.end-c.start,local_time)))
-            self.refresh_speed_ramp_list(c)
-        else:
-            self.keyframe_list.clear()
-            self.keyframe_graph.set_data([],1.0,'scale',1.0)
-            self.speed_ramp_list.clear()
-        if is_audioable:
-            self.volume_keyframe_time.setMaximum(max(0.01,c.length))
-            local_time=max(0.0,min(c.length,self.playhead-c.position))
-            self.volume_keyframe_time.setValue(local_time)
-            self.refresh_volume_keyframe_list(c)
-        else:
-            self.volume_keyframe_list.clear()
-        if not is_audioable:
-            self.volume_keyframe_curve.setCurrentIndex(self.volume_keyframe_curve.findData('linear'))
-        beat_count=sum(1 for marker in self.markers if marker.get('kind') == 'beat')
-        self.beat_analyze_button.setEnabled(is_audioable and not self.worker)
-        self.beat_clear_button.setEnabled(beat_count > 0 and not self.worker)
-        self.beat_status.setText(f'{beat_count} Beat-Marker vorhanden.' if beat_count else 'Keine Beat-Marker vorhanden.')
-        self.text_cut_status.setText('Pausen und FÃ¼llwÃ¶rter werden lokal entfernt.' if is_audioable else 'WÃ¤hle ein Video oder Audio mit Ton.')
-        self.auto_cut_status.setText('Beat- und Szenenpunkte werden lokal erkannt.' if is_video else 'WÃ¤hle einen normalen Videoclip.')
-        if c.multicam_group:
-            members=[value for value in self.clips if value.multicam_group == c.multicam_group]
-            active=next((value for value in members if value.multicam_active), None)
-            self.multicam_status.setText(
-                f'{len(members)} Winkel Â· aktiv: {active.camera_angle or "unbenannt"}' if active
-                else f'{len(members)} Winkel Â· kein aktiver Winkel')
-        else:
-            self.multicam_status.setText('Keine Multi-Kamera-Gruppe.')
-
-    def select_clip(self,uid):
-        self.compare_released(); self.video.cancel_transform()
-        if uid!=self.current and self.mode=='source':
-            self.player.pause();self.pending_seek=None;self.player.setSource(QUrl());self.mode='timeline'
-            self.source_clip_uid=None;self.source_in=None;self.source_out=None
-            self.video_stack.setCurrentIndex(0);self.placeholder.setText('Clip ausgewÃ¤hlt Â· â€žClip ansehenâ€œ startet die Quellvorschau.')
-        self.set_selection([uid], uid, expand_groups=True)
-
-    def commit_drag(self,candidate):
-        if self.worker: self.refresh(); return
-        candidates = list(candidate) if isinstance(candidate, (list, tuple)) else [candidate]
-        originals = {value.uid: value for value in self.clips}
-        if any(value.uid not in originals for value in candidates):
-            return
-        if any(self.track_locked(originals[value.uid].track) or self.track_locked(value.track) for value in candidates):
-            self.statusBar().showMessage('Die Quell- oder Zielspur ist gesperrt.',4000)
-            self.refresh()
-            return
-        by_uid = {value.uid: value for value in candidates}
-        proposed=[by_uid.get(c.uid,c) for c in self.clips]
-        try:
-            validate_timeline(proposed,self.tracks)
-            if proposed==self.clips:return
-            self.checkpoint(); self.clips=proposed; self.selection=[value.uid for value in candidates]; self.current=candidates[-1].uid; self.changed()
-        except Exception as exc:
-            self.statusBar().showMessage(str(exc).replace('\n',' '),7000)
-            self.timeline.update()
-
-    def apply_text_style_preset(self):
-        c=self.current_clip()
-        if not c or c.kind!='text' or self.worker:
-            return self.statusBar().showMessage('WÃ¤hle zuerst einen Text- oder Untertitelclip.',3000)
-        preset=TEXT_STYLE_PRESETS.get(self.text_style_preset.currentData())
-        if not preset:
-            return
-        if not self.require_unlocked(c):
-            return
-        candidate=replace(c,**dict(preset))
-        try:
-            validate_timeline([candidate if item.uid==c.uid else item for item in self.clips],self.tracks)
-            self.checkpoint(); self.clips=[candidate if item.uid==c.uid else item for item in self.clips]; self.changed()
-            self.statusBar().showMessage('Textstil angewendet.',2500)
-        except Exception as exc:
-            self.error(exc)
-
-    def apply_effect_preset(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or self.worker:
-            return self.statusBar().showMessage('WÃ¤hle zuerst einen Video- oder Adjustment-Layer.',3000)
-        if not self.require_unlocked(c):
-            return
-        name=self.effect_preset.currentData() or 'clean'
-        preset=EFFECT_PRESETS.get(name)
-        if not preset:
-            return
-        candidate=replace(c,effect_preset=name,**dict(preset))
-        try:
-            proposed=[candidate if item.uid==c.uid else item for item in self.clips]
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed()
-            self.statusBar().showMessage(f'Effekt-Preset â€ž{self.effect_preset.currentText()}â€œ angewendet.',3000)
-        except Exception as exc:
-            self.error(exc)
-
-    def export_subtitles(self):
-        if self.worker:
-            return
-        cues=subtitle_cues_from_clips(self.clips,self.track_names)
-        if not cues:
-            return self.error('Keine exportierbaren Text- oder Untertitelclips gefunden.')
-        path,_=QFileDialog.getSaveFileName(self,'Untertitel exportieren','Untertitel.srt',
-                                           'SubRip (*.srt);;WebVTT (*.vtt)',options=QFileDialog.DontConfirmOverwrite)
-        if not path:
-            return
-        suffix=Path(path).suffix.casefold()
-        if suffix not in ('.srt','.vtt'):
-            path += '.vtt' if 'WebVTT' in path else '.srt'
-        target=Path(path).resolve()
-        if target.exists() and QMessageBox.question(self,'Untertitel ersetzen?',f'{target}\nÃ¼berschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
-            return
-        try:
-            write_subtitle_file(target,self.clips,self.track_names)
-            self.statusBar().showMessage(f'{len(cues)} Untertitel exportiert Â· {target.name}',5000)
-        except Exception as exc:
-            self.error(exc)
-
-    def apply_properties(self):
-        if self._inspector_filling or self.worker: return
-        c=self.current_clip()
-        if len(self.selection)>1:
-            self.statusBar().showMessage('Inspector-Ã„nderungen sind bei Mehrfachauswahl deaktiviert.',3000)
-            return
-        if c:
-            if not self.require_unlocked(c):
-                self.fill_inspector()
-                return
-            values=dict(position=self.position.value(),start=self.start.value(),end=self.end.value(),speed=self.speed.value(),fade_in=self.fade_in.value(),fade_out=self.fade_out.value(),volume=self.volume.value()/100,track=self.track_combo.currentData())
-            if c.kind=='text':
-                values.update(text=self.text_value.text(),font_size=self.text_size.value(),color=self.text_color.text().strip(),
-                              font_family=self.text_font.currentText().strip(),font_bold=self.text_bold.isChecked(),font_italic=self.text_italic.isChecked(),
-                              outline_width=self.text_outline_width.value(),outline_color=self.text_outline_color.text().strip(),
-                              shadow_size=self.text_shadow_size.value(),shadow_color=self.text_shadow_color.text().strip(),
-                              background_enabled=self.text_background_enabled.isChecked(),background_color=self.text_background_color.text().strip(),
-                              background_opacity=self.text_background_opacity.value()/100,background_padding=self.text_background_padding.value(),
-                              text_animation=self.text_animation.currentData(),text_animation_duration=self.text_animation_duration.value(),
-                              x=self.text_x.value()/100,y=self.text_y.value()/100)
-            if c.kind=='video':
-                values.update(video_scale=self.transform_scale.value(),video_x=self.transform_x.value()/100,video_y=self.transform_y.value()/100,
-                             crop_left=self.crop_left.value()/100,crop_top=self.crop_top.value()/100,
-                             crop_right=self.crop_right.value()/100,crop_bottom=self.crop_bottom.value()/100,
-                             rotation=self.rotation.value(),flip_horizontal=self.flip_horizontal.isChecked(),
-                             flip_vertical=self.flip_vertical.isChecked(),brightness=self.brightness.value(),
-                             contrast=self.contrast.value(),saturation=self.saturation.value(),
-                             color_exposure=self.color_exposure.value(),color_temperature=self.color_temperature.value()/100,
-                             color_tint=self.color_tint.value()/100,color_vibrance=self.color_vibrance.value()/100,
-                             **{key:spin.value()/100 for key,spin in self.color_wheel_spins.items()},
-                             opacity=self.opacity.value()/100,
-                             blur=self.blur.value(),sharpen=self.sharpen.value(),stabilization=self.stabilization.value()/100,
-                             background_removal_enabled=self.background_removal_enabled.isChecked(),
-                             background_removed_path=c.background_removed_path,
-                             tracking_keyframes=[dict(point) for point in c.tracking_keyframes],
-                             auto_reframe_enabled=self.auto_reframe_enabled.isChecked() if c.source_type == 'video' else False,
-                             auto_reframe_format=self.auto_reframe_format.currentData() or 'project',
-                             auto_reframe_keyframes=[dict(point) for point in c.auto_reframe_keyframes] if c.source_type == 'video' else [],
-                             object_removal_enabled=self.object_removal_enabled.isChecked(),
-                             effect_preset=c.effect_preset,
-                             freeze_frame=self.freeze_enabled.isChecked(),
-                             freeze_duration=self.freeze_duration.value() if self.freeze_enabled.isChecked() else 0.0,
-                             reverse=self.reverse_clip.isChecked(),filter_preset=self.filter_preset.currentData(),
-                             lut_path=str(Path(self.lut_path.text().strip()).expanduser().resolve()) if self.lut_path.text().strip() else '',
-                             chroma_key_enabled=self.chroma_key_enabled.isChecked(),chroma_key_color=self.chroma_key_color.text().strip(),
-                             chroma_key_similarity=self.chroma_key_similarity.value()/100,chroma_key_blend=self.chroma_key_blend.value()/100,
-                             mask_type=self.mask_type.currentData(),mask_x=self.mask_x.value()/100,mask_y=self.mask_y.value()/100,
-                             mask_width=self.mask_width.value()/100,mask_height=self.mask_height.value()/100,mask_feather=self.mask_feather.value()/100,
-                             mask_points=self.parse_mask_points(self.mask_points.text()) if self.mask_type.currentData() == 'bezier' else [],
-                             mask_path_keyframes=[dict(frame, points=[dict(point) for point in frame.get('points', [])])
-                                                  for frame in c.mask_path_keyframes] if self.mask_type.currentData() == 'bezier' else [])
-                preset_values=EFFECT_PRESETS.get(c.effect_preset)
-                def differs_from_preset(key, value):
-                    current=values.get(key, getattr(c,key))
-                    if isinstance(current, (int,float)) and isinstance(value, (int,float)):
-                        return abs(float(current)-float(value)) > 1e-7
-                    return current != value
-                if preset_values and any(differs_from_preset(key,value) for key,value in preset_values.items() if key in values):
-                    values['effect_preset']='custom'
-                if c.keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
-                                    or abs(values['speed']-c.speed)>1e-7):
-                    values['keyframes']=retime_keyframes(c,values['start'],values['end'],values['speed'])
-                if c.speed_keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7):
-                    values['speed_keyframes']=retime_speed_keyframes(c,values['start'],values['end'])
-                if c.tracking_keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
-                                             or abs(values['speed']-c.speed)>1e-7):
-                    values['tracking_keyframes']=retime_tracking_keyframes(c,values['start'],values['end'],values['speed'])
-                if c.auto_reframe_keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
-                                                 or abs(values['speed']-c.speed)>1e-7):
-                    values['auto_reframe_keyframes']=retime_auto_reframe_keyframes(c,values['start'],values['end'],values['speed'])
-                if c.mask_path_keyframes and (abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
-                                              or abs(values['speed']-c.speed)>1e-7):
-                    values['mask_path_keyframes']=retime_mask_path_keyframes(c,values['start'],values['end'],values['speed'])
-            if c.kind in ('video','audio') and c.volume_keyframes and (
-                    abs(values['start']-c.start)>1e-7 or abs(values['end']-c.end)>1e-7
-                    or abs(values['speed']-c.speed)>1e-7):
-                values['volume_keyframes']=retime_volume_keyframes(c,values['start'],values['end'],values['speed'])
-            if c.kind in ('video','audio'):
-                values.update(audio_noise_reduction=self.audio_noise_reduction.value(),
-                              audio_eq_low=self.audio_eq_low.value(),audio_eq_mid=self.audio_eq_mid.value(),audio_eq_high=self.audio_eq_high.value(),
-                              audio_compressor_enabled=self.audio_compressor_enabled.isChecked(),
-                              audio_compressor_threshold=self.audio_compressor_threshold.value(),audio_compressor_ratio=self.audio_compressor_ratio.value(),
-                              audio_ducking=self.audio_ducking.value()/100,
-                              audio_voice_isolation=self.audio_voice_isolation.value()/100,
-                              audio_channel_mode=self.audio_channel_mode.currentData(),audio_pan=self.audio_pan.value()/100,
-                              audio_normalize=self.audio_normalize.isChecked(),
-                              audio_normalize_target=self.audio_normalize_target.value())
-                transition_type='none' if c.source_type=='adjustment' else self.transition_type.currentData()
-                values.update(transition_type=transition_type,
-                              transition_duration=self.transition_duration.value() if transition_type!='none' else 0.0)
-            candidate=replace(c,**values)
-            if candidate==c: return
-            try:
-                proposed=[candidate if v.uid==c.uid else v for v in self.clips]; validate_timeline(proposed,self.tracks)
-                self.checkpoint(); self.clips=proposed; self.changed()
-            except Exception as exc:self.error(exc)
-
-    def reset_transform(self):
-        c=self.current_clip()
-        if len(self.selection)>1:
-            return self.statusBar().showMessage('Bild zurÃ¼cksetzen ist bei Mehrfachauswahl deaktiviert.',3000)
-        if not c or c.kind!='video' or self.worker or not self.require_unlocked(c):return
-        defaults=dict(video_scale=1.0,video_x=.5,video_y=.5,crop_left=0.0,crop_top=0.0,
-                      crop_right=0.0,crop_bottom=0.0,rotation=0.0,flip_horizontal=False,flip_vertical=False,
-                      keyframes=[],speed_keyframes=[],brightness=0.0,contrast=1.0,saturation=1.0,
-                      filter_preset='none',lut_path='',opacity=1.0,blur=0.0,sharpen=0.0,stabilization=0.0,effect_preset='clean',
-                      background_removal_enabled=False,background_removed_path='',tracking_keyframes=[],object_removal_enabled=False,
-                      auto_reframe_enabled=False,auto_reframe_format='project',auto_reframe_keyframes=[],
-                      color_exposure=0.0,color_temperature=0.0,color_tint=0.0,color_vibrance=0.0,
-                      color_lift_r=0.0,color_lift_g=0.0,color_lift_b=0.0,
-                      color_gamma_r=0.0,color_gamma_g=0.0,color_gamma_b=0.0,
-                      color_gain_r=0.0,color_gain_g=0.0,color_gain_b=0.0,
-                      freeze_frame=False,freeze_duration=0.0,reverse=False,chroma_key_enabled=False,
-                      chroma_key_color='#00ff00',chroma_key_similarity=.1,chroma_key_blend=.1,
-                      mask_type='none',mask_x=0.0,mask_y=0.0,mask_width=1.0,mask_height=1.0,mask_feather=0.0,
-                      mask_points=[],mask_path_keyframes=[])
-        if all(getattr(c,key)==value for key,value in defaults.items()):
-            return
-        self.checkpoint(); candidate=replace(c,**defaults)
-        self.clips=[candidate if item.uid==c.uid else item for item in self.clips]; self.changed()
-
-    def add_text(self):
-        if self.worker:return
-        text,ok=QInputDialog.getText(self,'Text hinzufÃ¼gen','Text fÃ¼r den Titel oder Untertitel:')
-        if not ok or not text.strip():return
-        if not any(c.kind=='video' for c in self.clips):
-            return self.error('FÃ¼ge zuerst ein Video zur Timeline hinzu.')
-        position=max(0,min(self.playhead,length(self.clips)))
-        duration=min(3.0,max(0.5,length(self.clips)-position)) if length(self.clips)>position else 3.0
-        track=max((t for t in self.tracks if t>0),default=0)+1
-        # Text has no source media limit; its visible duration is controlled by
-        # the clip end/trim fields and can be extended beyond the initial 3 s.
-        candidate=Clip('',864000.0,start=0,end=duration,position=position,track=track,kind='text',has_audio=False,text=text.strip(),source_type='text')
-        self.checkpoint(); self.tracks.append(track); self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks); self.clips.append(candidate); self.selection=[candidate.uid]; self.current=candidate.uid; self.changed()
-
-    def add_adjustment_layer(self):
-        if self.worker:
-            return
-        if not any(c.kind=='video' and c.source_type!='adjustment' for c in self.clips):
-            return self.error('FÃ¼ge zuerst mindestens ein Video zur Timeline hinzu.')
-        duration=max((c.finish for c in self.clips if c.source_type!='adjustment'),default=0.0)
-        if duration < MIN_CLIP:
-            return self.error('Die Timeline ist noch zu kurz fÃ¼r eine Adjustment-Layer.')
-        track=max((t for t in self.tracks if t>0),default=0)+1
-        candidate=Clip('',max(864000.0,duration),start=0,end=duration,position=0,track=track,
-                       kind='video',has_audio=False,source_type='adjustment',effect_preset='clean')
-        try:
-            validate_timeline(self.clips+[candidate],self.tracks+[track])
-            self.checkpoint()
-            video_slot=next((index for index,value in enumerate(self.tracks) if value<0),len(self.tracks))
-            self.tracks.insert(video_slot,track)
-            self.track_states=normalize_track_states(self.track_states,self.tracks)
-            self.track_names=normalize_track_names(self.track_names,self.tracks)
-            self.track_names[track]=f'Adjustment {sum(value.source_type=="adjustment" for value in self.clips)+1}'
-            self.clips.append(candidate)
-            self.selection=[candidate.uid]; self.current=candidate.uid; self.changed()
-            self.statusBar().showMessage('Adjustment-Layer angelegt Â· Effekte wirken auf die darunterliegende Komposition.',3500)
-        except Exception as exc:
-            self.error(exc)
-
-    def split(self):
-        selected=self.selected_clips()
-        if not selected or self.worker:
-            return
-        if self.selection_locked():
-            return self.statusBar().showMessage('Eine ausgewÃ¤hlte Spur ist gesperrt.',3000)
-        eligible=[clip for clip in selected if clip.position+MIN_CLIP < self.playhead < clip.finish-MIN_CLIP]
-        if not eligible:
-            return self.error('Setze den Abspielkopf in mindestens einen ausgewÃ¤hlten Clip.')
-        try:
-            replacement={}
-            new_selection=[]
-            for clip in eligible:
-                first,second=split_clip(clip,self.playhead)
-                replacement[clip.uid]=(first,second)
-                new_selection.extend([first.uid,second.uid])
-            proposed=[]
-            for clip in self.clips:
-                proposed.extend(replacement.get(clip.uid,(clip,)))
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.selection=new_selection; self.current=new_selection[-1]; self.changed()
-        except Exception as exc:self.error(exc)
-
-    def _single_trim_clip(self):
-        """Return the one selected source clip used by professional trim tools."""
-        if self.worker:
-            return None
-        selected = self.selected_clips()
-        if len(selected) != 1:
-            self.statusBar().showMessage('WÃ¤hle genau einen Video- oder Audioclip fÃ¼r diesen Trim-Schnitt.', 3500)
-            return None
-        clip = selected[0]
-        if clip.kind not in ('video', 'audio') or clip.source_type not in ('video', 'audio'):
-            self.statusBar().showMessage('Dieser Trim-Schnitt ist nur fÃ¼r Video- und Audiomedien verfÃ¼gbar.', 3500)
-            return None
-        if not self.require_unlocked(clip):
-            return None
-        return clip
-
-    def _frame_step(self, clip):
-        """Return one source frame in timeline seconds for trim nudges."""
-        try:
-            fps = float(clip.source_fps or 24.0)
-        except (TypeError, ValueError):
-            fps = 24.0
-        return max(MIN_CLIP, 1.0 / max(1.0, fps))
-
-    def _commit_trim_replacements(self, replacements, message, selection=None, markers=None):
-        """Validate and commit a trim edit as one undoable transaction."""
-        proposed = [replacements.get(clip.uid, clip) for clip in self.clips]
-        validate_timeline(proposed, self.tracks)
-        self.checkpoint()
-        self.clips = proposed
-        if markers is not None:
-            self.markers = normalize_markers(markers, length(proposed))
-        chosen = selection or list(replacements)
-        self.selection = [uid for uid in chosen if any(clip.uid == uid for clip in proposed)]
-        self.current = self.selection[-1] if self.selection else None
-        self.changed()
-        self.statusBar().showMessage(message, 3500)
-
-    def _ripple_trim(self, edge):
-        clip = self._single_trim_clip()
-        if clip is None:
-            return
-        if not clip.position + MIN_CLIP <= self.playhead <= clip.finish - MIN_CLIP:
-            return self.statusBar().showMessage('Setze den Abspielkopf innerhalb des ausgewÃ¤hlten Clips.', 3500)
-        old_finish = clip.finish
-        if edge == 'in':
-            delta = self.playhead - clip.position
-            trimmed = edited_clip(clip, 'left', delta)
-            # Ripple-In removes the leading source range but keeps the clip at
-            # the same timeline position, so later clips can close the gap.
-            candidate = replace(trimmed, position=clip.position)
-            label_text = 'Ripple-In'
-        else:
-            delta = self.playhead - clip.finish
-            candidate = edited_clip(clip, 'right', delta)
-            label_text = 'Ripple-Out'
-        removed = clip.length - candidate.length
-        if removed < MIN_CLIP - 1e-7:
-            return self.statusBar().showMessage('Der Trim-Bereich ist zu klein.', 3000)
-        replacements = {clip.uid: candidate}
-        for other in self.clips:
-            if other.uid == clip.uid:
-                continue
-            if other.track == clip.track and other.position >= old_finish - 1e-7:
-                if self.track_locked(other.track):
-                    return self.statusBar().showMessage('Eine betroffene Spur ist gesperrt.', 3500)
-                replacements[other.uid] = replace(other, position=max(0.0, other.position - removed))
-        markers = []
-        for marker in self.markers:
-            value = dict(marker)
-            if float(value.get('time', 0.0)) >= old_finish - 1e-7:
-                value['time'] = max(0.0, float(value['time']) - removed)
-            markers.append(value)
-        try:
-            self._commit_trim_replacements(
-                replacements, f'{label_text} ausgefÃ¼hrt Â· {removed:.3f} s entfernt',
-                selection=[clip.uid], markers=markers)
-        except Exception as exc:
-            self.error(exc)
-
-    def ripple_trim_in(self):
-        self._ripple_trim('in')
-
-    def ripple_trim_out(self):
-        self._ripple_trim('out')
-
-    def _adjacent_pair_for_roll(self, clip):
-        same = sorted((value for value in self.clips
-                       if value.uid != clip.uid and value.track == clip.track
-                       and value.kind == clip.kind), key=lambda value: value.position)
-        previous = max((value for value in same if value.finish <= clip.position + 1e-6),
-                       key=lambda value: value.finish, default=None)
-        following = min((value for value in same if value.position >= clip.finish - 1e-6),
-                         key=lambda value: value.position, default=None)
-        pairs = []
-        if previous is not None and abs(previous.finish - clip.position) <= 1e-5:
-            pairs.append((previous, clip))
-        if following is not None and abs(clip.finish - following.position) <= 1e-5:
-            pairs.append((clip, following))
-        valid = [pair for pair in pairs
-                 if pair[0].position + MIN_CLIP <= self.playhead <= pair[1].finish - MIN_CLIP]
-        return min(valid, key=lambda pair: abs(pair[0].finish - self.playhead), default=None)
-
-    def roll_to_playhead(self):
-        clip = self._single_trim_clip()
-        if clip is None:
-            return
-        pair = self._adjacent_pair_for_roll(clip)
-        if pair is None:
-            return self.statusBar().showMessage('Setze den Abspielkopf zwischen zwei angrenzende Clips.', 3500)
-        left, right = pair
-        if self.track_locked(left.track) or self.track_locked(right.track):
-            return self.statusBar().showMessage('Eine betroffene Spur ist gesperrt.', 3500)
-        try:
-            first, second = roll_edit(left, right, self.playhead)
-            self._commit_trim_replacements(
-                {left.uid: first, right.uid: second},
-                f'Roll-Schnitt auf {self.playhead:.3f} s gesetzt',
-                selection=[first.uid, second.uid])
-        except Exception as exc:
-            self.error(exc)
-
-    def _adjacent_triplet(self, clip):
-        same = sorted((value for value in self.clips
-                       if value.uid != clip.uid and value.track == clip.track
-                       and value.kind == clip.kind), key=lambda value: value.position)
-        previous = max((value for value in same if value.finish <= clip.position + 1e-6),
-                       key=lambda value: value.finish, default=None)
-        following = min((value for value in same if value.position >= clip.finish - 1e-6),
-                         key=lambda value: value.position, default=None)
-        if (previous is None or following is None
-                or abs(previous.finish - clip.position) > 1e-5
-                or abs(clip.finish - following.position) > 1e-5):
-            return None
-        return previous, clip, following
-
-    def slide_selected(self, direction):
-        clip = self._single_trim_clip()
-        if clip is None:
-            return
-        triplet = self._adjacent_triplet(clip)
-        if triplet is None:
-            return self.statusBar().showMessage('Slide braucht einen Clip mit direkten Nachbarn links und rechts.', 3500)
-        if self.track_locked(clip.track):
-            return self.statusBar().showMessage('Die betroffene Spur ist gesperrt.', 3500)
-        previous, middle, following = triplet
-        delta = self._frame_step(clip) * (1 if direction >= 0 else -1)
-        try:
-            left, moved, right = slide_edit(previous, middle, following, delta)
-            self._commit_trim_replacements(
-                {left.uid: left, moved.uid: moved, right.uid: right},
-                f'Slide-Schnitt {"rechts" if delta > 0 else "links"} Â· {abs(delta):.3f} s',
-                selection=[moved.uid])
-        except Exception as exc:
-            self.error(exc)
-
-    def slip_selected(self, direction):
-        clip = self._single_trim_clip()
-        if clip is None:
-            return
-        delta = self._frame_step(clip) * (1 if direction >= 0 else -1)
-        try:
-            candidate = slip_clip(clip, delta)
-            if abs(candidate.start - clip.start) <= 1e-7:
-                return self.statusBar().showMessage('Der Quellbereich kann nicht weiter in diese Richtung verschoben werden.', 3000)
-            self._commit_trim_replacements(
-                {clip.uid: candidate},
-                f'Slip-Schnitt {"rechts" if delta > 0 else "links"} Â· {abs(candidate.start-clip.start):.3f} s',
-                selection=[candidate.uid])
-        except Exception as exc:
-            self.error(exc)
-
-    def remove(self):
-        selected=self.selected_clips()
-        if selected and not self.worker and not self.selection_locked():
-            removed={clip.uid for clip in selected}
-            anchor=selected[0]
-            self.checkpoint(); self.clips=[clip for clip in self.clips if clip.uid not in removed]
-            adjacent=min(self.clips,key=lambda c:((c.track!=anchor.track),abs(c.position-anchor.position)),default=None)
-            self.current=adjacent.uid if adjacent else None; self.selection=[self.current] if self.current else []; self.changed()
-
-    def add_track(self,video):
-        if self.worker:return
-        self.checkpoint()
-        new=max([t for t in self.tracks if t>0],default=0)+1 if video else min([t for t in self.tracks if t<0],default=0)-1
-        self.tracks.append(new); self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks); self.changed()
-
-    def track_counts_changed(self):
-        if self.worker:return
-        videos, audios = self.video_tracks.value(), self.audio_tracks.value()
-        wanted=list(range(videos,0,-1))+list(range(-1,-audios-1,-1))
-        if any(c.track not in wanted for c in self.clips):
-            self.statusBar().showMessage('Diese Spur enthÃ¤lt noch Clips. Verschiebe oder lÃ¶sche sie zuerst.',6000)
-            self.refresh(); return
-        if wanted != self.tracks:
-            self.checkpoint(); self.tracks=wanted; self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks); self.changed()
-
-    def default_track_name(self, track):
-        return f'VIDEO {track}' if track > 0 else f'AUDIO {-track}'
-
-    def show_track_context_menu(self, track, global_pos):
-        if track not in self.tracks:
-            return
-        menu=QMenu(self)
-        menu.addAction('Spur umbenennen â€¦',lambda:self.rename_track(track))
-        delete=menu.addAction('Leere Spur lÃ¶schen',lambda:self.delete_track(track))
-        delete.setEnabled(not any(clip.track == track for clip in self.clips))
-        menu.exec(global_pos)
-
-    def rename_track(self, track):
-        if self.worker or track not in self.tracks or self.track_locked(track):
-            return self.statusBar().showMessage('Diese Spur ist gesperrt.',3000) if track in self.tracks else None
-        current=self.track_names.get(track,self.default_track_name(track))
-        name,ok=QInputDialog.getText(self,'Spur umbenennen','Neuer Spurname:',text=current)
-        if not ok:
-            return
-        name=name.strip()
-        self.checkpoint()
-        if name and name != self.default_track_name(track):
-            self.track_names[track]=name[:48]
-        else:
-            self.track_names.pop(track,None)
-        self.changed()
-
-    def delete_track(self, track):
-        if self.worker or track not in self.tracks:
-            return
-        if self.track_locked(track):
-            return self.statusBar().showMessage('Diese Spur ist gesperrt.',3000)
-        if any(clip.track == track for clip in self.clips):
-            return self.statusBar().showMessage('Die Spur enthÃ¤lt noch Clips. Verschiebe oder lÃ¶sche sie zuerst.',5000)
-        same_type=[value for value in self.tracks if (value > 0) == (track > 0)]
-        if len(same_type) <= 1:
-            return self.statusBar().showMessage('Mindestens eine Video- und eine Audiospur muss bleiben.',4000)
-        self.checkpoint(); self.tracks=[value for value in self.tracks if value != track]
-        self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks); self.changed()
-
-    def extract_audio(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or not c.has_audio:return self.error('WÃ¤hle einen Videoclip mit Originalton.')
-        if not self.require_unlocked(c):return
-        source=Path(c.path)
-        target_dir=self.state_dir/'extracted-audio'; target_dir.mkdir(parents=True,exist_ok=True)
-        target=target_dir/(source.stem+'-'+uuid.uuid4().hex[:8]+'.wav')
-        clip_snapshot=replace(c)
-        tracks_snapshot=list(self.tracks)
-        def operation(progress,cancel):
-            args=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-i',str(source),
-                  '-map','0:a:0','-vn','-c:a','pcm_s16le','-ar','48000','-ac','2',str(target)]
-            proc=subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
-            while proc.poll() is None:
-                if cancel.wait(.1):
-                    proc.terminate()
-                    try: proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired: proc.kill(); proc.wait()
-                    raise ExportCancelled()
-            if proc.returncode:
-                detail=(proc.stderr.read() if proc.stderr else '').strip()
-                raise ValueError('Audio konnte nicht extrahiert werden.'+(('\n'+detail) if detail else ''))
-            return str(target)
-        self.start_job('Audiospur wird aus dem Video extrahiert â€¦',operation,
-                       lambda result:self.extracted_audio_done(result,clip_snapshot,tracks_snapshot))
-
-    def start_background_removal(self):
-        """Generate a local transparent derivative for the selected clip."""
-        c=self.current_clip()
-        if not c or c.kind!='video' or c.source_type not in ('video','image'):
-            return self.error('WÃ¤hle einen Video- oder Bildclip fÃ¼r die Hintergrundfreistellung.')
-        if self.worker or not self.require_unlocked(c):
-            return
-        source=Path(c.path)
-        target_dir=self.state_dir/'ai-media'; target_dir.mkdir(parents=True,exist_ok=True)
-        suffix='.png' if c.source_type=='image' else '.mov'
-        target=target_dir/(source.stem+'-'+c.uid[:10]+'-background'+suffix)
-        uid=c.uid
-        def operation(progress,cancel):
-            try:
-                return remove_background_media(source,target,progress,cancel)
-            except AIToolError:
-                if cancel.is_set():
-                    raise ExportCancelled()
-                raise
-        self.start_job('Lokale KI entfernt den Hintergrund â€¦',operation,
-                       lambda result:self.background_removal_done(result,uid))
-
-    def background_removal_done(self,result,uid):
-        if not result['ok']:
-            return self.job_error(result)
-        c=next((value for value in self.clips if value.uid==uid),None)
-        if not c:
-            return self.statusBar().showMessage('Clip wurde wÃ¤hrend der Verarbeitung entfernt.',5000)
-        try:
-            candidate=replace(c,background_removal_enabled=True,background_removed_path=str(result['value']))
-            proposed=[candidate if value.uid==uid else value for value in self.clips]
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
-            self.statusBar().showMessage('Hintergrund entfernt Â· transparente lokale Datei ist aktiv.',6000)
-        except Exception as exc:
-            self.error(exc)
-
-    def clear_background_removal(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or not c.background_removed_path:
-            return
-        if self.worker or not self.require_unlocked(c):
-            return
-        candidate=replace(c,background_removal_enabled=False,background_removed_path='')
-        self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
-
-    def start_motion_tracking(self):
-        """Track the inspector rectangle through one local video clip."""
-        c=self.current_clip()
-        if not c or c.kind!='video' or c.source_type!='video':
-            return self.error('WÃ¤hle einen normalen Videoclip fÃ¼r Motion-Tracking.')
-        if self.worker or not self.require_unlocked(c):
-            return
-        region=(self.mask_x.value()/100,self.mask_y.value()/100,
-                self.mask_width.value()/100,self.mask_height.value()/100)
-        if region[0]+region[2] > 1.000001 or region[1]+region[3] > 1.000001:
-            return self.error('Der Trackingbereich muss vollstÃ¤ndig im Bild liegen.')
-        uid=c.uid
-        def operation(progress,cancel):
-            try:
-                return track_motion(c.path,c.start,c.end,region,progress,cancel)
-            except AIToolError:
-                if cancel.is_set():
-                    raise ExportCancelled()
-                raise
-        self.start_job('Lokales Motion-Tracking wird berechnet â€¦',operation,
-                       lambda result:self.motion_tracking_done(result,uid))
-
-    def start_mask_tracking(self):
-        """Track a Bezier mask through the same local object tracker."""
-        c=self.current_clip()
-        if not c or c.kind!='video' or c.source_type!='video' or c.mask_type!='bezier' or len(c.mask_points)<3:
-            return self.error('WÃ¤hle eine Bezier-Maske mit mindestens drei Punkten.')
-        self.start_motion_tracking()
-
-    def motion_tracking_done(self,result,uid):
-        if not result['ok']:
-            return self.job_error(result)
-        c=next((value for value in self.clips if value.uid==uid),None)
-        if not c:
-            return self.statusBar().showMessage('Clip wurde wÃ¤hrend des Trackings entfernt.',5000)
-        # Tracking operates on source seconds; render filters see clip-local
-        # seconds after speed processing.  Fixed-speed clips therefore map
-        # source time by 1/speed.  Speed-ramp clips use the base speed as a
-        # stable approximation and remain fully editable afterwards.
-        divisor=max(.25,float(c.speed))
-        points=[]
-        for point in result['value']:
-            value=dict(point); value['time']=round(min(c.length,max(0.0,float(point['time'])/divisor)),6)
-            points.append(value)
-        points.sort(key=lambda value:float(value['time']))
-        unique=[]
-        for point in points:
-            if unique and abs(float(unique[-1]['time'])-float(point['time'])) <= 1e-7:
-                unique[-1]=point
-            else:
-                unique.append(point)
-        try:
-            candidate=replace(c,tracking_keyframes=unique)
-            if c.mask_type == 'bezier' and len(c.mask_points) >= 3:
-                candidate=replace(candidate,mask_path_keyframes=mask_path_keyframes_from_tracking(candidate))
-            proposed=[candidate if value.uid==uid else value for value in self.clips]
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
-            extra=' Â· Bezier-Maske animiert' if candidate.mask_path_keyframes else ''
-            self.statusBar().showMessage(f'Motion-Tracking fertig Â· {len(unique)} Punkte gespeichert.{extra}',6000)
-        except Exception as exc:
-            self.error(exc)
-
-    def start_auto_reframe(self):
-        """Detect a local face focus path for the selected video clip."""
-        c=self.current_clip()
-        if not c or c.kind!='video' or c.source_type!='video':
-            return self.error('WÃ¤hle einen normalen Videoclip fÃ¼r Auto-Reframe.')
-        if self.worker or not self.require_unlocked(c):
-            return
-        format_name=self.auto_reframe_format.currentData() or 'project'
-        try:
-            target_aspect=auto_reframe_aspect(format_name,PRESETS[self.preset.currentText()])
-        except (KeyError,ValueError) as exc:
-            return self.error(exc)
-        uid=c.uid
-        def operation(progress,cancel):
-            try:
-                return auto_reframe_video(c.path,c.start,c.end,target_aspect,progress,cancel)
-            except AIToolError:
-                if cancel.is_set():
-                    raise ExportCancelled()
-                raise
-        self.start_job('Lokales Auto-Reframe wird analysiert â€¦',operation,
-                       lambda result:self.auto_reframe_done(result,uid,format_name))
-
-    def auto_reframe_done(self,result,uid,format_name):
-        if not result['ok']:
-            return self.job_error(result)
-        c=next((value for value in self.clips if value.uid==uid),None)
-        if not c:
-            return self.statusBar().showMessage('Clip wurde wÃ¤hrend des Auto-Reframes entfernt.',5000)
-        divisor=max(.25,float(c.speed))
-        points=[]
-        for point in result['value']:
-            value=dict(point)
-            value['time']=round(min(c.length,max(0.0,float(point['time'])/divisor)),6)
-            points.append(value)
-        points.sort(key=lambda value:float(value['time']))
-        unique=[]
-        for point in points:
-            if unique and abs(float(unique[-1]['time'])-float(point['time'])) <= 1e-7:
-                unique[-1]=point
-            else:
-                unique.append(point)
-        try:
-            candidate=replace(c,auto_reframe_enabled=True,auto_reframe_format=format_name,
-                              auto_reframe_keyframes=unique)
-            proposed=[candidate if value.uid==uid else value for value in self.clips]
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.changed(); self.fill_inspector()
-            detected=sum(1 for point in unique if float(point.get('score',0.0)) > 0)
-            self.statusBar().showMessage(
-                f'Auto-Reframe fertig Â· {len(unique)} Fokus-Punkte Â· {detected} mit Gesichtserkennung.',6000)
-        except Exception as exc:
-            self.error(exc)
-
-    def clear_auto_reframe(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or not c.auto_reframe_keyframes:
-            return
-        if self.worker or not self.require_unlocked(c):
-            return
-        candidate=replace(c,auto_reframe_enabled=False,auto_reframe_keyframes=[])
-        self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
-
-    def start_beat_analysis(self):
-        c=self.current_clip()
-        if not c or c.kind not in ('video','audio') or not c.has_audio or c.source_type=='adjustment':
-            return self.error('WÃ¤hle einen Video- oder Audioclip mit Ton fÃ¼r Beat-Sync.')
-        if self.worker or not self.require_unlocked(c):
-            return
-        uid=c.uid
-        def operation(progress,cancel):
-            try:
-                return analyze_beats(c.path,c.start,c.end,progress,cancel)
-            except AIToolError:
-                if cancel.is_set():
-                    raise ExportCancelled()
-                raise
-        self.start_job('Lokale Beat-Erkennung wird berechnet â€¦',operation,
-                       lambda result:self.beat_analysis_done(result,uid))
-
-    def beat_analysis_done(self,result,uid):
-        if not result['ok']:
-            return self.job_error(result)
-        c=next((value for value in self.clips if value.uid==uid),None)
-        if not c:
-            return self.statusBar().showMessage('Clip wurde wÃ¤hrend der Beat-Erkennung entfernt.',5000)
-        divisor=max(.25,float(c.speed))
-        beat_markers=[marker for marker in self.markers
-                      if not (marker.get('kind') == 'beat' and c.position-1e-6 <= float(marker.get('time',0)) <= c.finish+1e-6)]
-        for index, beat in enumerate(result['value'].get('beats', []), 1):
-            time=c.position+min(c.length,max(0.0,float(beat)/divisor))
-            beat_markers.append({'time':round(time,6),'label':f'Beat {index}','kind':'beat','color':'#ff7edb'})
-        try:
-            normalized=normalize_markers(beat_markers,length(self.clips))
-            self.checkpoint(); self.markers=normalized; self.changed()
-            bpm=result['value'].get('bpm',0.0)
-            self.statusBar().showMessage(
-                f"Beat-Sync fertig Â· {len(result['value'].get('beats',[]))} Beats"
-                + (f" Â· ca. {bpm:.0f} BPM" if bpm else ''),6000)
-        except Exception as exc:
-            self.error(exc)
-
-    def start_text_based_cut(self):
-        """Transcribe one clip locally and remove pauses/filler words."""
-        c=self.current_clip()
-        if not c or c.kind not in ('video','audio') or c.source_type not in ('video','audio') or not c.has_audio:
-            return self.error('WÃ¤hle ein Video oder Audio mit Ton fÃ¼r den Textschnitt.')
-        if self.worker or not self.require_unlocked(c):
-            return
-        source=Path(c.path).expanduser().resolve(); uid=c.uid
-        if not source.is_file():
-            return self.error(f'Die Quelldatei wurde nicht gefunden:\n{source}')
-        divisor=max(.25,float(c.speed))
-
-        def operation(progress,cancel):
-            payload=transcribe_media(source,model_size='base',language='auto',
-                                     cache_dir=self.state_dir/'whisper-models',
-                                     progress=progress,cancel=cancel)
-            mapped=[]
-            for cue in payload.get('cues',[]):
-                try:
-                    source_start=float(cue['start']); source_end=float(cue['end'])
-                except (KeyError,TypeError,ValueError):
-                    continue
-                if source_end <= c.start+1e-7 or source_start >= c.end-1e-7:
-                    continue
-                local_start=max(c.start,source_start)-c.start
-                local_end=min(c.end,source_end)-c.start
-                item=dict(cue,start=round(local_start/divisor,6),end=round(local_end/divisor,6))
-                words=[]
-                for word in cue.get('words',[]):
-                    try:
-                        word_start=max(c.start,float(word['start']))-c.start
-                        word_end=min(c.end,float(word['end']))-c.start
-                    except (KeyError,TypeError,ValueError):
-                        continue
-                    if word_end > 0 and word_start < c.end-c.start:
-                        words.append(dict(word,start=round(max(0,word_start)/divisor,6),
-                                          end=round(max(0,word_end)/divisor,6)))
-                if words: item['words']=words
-                mapped.append(item)
-            plan=build_text_edit_plan(mapped,c.length)
-            plan['language']=payload.get('language','auto')
-            plan['cue_count']=len(mapped)
-            return plan
-        self.start_job('Textbasierter Schnitt wird lokal analysiert â€¦',operation,
-                       lambda result:self.text_based_cut_done(result,uid))
-
-    def text_based_cut_done(self,result,uid):
-        if not result['ok']:
-            return self.job_error(result)
-        c=next((value for value in self.clips if value.uid==uid),None)
-        if not c:
-            return self.statusBar().showMessage('Clip wurde wÃ¤hrend der Textanalyse entfernt.',5000)
-        plan=result['value']
-        removed=float(plan.get('removed_seconds',0.0))
-        if removed < .06:
-            return self.error('Keine lÃ¤ngeren Pausen oder FÃ¼llwÃ¶rter erkannt.')
-        try:
-            segments=cut_clip_ranges(c,plan.get('keep_ranges',[]))
-            old_finish=c.finish
-            actual_removed=max(0.0,c.length-sum(value.length for value in segments))
-            if actual_removed < .01:
-                return self.error('Der Textschnitt hat keine verwertbare Ã„nderung gefunden.')
-            removed_ranges=[(float(start),float(end)) for start,end in plan.get('removed_ranges',[])]
-
-            def compact_marker_time(time):
-                time=float(time)
-                if time < c.position-1e-7:
-                    return time
-                if time > old_finish+1e-7:
-                    return max(0.0,time-actual_removed)
-                local=max(0.0,min(c.length,time-c.position)); shift=0.0
-                for start,end in removed_ranges:
-                    if local >= end:
-                        shift += end-start
-                    elif local > start:
-                        local=start; break
-                return c.position+max(0.0,local-shift)
-
-            proposed=[]
-            for value in self.clips:
-                if value.uid==uid:
-                    continue
-                if value.track==c.track and value.position >= old_finish-1e-6:
-                    proposed.append(replace(value,position=max(0.0,value.position-actual_removed)))
-                else:
-                    proposed.append(value)
-            proposed.extend(segments)
-            markers=[dict(marker,time=round(compact_marker_time(marker['time']),6)) for marker in self.markers]
-            normalized_markers=normalize_markers(markers,length(proposed))
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.markers=normalized_markers
-            self.selection=[value.uid for value in segments]; self.current=segments[-1].uid; self.changed()
-            self.statusBar().showMessage(
-                f'Textschnitt fertig Â· {actual_removed:.2f} s entfernt Â· '
-                f'{plan.get("filler_segments",0)} FÃ¼llwort-Segmente Â· {len(segments)} Teile',7000)
-        except Exception as exc:
-            self.error(exc)
-
-    def clear_beat_markers(self):
-        if self.worker:
-            return
-        markers=[marker for marker in self.markers if marker.get('kind') != 'beat']
-        if len(markers) == len(self.markers):
-            return
-        self.checkpoint(); self.markers=normalize_markers(markers,length(self.clips)); self.changed()
-
-    def start_auto_cut(self):
-        """Find beats and hard scene changes, then split at useful points."""
-        c=self.current_clip()
-        if not c or c.kind!='video' or c.source_type!='video':
-            return self.error('WÃ¤hle einen normalen Videoclip fÃ¼r Beat-/Szenen-Auto-Cut.')
-        if self.worker or not self.require_unlocked(c):
-            return
-        uid=c.uid; divisor=max(.25,float(c.speed))
-        def operation(progress,cancel):
-            try:
-                if c.has_audio:
-                    beat_data=analyze_beats(c.path,c.start,c.end,
-                                            lambda value:progress(int(value*.45)),cancel)
-                else:
-                    beat_data={'beats':[],'bpm':0.0}
-                    progress(45)
-                scenes=detect_scene_changes(c.path,c.start,c.end,
-                                            lambda value:progress(45+int(value*.55)),cancel)
-                points=build_auto_cut_points(beat_data,scenes,c.length)
-                return {'points':[round(float(value)/divisor,6) for value in points],
-                        'beats':len(beat_data.get('beats',[])), 'scenes':len(scenes),
-                        'bpm':beat_data.get('bpm',0.0)}
-            except AIToolError:
-                if cancel.is_set():
-                    raise ExportCancelled()
-                raise
-        self.start_job('Beats und Szenen werden lokal analysiert â€¦',operation,
-                       lambda result:self.auto_cut_done(result,uid))
-
-    def auto_cut_done(self,result,uid):
-        if not result['ok']:
-            return self.job_error(result)
-        c=next((value for value in self.clips if value.uid==uid),None)
-        if not c:
-            return self.statusBar().showMessage('Clip wurde wÃ¤hrend des Auto-Cuts entfernt.',5000)
-        payload=result['value']; points=payload.get('points',[])
-        if not points:
-            return self.error('Keine stabilen Beat- oder Szenen-Schnittpunkte erkannt.')
-        try:
-            segments=split_clip_at_times(c,points)
-            if len(segments)<2:
-                return self.error('Die erkannten Punkte liegen zu dicht fÃ¼r einen sichtbaren Schnitt.')
-            proposed=[value for value in self.clips if value.uid!=uid]+segments
-            validate_timeline(proposed,self.tracks)
-            self.checkpoint(); self.clips=proposed; self.selection=[value.uid for value in segments]; self.current=segments[-1].uid; self.changed()
-            self.statusBar().showMessage(
-                f'Beat-/Szenen-Auto-Cut fertig Â· {len(segments)-1} Schnitte Â· '
-                f'{payload.get("beats",0)} Beats Â· {payload.get("scenes",0)} Szenen',7000)
-        except Exception as exc:
-            self.error(exc)
-
-    def clear_motion_tracking(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or not c.tracking_keyframes:
-            return
-        if self.worker or not self.require_unlocked(c):
-            return
-        candidate=replace(c,tracking_keyframes=[])
-        self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
-
-    def set_object_removal_enabled(self, enabled=True):
-        c=self.current_clip()
-        if not c or c.kind!='video' or c.source_type=='adjustment' or self.worker:
-            return
-        if not self.require_unlocked(c):
-            return
-        self.object_removal_enabled.setChecked(bool(enabled))
-        self.apply_properties()
-
-    # Compatibility helper for the old in-memory action used by older projects/tests.
-    # The visible button intentionally uses extract_audio(), which creates a real WAV.
-    def detach_audio(self):
-        c=self.current_clip()
-        if not c or c.kind!='video' or not c.has_audio:
-            return self.error('WÃ¤hle einen Videoclip mit Originalton.')
-        if not self.require_unlocked(c):return
-        proposed=None
-        for track in sorted((t for t in self.tracks if t<0),reverse=True):
-            candidate=replace(c,uid=uuid.uuid4().hex,track=track,kind='audio')
-            try:
-                validate_timeline(self.clips+[candidate],self.tracks); proposed=candidate; break
-            except ValueError:
-                continue
-        self.checkpoint()
-        if proposed is None:
-            track=min(self.tracks+[0])-1; self.tracks.append(track)
-            self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks)
-            proposed=replace(c,uid=uuid.uuid4().hex,track=track,kind='audio')
-        self.clips=[replace(v,volume=0) if v.uid==c.uid else v for v in self.clips]+[proposed]
-        self.selection=[proposed.uid]; self.current=proposed.uid; self.changed()
-
-    def extracted_audio_done(self,result,source_clip,tracks_snapshot):
-        if not result['ok']:
-            return self.job_error(result)
-        try:
-            audio=import_clip(result['value'])
-            end=min(source_clip.end,audio.duration)
-            start=min(source_clip.start,max(0,end-MIN_CLIP))
-            if end-start < MIN_CLIP:
-                raise ValueError('Die extrahierte Audiospur ist zu kurz fÃ¼r diesen Clip.')
-            proposed=None; chosen_tracks=list(self.tracks)
-            for track in sorted((t for t in self.tracks if t<0),reverse=True):
-                candidate=replace(audio,uid=uuid.uuid4().hex,track=track,position=source_clip.position,
-                                  start=start,end=end,volume=source_clip.volume)
-                try:
-                    validate_timeline(self.clips+[candidate],self.tracks); proposed=candidate; break
-                except ValueError:
-                    continue
-            if proposed is None:
-                track=min(self.tracks+[0])-1
-                chosen_tracks.append(track)
-                proposed=replace(audio,uid=uuid.uuid4().hex,track=track,position=source_clip.position,
-                                 start=start,end=end,volume=source_clip.volume)
-            validate_timeline(self.clips+[proposed],chosen_tracks)
-            self.checkpoint(); self.tracks=chosen_tracks; self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks)
-            self.clips=[replace(v,volume=0) if v.uid==source_clip.uid else v for v in self.clips]+[proposed]
-            self.assets.append(proposed); self.selection=[proposed.uid]; self.current=proposed.uid; self.prepare_visuals([proposed]); self.changed()
-            self.statusBar().showMessage('Audio extrahiert und auf eine eigene Audiospur gelegt.',6000)
-        except Exception as exc:
-            self.error(exc)
-
-    def import_dialog(self):
-        if self.worker:return
-        paths,_=QFileDialog.getOpenFileNames(self,'Video / Audio importieren','',
-          'Medien (*.mp4 *.mov *.mkv *.webm *.avi *.m4v *.mp3 *.wav *.flac *.ogg *.m4a *.aac *.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff);;Alle Dateien (*)')
-        self.import_paths(paths)
-
-    def import_sequence_dialog(self):
-        if self.worker:
-            return
-        paths,_=QFileDialog.getOpenFileNames(self,'Bildsequenz importieren','',
-          'Bilder (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff);;Alle Dateien (*)')
-        if not paths:
-            return
-        fps,ok=QInputDialog.getDouble(self,'Bildsequenz','Bildrate der Sequenz:',24.0,1.0,120.0,2)
-        if ok:
-            self.import_paths(paths,sequence_fps=fps)
-
-    def automatic_subtitle_dialog(self):
-        if self.worker:
-            return
-        sources=[]; seen=set()
-        candidates=[]
-        current=self.current_clip()
-        if current is not None:
-            candidates.append(current)
-        candidates.extend(self.assets)
-        candidates.extend(self.clips)
-        for candidate in candidates:
-            if candidate.kind not in ('video','audio') or candidate.source_type in ('image','image_sequence','adjustment'):
-                continue
-            path=str(candidate.path or '').strip()
-            if not path or path in seen:
-                continue
-            seen.add(path)
-            title=f'{Path(path).name} Â· {"Video" if candidate.kind == "video" else "Audio"}'
-            sources.append((title,path))
-        dialog=AutomaticSubtitleDialog(sources,self)
-        if dialog.exec()!=QDialog.Accepted:
-            return
-        settings=dialog.settings()
-        self.start_transcription(settings['path'],settings['language'],settings['model_size'])
-
-    def start_transcription(self,path,language='auto',model_size='base'):
-        if self.worker:
-            return
-        if not path:
-            return self.error('WÃ¤hle zuerst ein Video oder eine Audiodatei fÃ¼r die Spracherkennung aus.')
-        source=Path(path).expanduser().resolve()
-        if not source.is_file():
-            return self.error(f'Die Quelldatei wurde nicht gefunden:\n{source}')
-
-        def operation(progress,cancel):
-            return transcribe_media(source,model_size=model_size,language=language,
-                                    cache_dir=self.state_dir/'whisper-models',
-                                    progress=progress,cancel=cancel)
-        self.start_job('Automatische Untertitel werden erstellt â€¦',operation,
-                       lambda result:self.transcription_done(result,source))
-
-    def transcription_done(self,result,source):
-        if not result['ok']:
-            return self.job_error(result)
-        payload=result['value']
-        cues=payload.get('cues',[]) if isinstance(payload,dict) else payload
-        if not cues:
-            return self.error('Keine gesprochenen Worte im Medium erkannt.')
-        try:
-            count=self.add_subtitle_cues(cues,Path(source).name,'automatisch erstellt')
-            detected=str(payload.get('language','auto')).upper() if isinstance(payload,dict) else 'AUTO'
-            self.statusBar().showMessage(f'{count} Untertitel automatisch erstellt Â· Sprache {detected}',6000)
-        except Exception as exc:
-            self.error(exc)
-
-    def import_subtitle_dialog(self):
-        if self.worker:
-            return
-        path,_=QFileDialog.getOpenFileName(self,'Untertitel importieren','','Untertitel (*.srt *.vtt);;Alle Dateien (*)')
-        if path:
-            self.import_subtitles(path)
-
-    def import_subtitles(self,path):
-        if self.worker:
-            return
-        def operation(progress,cancel):
-            if cancel.is_set():
-                raise ExportCancelled()
-            cues=parse_subtitle_file(path)
-            progress(100)
-            return cues
-        self.start_job('Untertitel werden gelesen â€¦',operation,
-                       lambda result:self.subtitle_import_done(result,path))
-
-    def subtitle_import_done(self,result,path):
-        if not result['ok']:
-            return self.job_error(result)
-        try:
-            self.add_subtitle_cues(result['value'],Path(path).name,'importiert')
-        except Exception as exc:
-            self.error(exc)
-
-    def add_subtitle_cues(self,cues,source_label,action='importiert'):
-        if not cues:
-            raise ValueError('Keine gÃ¼ltigen Untertitel gefunden.')
-        existing=list(self.clips)
-        tracks=list(self.tracks)
-        video_tracks=[track for track in tracks if track > 0]
-        next_track=max(video_tracks,default=0)+1
-        subtitle_tracks=[]
-        new_clips=[]
-
-        def overlaps(track,start,end):
-            return any(item.track == track and item.position < end - 1e-7 and item.finish > start + 1e-7
-                       for item in existing + new_clips)
-
-        for cue in cues:
-            start=float(cue['start']); end=float(cue['end'])
-            track=next((candidate for candidate in subtitle_tracks if not overlaps(candidate,start,end)),None)
-            if track is None:
-                track=next_track; next_track+=1; subtitle_tracks.append(track); tracks.append(track)
-            duration=end-start
-            candidate=Clip('',864000.0,start=0,end=duration,position=start,track=track,kind='text',
-                           has_audio=False,text=cue['text'],source_type='text')
-            new_clips.append(candidate)
-        proposed=existing+new_clips
-        validate_timeline(proposed,tracks)
-        self.checkpoint(); self.tracks=tracks
-        self.track_states=normalize_track_states(self.track_states,self.tracks)
-        self.track_names=normalize_track_names(self.track_names,self.tracks)
-        for index,track in enumerate(subtitle_tracks,1):
-            self.track_names[track]='Untertitel' if index == 1 else f'Untertitel {index}'
-        self.clips=proposed; self.selection=[clip.uid for clip in new_clips]
-        self.current=new_clips[-1].uid if new_clips else None; self.changed()
-        self.statusBar().showMessage(f'{len(new_clips)} Untertitel aus {source_label} {action}.',5000)
-        return len(new_clips)
-
-    def import_paths(self,paths,sequence_fps=None):
-        if not paths or self.worker:return
-        def operation(progress,cancel):
-            assets=[]; errors=[]
-            if sequence_fps is not None:
-                try:
-                    assets.append(import_image_sequence(paths,sequence_fps))
-                    progress(100)
-                except Exception as exc:
-                    errors.append(str(exc))
-                return assets,errors
-            for i,path in enumerate(paths):
-                if cancel.is_set():raise ExportCancelled()
-                try:assets.append(import_clip(path))
-                except Exception as exc:errors.append(str(exc))
-                progress(int((i+1)/len(paths)*100))
-            if cancel.is_set():raise ExportCancelled()
-            return assets,errors
-        self.start_independent_job('import','Medien werden geprÃ¼ft â€¦',operation,self.import_done)
-
-    def import_done(self,result):
-        if not result['ok']:return self.job_error(result)
-        assets,errors=result['value']
-        asset_key=lambda asset:(asset.source_type,tuple(asset.source_paths) if asset.source_paths else asset.path)
-        known={asset_key(asset) for asset in self.assets}
-        added=[asset for asset in assets if asset_key(asset) not in known]
-        if added: self.checkpoint('Medien importieren')
-        self.assets.extend(added); self.prepare_visuals(added); self.refresh_media()
-        if added:self.changed()
-        if added and self.performance_combo.currentData()=='smooth': QTimer.singleShot(0,self.performance_changed)
-        if errors:self.error('\n'.join(errors))
-
-    def open_media_panel(self):
-        """Show the project media bin and keep the library panel out of the way."""
-        if not hasattr(self, 'asset_library_panel'):
-            return
-        self.media_heading.setText('MEDIEN')
-        for widget in self._media_controls:
-            if widget is self.media_empty_hint:
-                continue
-            widget.show()
-        self.asset_library_panel.hide()
-        self.media_empty_hint.setVisible(self.media_list.count() == 0)
-        self.refresh_media()
-
-    def open_library_panel(self):
-        """Replace the media bin with the compact offline starter library."""
-        if not hasattr(self, 'asset_library_panel'):
-            return
-        for widget in self._media_controls:
-            widget.hide()
-        self.media_heading.setText('BIBLIOTHEK')
-        self.media_count.setText(f'{len(library_items())} Starter-Assets')
-        self.asset_library_panel.show()
-        self.asset_library_panel.refresh()
-
-    def preview_library_item(self, item_id):
-        item=get_library_item(item_id)
-        if item is None:
-            return
-        if item.kind != 'sound':
-            self.statusBar().showMessage('Dieses Preset wird direkt auf den ausgewÃ¤hlten Clip angewendet.',3000)
-            return
-        try:
-            path=library_sound_path(item.item_id,self.state_dir)
-            self.library_player.stop()
-            self.library_player.setSource(QUrl.fromLocalFile(str(path)))
-            self.library_player.play()
-            self.statusBar().showMessage(f'Vorschau: {item.title}',2000)
-        except Exception as exc:
-            self.error(exc)
-
-    def _library_audio_track(self, preferred=None):
-        """Choose an unlocked audio track, creating one only when necessary."""
-        audio_tracks=[track for track in self.tracks if track < 0]
-        if preferred in audio_tracks and not self.track_locked(preferred):
-            return preferred
-        available=[track for track in audio_tracks if not self.track_locked(track)]
-        if available:
-            return min(available, key=abs)
-        # The caller adds this track together with the rest of the edit so a
-        # single undo step can remove it again if all existing audio tracks
-        # were locked.
-        return min(audio_tracks or [0])-1
-
-    def _library_insert_position(self, track, duration, preferred=None):
-        """Find the first free slot on a target track from the playhead onward."""
-        position=max(0.0,float(self.playhead if preferred is None else preferred))
-        for clip in sorted((value for value in self.clips if value.track == track), key=lambda value:value.position):
-            if clip.finish <= position + 1e-7:
-                continue
-            if clip.position >= position + duration - 1e-7:
-                break
-            position=clip.finish
-        return position
-
-    def _commit_library_clip(self, candidate, title):
-        proposed=[candidate if item.uid==candidate.uid else item for item in self.clips]
-        validate_timeline(proposed,self.tracks)
-        self.checkpoint(title)
-        self.clips=proposed; self.selection=[candidate.uid]; self.current=candidate.uid; self.changed()
-
-    def _apply_library_effect(self, item):
-        clip=self.current_clip()
-        if not clip or clip.kind != 'video' or self.worker:
-            return self.statusBar().showMessage('WÃ¤hle zuerst einen Video- oder Adjustment-Clip aus.',3000)
-        if not self.require_unlocked(clip):
-            return
-        parameters=dict(item.parameters)
-        preset_name=parameters.pop('effect_preset', 'clean')
-        values=dict(EFFECT_PRESETS.get(preset_name, {}))
-        values.update(parameters)
-        candidate=replace(clip,effect_preset=preset_name,**values)
-        try:
-            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
-            self.statusBar().showMessage(f'Effekt â€ž{item.title}â€œ angewendet.',3000)
-        except Exception as exc:
-            self.error(exc)
-
-    def _apply_library_animation(self, item):
-        clip=self.current_clip()
-        if not clip or self.worker:
-            return self.statusBar().showMessage('WÃ¤hle zuerst einen Clip fÃ¼r die Animation aus.',3000)
-        if not self.require_unlocked(clip):
-            return
-        animation=item.parameters.get('animation')
-        if clip.kind == 'text':
-            text_animation={'text_fade':'fade','text_slide':'slide_left'}.get(animation)
-            if text_animation is None:
-                return self.statusBar().showMessage('Diese Animation ist fÃ¼r Textclips vorgesehen.',3000)
-            candidate=replace(clip,text_animation=text_animation,
-                              text_animation_duration=min(.8,max(.05,clip.length)))
-        elif clip.kind == 'video' and clip.source_type != 'adjustment':
-            duration=max(.1,float(clip.length))
-            edge=min(.65,max(.05,duration*.35))
-            start_scale=clip.video_scale; end_scale=clip.video_scale
-            start_x=clip.video_x; end_x=clip.video_x
-            start_y=clip.video_y; end_y=clip.video_y
-            if animation == 'zoom_in':
-                start_scale=max(.1,clip.video_scale*.84)
-            elif animation == 'zoom_out':
-                end_scale=max(.1,clip.video_scale*.84)
-            elif animation == 'slide_left':
-                start_x=.08
-            elif animation == 'slide_up':
-                start_y=.08
-            else:
-                return self.statusBar().showMessage('Diese Animation ist fÃ¼r Textclips vorgesehen.',3000)
-            frames=[dict(time=0.0,scale=start_scale,x=start_x,y=start_y,
-                         rotation=clip.rotation,opacity=clip.opacity,blur=clip.blur,curve='ease_out'),
-                    dict(time=duration,scale=end_scale,x=end_x,y=end_y,
-                         rotation=clip.rotation,opacity=clip.opacity,blur=clip.blur,curve='ease_in_out')]
-            candidate=replace(clip,keyframes=frames)
-        else:
-            return self.statusBar().showMessage('WÃ¤hle einen normalen Video- oder Textclip aus.',3000)
-        try:
-            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
-            self.statusBar().showMessage(f'Animation â€ž{item.title}â€œ angewendet.',3000)
-        except Exception as exc:
-            self.error(exc)
-
-    def _apply_library_transition(self, item):
-        clip=self.current_clip()
-        if not clip or clip.kind not in ('video','audio') or clip.source_type == 'adjustment' or self.worker:
-            return self.statusBar().showMessage('WÃ¤hle einen Video- oder Audioclip fÃ¼r den Ãœbergang aus.',3000)
-        if not self.require_unlocked(clip):
-            return
-        transition=item.parameters.get('transition_type','dissolve')
-        duration=min(float(item.parameters.get('duration',.5)),max(0.0,clip.length))
-        candidate=replace(clip,transition_type=transition,transition_duration=duration)
-        try:
-            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
-            self.statusBar().showMessage(f'Ãœbergang â€ž{item.title}â€œ angewendet.',3000)
-        except Exception as exc:
-            self.error(exc)
-
-    def _insert_library_sound(self, item, position=None, track=None):
-        if self.worker:
-            return
-        try:
-            path=library_sound_path(item.item_id,self.state_dir)
-            existing=next((asset for asset in self.assets
-                           if asset.path and Path(asset.path).resolve()==path.resolve()),None)
-            if existing is None:
-                asset=replace(import_clip(str(path)),display_name=item.title)
-            else:
-                asset=existing
-                if not asset.display_name:
-                    asset=replace(asset,display_name=item.title)
-            target_track=self._library_audio_track(track)
-            target_tracks=list(self.tracks)
-            if target_track not in target_tracks:
-                target_tracks.append(target_track)
-            target_position=self._library_insert_position(target_track,asset.length,position)
-            candidate=replace(asset,uid=uuid.uuid4().hex,position=target_position,track=target_track)
-            validate_timeline(self.clips+[candidate],target_tracks)
-            self.checkpoint('Bibliothek: Sound einfÃ¼gen')
-            if target_tracks != self.tracks:
-                self.tracks=target_tracks
-                self.track_states=normalize_track_states(self.track_states,self.tracks)
-                self.track_names=normalize_track_names(self.track_names,self.tracks)
-            if existing is not None and asset.uid != existing.uid:
-                self.assets=[asset if value.uid==existing.uid else value for value in self.assets]
-            if existing is None:
-                self.assets.append(asset)
-            self.clips.append(candidate); self.selection=[candidate.uid]; self.current=candidate.uid
-            self.prepare_visuals([asset]); self.changed()
-            self.statusBar().showMessage(f'Sound â€ž{item.title}â€œ eingefÃ¼gt.',3000)
-        except Exception as exc:
-            self.error(exc)
-
-    def use_library_item(self, item_id):
-        """Apply a preset or insert a generated sound using existing editor data."""
-        item=get_library_item(item_id)
-        if item is None:
-            return
-        if item.kind == 'sound':
-            self._insert_library_sound(item)
-        elif item.kind == 'effect':
-            self._apply_library_effect(item)
-        elif item.kind == 'animation':
-            self._apply_library_animation(item)
-        elif item.kind == 'transition':
-            self._apply_library_transition(item)
-
-    def handle_library_drop(self, item_id, position, track):
-        item=get_library_item(item_id)
-        if item is None or item.kind != 'sound':
-            return
-        self._insert_library_sound(item,position=float(position),track=int(track))
-
-    def refresh_media(self):
-        self.missing_media=missing_project_media(self.clips,self.assets)
-        selected_item=self.media_list.currentItem() if hasattr(self,'media_list') else None
-        selected_uid=selected_item.data(MediaList.ASSET_UID_ROLE) if selected_item is not None else None
-        query=self.media_search.text().strip().casefold() if hasattr(self,'media_search') else ''
-        filter_value=self.media_filter.currentData() if hasattr(self,'media_filter') else 'all'
-        sort_value=self.media_sort.currentData() if hasattr(self,'media_sort') else 'order'
-        favorites_only=self.media_favorites_only.isChecked() if hasattr(self,'media_favorites_only') else False
-        rows=[]
-        for index,c in enumerate(self.assets):
-            icon='â–¦' if c.source_type=='image_sequence' else 'â–§' if c.source_type=='image' else 'â–¸' if c.kind=='video' else 'â™«'
-            label_kind='BILDSEQUENZ' if c.source_type=='image_sequence' else 'BILD' if c.source_type=='image' else c.kind.upper()
-            referenced=[c.path]+list(c.source_paths)+([c.lut_path] if c.lut_path else [])
-            offline=any(path and not Path(path).is_file() for path in referenced)
-            category='sequence' if c.source_type=='image_sequence' else 'image' if c.source_type=='image' else 'video' if c.kind=='video' else 'audio'
-            searchable=' '.join((Path(c.path).name,str(c.path),label_kind,category)).casefold()
-            if query and query not in searchable:
-                continue
-            if filter_value not in ('all',category) and not (filter_value=='offline' and offline):
-                continue
-            if favorites_only and str(Path(c.path).resolve()) not in self.favorite_assets:
-                continue
-            rows.append((index,c,category,offline,icon,label_kind))
-        if sort_value == 'name':
-            rows.sort(key=lambda row:(Path(row[1].path).name.casefold(),row[0]))
-        elif sort_value == 'type':
-            rows.sort(key=lambda row:(row[5],Path(row[1].path).name.casefold(),row[0]))
-        elif sort_value == 'duration':
-            rows.sort(key=lambda row:(-float(row[1].duration),Path(row[1].path).name.casefold(),row[0]))
-        self.media_list.setUpdatesEnabled(False); self.media_list.clear()
-        for index,c,category,offline,icon,label_kind in rows:
-            marker=('âš   ' if offline else '')+('â˜…  ' if str(Path(c.path).resolve()) in self.favorite_assets else '')
-            item=QListWidgetItem(f'{marker}{icon}  {Path(c.path).name}\n{c.duration:.1f} s  Â·  {label_kind}')
-            poster=self.thumbnails.get(c.path) if hasattr(self,'thumbnails') else None
-            if poster is not None and not poster.isNull():
-                target=QSize(42,34) if getattr(self.media_list,'viewMode',lambda:QListWidget.IconMode)() == QListWidget.ListMode else QSize(116,66)
-                item.setIcon(QIcon(QPixmap.fromImage(poster).scaled(target,Qt.KeepAspectRatio,Qt.SmoothTransformation)))
-            item.setSizeHint(QSize(0,48) if getattr(self.media_list,'viewMode',lambda:QListWidget.IconMode)() == QListWidget.ListMode else QSize(132,96))
-            item.setToolTip(c.path); item.setData(MediaList.ASSET_INDEX_ROLE,index); item.setData(MediaList.ASSET_UID_ROLE,c.uid); self.media_list.addItem(item)
-        self.media_list.setUpdatesEnabled(True)
-        if selected_uid:
-            selected_row=next((row for row in range(self.media_list.count())
-                               if self.media_list.item(row).data(MediaList.ASSET_UID_ROLE)==selected_uid),-1)
-        else:
-            selected_row=-1
-        if selected_row >= 0:
-            self.media_list.setCurrentRow(selected_row)
-        elif self.media_list.count():
-            self.media_list.setCurrentRow(0)
-        if hasattr(self,'media_count'):
-            total=len(self.assets); visible=len(rows)
-            self.media_count.setText(f'{visible} / {total} Medien' if visible != total else f'{total} Medien')
-        if hasattr(self,'media_empty_hint'):
-            self.media_empty_hint.setVisible(not rows)
-            if not self.assets:
-                self.media_empty_hint.setText('Noch keine Medien\nImportiere ein Video, Audio oder Bild, um zu starten.')
-            elif favorites_only:
-                self.media_empty_hint.setText('Keine Favoriten sichtbar\nMarkiere ein Medium mit â˜†, um es hier zu sammeln.')
-            else:
-                self.media_empty_hint.setText('Keine Medien passen zu diesem Filter\nSuche oder Filter zurÃ¼cksetzen.')
-        self.update_media_favorite_button()
-        self.timeline.assets=self.assets if hasattr(self,'timeline') else []
-        if hasattr(self,'proxy_box'):
-            available=any(c.kind in ('video','audio') and c.source_type not in ('image','image_sequence')
-                          and c.path and Path(c.path).is_file() for c in self.assets+self.clips)
-            self.proxy_box.setEnabled(available)
-            self.proxy_profile_combo.setEnabled(available)
-            if not available and self.proxy_box.isChecked():
-                self.proxy_box.setChecked(False)
-
-    def prepare_visuals(self, assets):
-        """Posters and waveforms are decoded off the GUI thread."""
-        self.queue_visuals(assets)
-
-    def jump_cut(self,direction):
-        targets=sorted({v for c in self.clips for v in (c.position,c.finish)})
-        choices=[v for v in targets if (v-self.playhead)*direction>1e-6]
-        if choices: self.set_playhead(min(choices) if direction>0 else max(choices))
-
-    def nudge_playhead(self, seconds):
-        if self.worker:return
-        self.set_playhead(max(0,min(length(self.clips),self.playhead+seconds)))
-
-    def transport_stop(self):
-        self.transport_rate_pending=None
-        self.transport_timer.stop()
-        self.transport_rate=0.0
-        self.player.pause(); self.player.setPlaybackRate(1.0)
-        self.play_button.setText('â–¶ Timeline')
-
-    def _start_transport(self, rate):
-        if self.worker or not self.clips:
-            return
-        rate=float(rate)
-        if not self.preview_is_current():
-            self.transport_rate_pending=rate
-            self.preview_play_requested=False
-            self.render_preview()
-            return
-        self.mode='timeline'; self.audio.setVolume(1); self.transport_rate=rate; self.update_source_monitor_controls()
-        if rate < 0:
-            if self.playhead <= .01:
-                self.playhead=length(self.clips)
-            self.player.pause(); self.transport_timer.start()
-            self.statusBar().showMessage(f'J Â· rÃ¼ckwÃ¤rts {abs(rate):g}Ã—',2000)
-            return
-        self.transport_timer.stop()
-        if self.playhead >= length(self.clips)-.02:
-            self.playhead=0.0
-        self.player.setPlaybackRate(rate)
-        self.load_player(self.preview_path,self.playhead,True)
-        self.statusBar().showMessage(f'L Â· vorwÃ¤rts {rate:g}Ã—',2000)
-
-    def transport_j(self):
-        if self.transport_rate < 0:
-            self._start_transport(max(-4.0,self.transport_rate*2.0))
-        else:
-            self._start_transport(-1.0)
-
-    def transport_k(self):
-        self.transport_stop()
-        self.statusBar().showMessage('K Â· Pause',2000)
-
-    def transport_l(self):
-        if self.transport_rate > 0:
-            self._start_transport(min(4.0,self.transport_rate*2.0))
-        else:
-            self._start_transport(1.0)
-
-    def transport_tick(self):
-        if self.transport_rate >= 0 or not self.clips:
-            self.transport_stop()
-            return
-        next_time=self.playhead + self.transport_rate*0.04
-        if next_time <= 0:
-            self.set_playhead(0)
-            self.transport_stop()
-            return
-        self.set_playhead(next_time)
-
-    def add_selected_asset(self):
-        row=self.media_list.asset_index()
-        if row<0 or self.worker:return
-        a=self.assets[row]; selected=self.current_clip()
-        compatible=[t for t in self.tracks if (t>0)==(a.kind=='video')]
-        track=selected.track if selected and selected.track in compatible else min(compatible,key=abs)
-        position=max((c.finish for c in self.clips if c.track==track),default=0)
-        self.drop_asset(row,position,track)
-
-    def drop_asset(self,index,position,track):
-        if self.worker or not 0<=index<len(self.assets):return
-        if self.track_locked(track):
-            self.statusBar().showMessage('Diese Zielspur ist gesperrt.',3000)
-            return
-        a=self.assets[index]
-        candidate=replace(a,position=position,track=track,uid=uuid.uuid4().hex)
-        try:
-            validate_timeline(self.clips+[candidate],self.tracks)
-            self.checkpoint(); self.clips.append(candidate); self.selection=[candidate.uid]; self.current=candidate.uid; self.changed()
-        except Exception as exc:self.error(exc)
-
-    def dragEnterEvent(self,event):
-        if event.mimeData().hasUrls() and not self.worker:event.acceptProposedAction()
-
-    def dropEvent(self,event):
-        paths=[u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
-        subtitle_paths=[path for path in paths if Path(path).suffix.lower() in ('.srt','.vtt')]
-        media_paths=[path for path in paths if path not in subtitle_paths]
-        if subtitle_paths:
-            self.import_subtitles(subtitle_paths[0])
-        if media_paths:
-            self.import_paths(media_paths)
-        event.acceptProposedAction()
-
-    def zoom(self,value):
-        old=self.timeline.scale; scroll=self.scroll.horizontalScrollBar()
-        center,offset=self._zoom_anchor or ((scroll.value()+self.scroll.viewport().width()/2-self.timeline.LEFT)/old,self.scroll.viewport().width()/2)
-        self.timeline.scale=float(value); self.timeline.refresh(self.clips,self.tracks,self.current,self.track_states,self.track_names,self.selection)
-        self.timeline.resize(max(self.timeline.minimumWidth(),self.scroll.viewport().width()),self.timeline.height())
-        scroll.setValue(int(center*value+self.timeline.LEFT-offset))
-
-    def fit_timeline(self):
-        width=self.scroll.viewport().width()-self.timeline.LEFT-35
-        self.zoom_slider.setValue(max(2,min(200,int(width/max(5,length(self.clips))))))
-
-    @staticmethod
-    def _source_clock(seconds):
-        seconds=max(0.0,float(seconds))
-        return f'{int(seconds)//60:02}:{seconds%60:05.2f}'
-
-    def _source_media_clip(self):
-        """Return the active video/audio source shown in the source monitor."""
-        clip=self.current_clip()
-        if (self.mode!='source' or clip is None or clip.kind not in ('video','audio')
-                or clip.source_type not in ('video','audio')):
-            return None
-        return clip
-
-    def _activate_source_clip(self, clip):
-        """Start a fresh transient In/Out session for a newly selected source."""
-        if self.source_clip_uid!=clip.uid:
-            self.source_clip_uid=clip.uid; self.source_in=None; self.source_out=None
-
-    def _source_bounds(self, clip):
-        """Return the effective source In/Out, clamped to the current clip."""
-        start=clip.start if self.source_clip_uid!=clip.uid or self.source_in is None else self.source_in
-        end=clip.end if self.source_clip_uid!=clip.uid or self.source_out is None else self.source_out
-        start=max(clip.start,min(clip.end,start)); end=max(clip.start,min(clip.end,end))
-        if end-start<MIN_CLIP:
-            return clip.start,clip.end
-        return start,end
-
-    def _source_position(self, clip):
-        """Return the current source time, using the player when available."""
-        fallback=clip.start+max(0.0,min(clip.length,max(0.0,self.playhead-clip.position)))
-        try:
-            url=QUrl.fromLocalFile(str(clip.path))
-            player_position=self.player.position()/1000.0
-            if self.player.source()==url and clip.start-.1<=player_position<=clip.end+.1:
-                return max(clip.start,min(clip.end,player_position))
-        except (AttributeError,TypeError,ValueError):
-            pass
-        return max(clip.start,min(clip.end,fallback))
-
-    def update_source_monitor_controls(self):
-        """Refresh source-monitor labels and action availability."""
-        if not hasattr(self,'source_in_button'):
-            return
-        clip=self.current_clip()
-        active=self._source_media_clip() is not None
-        for widget in (self.source_in_button,self.source_out_button,self.source_clear_button,
-                       self.source_insert_button,self.source_overwrite_button):
-            widget.setEnabled(active)
-        if active:
-            source_in,source_out=self._source_bounds(clip)
-            marks=[]
-            if self.source_in is not None: marks.append(f'I {self._source_clock(source_in)}')
-            if self.source_out is not None: marks.append(f'O {self._source_clock(source_out)}')
-            text='Quelle Â· '+(' Â· '.join(marks) if marks else 'gesamter Clip')
-            self.source_range_label.setText(text)
-        elif clip is not None and clip.kind in ('video','audio') and clip.source_type in ('video','audio'):
-            self.source_range_label.setText('Quelle: â€žClip ansehenâ€œ fÃ¼r In/Out')
-        elif clip is not None and clip.source_type in ('image','image_sequence'):
-            self.source_range_label.setText('Quelle: Standbild Â· keine In/Out-Marken')
-        else:
-            self.source_range_label.setText('Quelle: kein Medienclip ausgewÃ¤hlt')
-
-    def set_source_in(self):
-        clip=self._source_media_clip()
-        if clip is None:
-            return self.statusBar().showMessage('Ã–ffne zuerst einen Video- oder Audioclip mit â€žClip ansehenâ€œ.',3500)
-        source_time=self._source_position(clip); _,source_out=self._source_bounds(clip)
-        if source_time>=source_out-MIN_CLIP:
-            return self.statusBar().showMessage('Der Quell-In muss vor dem Quell-Out liegen.',3000)
-        self.source_in=round(source_time,6); self.update_source_monitor_controls()
-        self.statusBar().showMessage(f'Quell-In bei {self._source_clock(source_time)} gesetzt.',2500)
-
-    def set_source_out(self):
-        clip=self._source_media_clip()
-        if clip is None:
-            return self.statusBar().showMessage('Ã–ffne zuerst einen Video- oder Audioclip mit â€žClip ansehenâ€œ.',3500)
-        source_time=self._source_position(clip); source_in,_=self._source_bounds(clip)
-        if source_time<=source_in+MIN_CLIP:
-            return self.statusBar().showMessage('Der Quell-Out muss nach dem Quell-In liegen.',3000)
-        self.source_out=round(source_time,6); self.update_source_monitor_controls()
-        self.statusBar().showMessage(f'Quell-Out bei {self._source_clock(source_time)} gesetzt.',2500)
-
-    def clear_source_marks(self):
-        if self._source_media_clip() is None:
-            return self.statusBar().showMessage('Ã–ffne zuerst einen Video- oder Audioclip mit â€žClip ansehenâ€œ.',3500)
-        self.source_in=None; self.source_out=None; self.update_source_monitor_controls()
-        self.statusBar().showMessage('Quell-In/Out zurÃ¼ckgesetzt Â· gesamter Clip aktiv.',2500)
-
-    def _source_candidate(self):
-        """Build a clean timeline candidate from the marked source range."""
-        clip=self._source_media_clip()
-        if clip is None:
-            self.statusBar().showMessage('Ã–ffne zuerst einen Video- oder Audioclip mit â€žClip ansehenâ€œ.',3500)
-            return None
-        source_in,source_out=self._source_bounds(clip)
-        if source_out-source_in<MIN_CLIP:
-            self.statusBar().showMessage('Der Quellbereich ist zu kurz.',3000)
-            return None
-        if self.track_locked(clip.track):
-            self.statusBar().showMessage('Die Zielspur ist gesperrt.',3000)
-            return None
-        return replace(clip,uid=uuid.uuid4().hex,position=max(0.0,self.playhead),
-                       start=source_in,end=source_out,group_id='',
-                       transition_type='none',transition_duration=0.0,
-                       fade_in=0.0,fade_out=0.0,freeze_frame=False,freeze_duration=0.0,
-                       keyframes=[],volume_keyframes=[],speed_keyframes=[],
-                       source_paths=list(clip.source_paths))
-
-    def insert_source_range(self):
-        candidate=self._source_candidate()
-        if candidate is None:return
-        try:
-            self._insert_candidates_ripple([candidate])
-        except Exception as exc:
-            self.error(exc)
-
-    def overwrite_source_range(self):
-        candidate=self._source_candidate()
-        if candidate is None:return
-        try:
-            self._overwrite_candidates([candidate])
-        except Exception as exc:
-            self.error(exc)
-
-    def set_playhead(self,time):
-        self.playhead=max(0,min(length(self.clips),float(time))); self.timeline.set_playhead(self.playhead); self.update_time()
-        self.refresh_view_geometry()
-        if self.mode=='timeline' and self.direct_preview_is_current():
-            self._load_direct_clip_at_playhead(self.player.playbackState()==QMediaPlayer.PlayingState)
-        elif self.mode=='timeline' and self.preview_is_current():
-            self.player.setPosition(int(min(self.playhead,length(self.clips))*1000))
-        elif self.mode=='source' and self.current_clip():
-            c=self.current_clip()
-            if c.position<=time<=c.finish:
-                source_time=c.start+time-c.position
-                source_in,source_out=self._source_bounds(c)
-                self.player.setPosition(int(max(source_in,min(source_out,source_time))*1000))
-        self.update_source_monitor_controls()
-
-    def seek_slider(self,value):
-        self.set_playhead(value/10000*length(self.clips))
-
-    def update_time(self):
-        def clock(t):return f'{int(t)//60:02}:{t%60:04.1f}'
-        total=length(self.clips); self.time_label.setText(f'{clock(self.playhead)} / {clock(total)}')
-        if not self.seek.isSliderDown():self.seek.setValue(int(min(1,self.playhead/total)*10000) if total else 0)
-
-    def play_state(self,state):
-        if state==QMediaPlayer.PlayingState:
-            self.follow_suspended=False
-            self.play_button.setText(f'â…¡ {self.transport_rate:g}Ã—' if self.transport_rate else 'â…¡ Pause')
-        else:
-            self.play_button.setText('â–¶ Timeline')
-
-    def position_changed(self,ms):
-        if self.pending_seek or self.compare_active:return
-        if self.mode=='timeline':
-            if self.direct_preview_is_current():
-                clips=self._direct_preview_clips()
-                clip=next((value for value in clips if value.uid==self.direct_clip_uid),None)
-                if clip is None:
-                    selected=self._direct_clip_at(self.playhead,clips)
-                    clip=selected[1] if selected else None
-                if clip is None:
-                    return
-                local=max(0.0,min(clip.length,ms/1000.0-clip.start))
-                self.playhead=clip.position+local
-                if self.playhead>=clip.finish-.04:
-                    index=next((index for index,value in enumerate(clips) if value.uid==clip.uid),-1)
-                    if index+1<len(clips):
-                        self.playhead=clips[index+1].position
-                        self._load_direct_clip_at_playhead(True)
-                    else:
-                        self.playhead=length(self.clips); self.player.pause()
-                self.timeline.set_playhead(self.playhead); self.update_time()
-                self.follow_playhead(); self.refresh_view_geometry(); self.update_source_monitor_controls()
-                return
-            if not self.preview_is_current():return
-            self.playhead=ms/1000
-        else:
-            c=self.current_clip()
-            if not c:return
-            local=max(0,min(c.length,ms/1000-c.start)); self.playhead=c.position+local
-            _,source_out=self._source_bounds(c)
-            if ms/1000>=source_out-.015 and self.player.playbackState()==QMediaPlayer.PlayingState:
-                self.player.setPosition(round(source_out*1000)); self.player.pause()
-        self.timeline.set_playhead(self.playhead); self.update_time()
-        self.follow_playhead(); self.refresh_view_geometry()
-        self.update_source_monitor_controls()
-
-    def media_ready(self,status):
-        if status in (QMediaPlayer.LoadedMedia,QMediaPlayer.BufferedMedia) and self.pending_seek:
-            position,play=self.pending_seek; self.pending_seek=None; self.player.setPosition(position)
-            if play:self.player.play()
-
-    def load_player(self,path,position,play,video=True):
-        self.player.stop(); self.pending_seek=(round(position*1000),play)
-        self.video_stack.setCurrentIndex(1 if video else 0)
-        if not video:self.placeholder.setText('â™«\nAudiovorschau')
-        url=QUrl.fromLocalFile(str(path))
-        if self.player.source()==url:
-            self.pending_seek=None;self.player.setPosition(round(position*1000))
-            if play:self.player.play()
-        else:self.player.setSource(url)
-
-    def source_preview(self):
-        c=self.current_clip()
-        if not c or c.kind=='text' or c.source_type=='adjustment' or self.worker:return
-        self.transport_stop()
-        self._activate_source_clip(c)
-        if c.source_type in ('image','image_sequence'):
-            image=QImage(c.source_paths[0] if c.source_paths else c.path)
-            if image.isNull():
-                return self.error('Das Bild konnte nicht angezeigt werden.')
-            self.mode='source'; self.video_stack.setCurrentIndex(1); self.video.frame=image; self.video.update()
-            self.preview_status.setText('BILDVORSCHAU Â· Timeline-Vorschau zeigt die vollstÃ¤ndige Komposition')
-            self.update_source_monitor_controls()
-            return
-        if self.preview_worker:
-            self.cancel_preview(wait=True); self.preview_queued=False
-        self.mode='source';self.preview_status.setText('CLIPVORSCHAU Â· nur die ausgewÃ¤hlte Quelle, nicht der Mix')
-        self.audio.setVolume(c.volume); self.player.setPlaybackRate(c.speed)
-        source_in,source_out=self._source_bounds(c)
-        source_time=max(source_in,min(source_out-.01,self._source_position(c)))
-        self.update_source_monitor_controls()
-        source=self.proxy_map.get(str(Path(c.path).resolve()),c.path) if self.proxy_enabled else c.path
-        self.load_player(source,source_time,True,c.kind=='video')
-
-    def toggle_play(self):
-        if self.worker:return
-        if self.transport_timer.isActive() or self.transport_rate != 0:
-            self.transport_stop(); return
-        if self.player.playbackState()==QMediaPlayer.PlayingState:
-            self.player.pause();return
-        if not self.clips:return self.error('FÃ¼ge zuerst Medien zur Timeline hinzu.')
-        if self.direct_preview_is_current():
-            if self.playhead>=length(self.clips)-.02:
-                self.playhead=0.0
-            self._load_direct_clip_at_playhead(True)
-            return
-        if self.preview_worker:
-            # A render may already be running because of live preview. Reuse
-            # that render instead of starting a second FFmpeg process.
-            self.preview_play_requested=True
-            if getattr(self.preview_worker,'preview_signature',None) != self.preview_signature_for_current():
-                self.preview_queued=True; self.preview_worker.cancel.set()
-                self.preview_status.setText('Vorschau wird fÃ¼r die Wiedergabe aktualisiert â€¦')
-            else:
-                self.preview_status.setText('Vorschau fertigstellen Â· Wiedergabe startet gleich â€¦')
-            return
-        if self.preview_is_current():
-            self.mode='timeline';self.player.setPlaybackRate(1.0);self.audio.setVolume(1);self.update_source_monitor_controls()
-            self.preview_status.setText('TIMELINE Â· alle Video- und Audiospuren Â· Vorschau 480p / Export in gewÃ¤hlter AuflÃ¶sung')
-            if self.playhead>=length(self.clips)-.02:self.playhead=0
-            self.load_player(self.preview_path,self.playhead,True);return
-        self.preview_play_requested=True
-        self.render_preview()
-
-    def auto_preview(self):
-        if self.worker or not self.clips or self.compare_active: return
-        if not self.live_preview_box.isChecked() and not self.preview_play_requested:return
-        self.preview_queued=False
-        self.render_preview(auto=True)
-
-    def preview_option_changed(self,*_):
-        if self.clips and self.live_preview_box.isChecked():
-            if self.direct_preview_is_current():
-                return
-            self.preview_queued=True
-            if self.preview_worker:self.preview_worker.cancel.set()
-            self.live_preview_timer.start()
-
-    def render_preview(self,auto=False):
-        if self.compare_active: return
-        if self.preview_is_current():
-            return
-        if self._direct_preview_clips():
-            if self.preview_worker:
-                self.preview_worker.cancel.set()
-            requested=self.preview_play_requested
-            self.activate_direct_preview(play=requested or self.player.playbackState()==QMediaPlayer.PlayingState)
-            self.preview_play_requested=False
-            self.preview_queued=False
-            return
-        if self.preview_worker:
-            if getattr(self.preview_worker,'preview_signature',None) != self.preview_signature_for_current():
-                self.preview_queued=True; self.preview_worker.cancel.set()
-            return
-        revision=self.revision; size=self.preview_size(); signature=self.preview_signature_for_current()
-        proxy_tag='proxy' if self.proxy_enabled else 'original'
-        target=Path(self.cache.name)/f'preview-{revision}-{size[0]}x{size[1]}-{proxy_tag}.mp4'
-        clips=[]
-        for clip in self.clips:
-            source=clip.path
-            if self.proxy_enabled and source:
-                source=self.proxy_map.get(str(Path(source).resolve()),source)
-            clips.append(replace(clip,path=source,source_paths=list(clip.source_paths)))
-        tracks=list(self.tracks); track_states={track:dict(state) for track,state in self.track_states.items()}; master_settings=dict(self.master_mixer)
-        use_gpu=self.gpu_preview_box.isChecked()
-        def operation(progress,cancel):
-            try:
-                render(clips,tracks,target,size,progress,cancel,True,track_states,
-                       preview_acceleration=use_gpu,master_settings=master_settings)
-            except Exception:
-                if not use_gpu:
-                    raise
-                # Hardware decode is an acceleration hint, not a requirement.
-                # Drivers can disappear between detection and rendering, so a
-                # preview always gets one automatic software fallback.
-                render(clips,tracks,target,size,progress,cancel,True,track_states,
-                       preview_acceleration=False,master_settings=master_settings)
-            return str(target),revision
-        self.preview_status.setText('Mehrspur-Vorschau wird im Hintergrund aktualisiert â€¦')
-        job=Job(operation); job.preview_signature=signature; self.preview_worker=job
-        job.progress.connect(lambda value:None if self.compare_active else self.preview_status.setText(f'Mehrspur-Vorschau wird aktualisiert â€¦ {value}%'))
-        job.result.connect(lambda result,j=job:self.finish_preview_job(j,result,auto,revision,signature))
-        job.start()
-
-    def finish_preview_job(self,job,result,auto,revision,signature):
-        if self.preview_worker is not job:
-            return
-        job.wait(); self.preview_worker=None; job.deleteLater()
-        stale=revision!=self.revision or signature!=self.preview_signature_for_current()
-        if not result['ok']:
-            if self.compare_active:
-                self.preview_queued=True
-                return
-            if result.get('cancelled') and (stale or self.preview_queued or self.preview_play_requested):
-                self.live_preview_timer.start()
-                return
-            if auto:
-                self.preview_status.setText('Vorschau konnte nicht aktualisiert werden Â· Export bleibt verfÃ¼gbar')
-                self.statusBar().showMessage(result.get('error','Vorschau fehlgeschlagen'),6000)
-            else:
-                self.job_error(result)
-            return
-        path,rev=result['value']
-        if stale:
-            try:Path(path).unlink(missing_ok=True)
-            except OSError:pass
-            if self.preview_queued or self.preview_play_requested:
-                self.live_preview_timer.start()
-            return
-        old=self.preview_path; self.preview_path=path; self.preview_revision=rev; self.preview_signature=signature
-        if self.compare_active:
-            self.preview_queued=False
-            return
-        self.mode='timeline'; self.audio.setVolume(1); self.update_source_monitor_controls()
-        should_play=self.preview_play_requested
-        pending_rate=self.transport_rate_pending
-        self.transport_rate_pending=None
-        self.preview_play_requested=False
-        if (should_play or pending_rate is not None) and self.playhead>=length(self.clips)-.02 and pending_rate is not None and pending_rate > 0:
-            self.playhead=0
-        self.preview_status.setText('TIMELINE Â· alle Video- und Audiospuren Â· Schnellvorschau' if self.quick_preview_box.isChecked() else 'TIMELINE Â· alle Video- und Audiospuren')
-        self.load_player(path,min(self.playhead,length(self.clips)),should_play and pending_rate is None)
-        if old and old!=path:
-            try:Path(old).unlink(missing_ok=True)
-            except OSError:pass
-        self.trim_cache(keep={path})
-        queued=self.preview_queued; self.preview_queued=False
-        if queued and self.live_preview_box.isChecked():
-            self.live_preview_timer.start()
-        if pending_rate is not None:
-            QTimer.singleShot(0,lambda rate=pending_rate:self._start_transport(rate))
-
-    def relink_media(self, missing=None, mapping=None, directory=None):
-        """Relink offline sources, auto-matching unique filenames in a folder."""
-        if self.worker:
-            return False
-        missing=list(missing if missing is not None else self.missing_media)
-        if not missing:
-            missing=missing_project_media(self.clips,self.assets)
-        if not missing:
-            self.statusBar().showMessage('Alle Medien sind bereits verknÃ¼pft.',3000)
-            return False
-        if mapping is None:
-            directory=directory or QFileDialog.getExistingDirectory(self,'Ordner mit den fehlenden Medien auswÃ¤hlen','')
-            if not directory:
-                return False
-            candidates=find_relink_candidates(missing,directory)
-            mapping={}
-            unresolved=[]
-            for old in missing:
-                choices=candidates.get(str(Path(old).resolve()),[])
-                if len(choices)==1:
-                    mapping[old]=choices[0]
-                    continue
-                suffix=Path(old).suffix
-                selected,_=QFileDialog.getOpenFileName(
-                    self,f'Medium neu verknÃ¼pfen: {Path(old).name}',directory,
-                    f'Passende Dateien (*{suffix})' if suffix else 'Alle Dateien (*)')
-                if selected:
-                    mapping[old]=selected
-                else:
-                    unresolved.append(old)
-            if unresolved:
-                self.statusBar().showMessage(f'{len(unresolved)} Medien bleiben offline.',5000)
-                return False
-        try:
-            clips,assets=relink_project_media(self.clips,self.assets,mapping)
-            validate_timeline(clips,self.tracks)
-            for asset in assets:
-                asset.validate()
-            self.checkpoint(); self.clips=clips; self.assets=assets
-            self.missing_media=missing_project_media(self.clips,self.assets)
-            self.proxy_map={}; self.proxy_directory=None; self.proxy_enabled=False
-            self.auto_proxy_sources=set()
-            self.proxy_box.blockSignals(True); self.proxy_box.setChecked(False); self.proxy_box.blockSignals(False)
-            self.prepare_visuals(self.assets); self.refresh_media(); self.changed()
-            if self.missing_media:
-                self.statusBar().showMessage(f'{len(self.missing_media)} Medien bleiben offline.',5000)
-            else:
-                self.statusBar().showMessage(f'{len(mapping)} Medien neu verknÃ¼pft.',5000)
-            return True
-        except Exception as exc:
-            self.error(exc)
-            return False
-
-    def archive_project_dialog(self):
-        if self.worker:
-            return
-        if not self.clips:
-            return self.error('Die Timeline ist leer.')
-        name=Path(self.project_path).stem if self.project_path else Path(self.suggested_name).stem
-        path,_=QFileDialog.getSaveFileName(
-            self,'Projekt mit Medien archivieren',name+'.zip',
-            'Framecut-Archiv (*.zip);;Alle Dateien (*)',options=QFileDialog.DontConfirmOverwrite)
-        if not path:
-            return
-        if not path.lower().endswith('.zip'):
-            path+='.zip'
-        target=Path(path).resolve()
-        if target.exists() and QMessageBox.question(self,'Archiv ersetzen?',f'{target}\nÃ¼berschreiben?',
-                                                     QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
-            return
-        clips=[replace(c,source_paths=list(c.source_paths)) for c in self.clips]
-        assets=[replace(c,source_paths=list(c.source_paths)) for c in self.assets]
-        tracks=list(self.tracks); states={track:dict(state) for track,state in self.track_states.items()}
-        names=dict(self.track_names); preset=self.preset.currentText(); project_name=name
-        def operation(progress,cancel):
-            return archive_project(target,project_name,clips,preset,tracks,assets,
-                                   track_states=states,track_names=names,progress=progress,cancel=cancel,
-                                   markers=[dict(marker) for marker in self.markers],mixer=dict(self.master_mixer))
-        def complete(result):
-            if result['ok']:
-                self.statusBar().showMessage('Archiv erstellt Â· Originalmedien blieben unverÃ¤ndert',6000)
-                QMessageBox.information(self,'Archiv fertig','Projekt und Medien archiviert:\n'+result['value'])
-            else:
-                self.job_error(result)
-        self.start_job('Projekt und Medien werden archiviert â€¦',operation,complete)
-
-    def proxy_toggled(self, enabled):
-        self.proxy_enabled=bool(enabled)
-        if not enabled:
-            self.proxy_map={}
-            if self._direct_preview_clips():
-                self.activate_direct_preview(play=self.player.playbackState()==QMediaPlayer.PlayingState)
-            self.preview_queued=True
-            if self.clips and self.live_preview_box.isChecked():
-                self.live_preview_timer.start()
-            return
-        if self.worker:
-            return
-        if self._direct_preview_clips():
-            self.activate_direct_preview(play=self.player.playbackState()==QMediaPlayer.PlayingState)
-        self.start_proxy_generation()
-
-    def maybe_start_auto_proxy(self):
-        """Prepare a 360p proxy in the background for very large sources."""
-        if self._closing or self.worker or self.proxy_enabled or 'proxy' in self.independent_jobs:
-            return False
-        threshold=256*1024*1024
-        heavy=[]
-        for clip in self.clips:
-            if (clip.kind == 'video' and clip.source_type == 'video' and clip.path
-                    and Path(clip.path).is_file()):
-                try:
-                    if Path(clip.path).stat().st_size >= threshold:
-                        heavy.append(str(Path(clip.path).resolve()))
-                except OSError:
-                    continue
-        new_sources=set(heavy)-self.auto_proxy_sources
-        if not new_sources:
-            return False
-        self.auto_proxy_sources.update(new_sources)
-        self.proxy_enabled=True
-        self.proxy_box.blockSignals(True); self.proxy_box.setChecked(True); self.proxy_box.blockSignals(False)
-        self.activate_direct_preview(play=self.player.playbackState()==QMediaPlayer.PlayingState)
-        self.statusBar().showMessage('GroÃŸe Quelle erkannt Â· Schnellvorschau wird im Hintergrund vorbereitet. Schneiden und Abspielen bleiben sofort mÃ¶glich.',6000)
-        self.start_proxy_generation()
-        return True
-
-    def ensure_missing_proxies(self):
-        """Start automatic large-file proxies, then repair missing manual ones."""
-        if self._closing or self.worker:
-            return
-        if not self.proxy_enabled:
-            self.maybe_start_auto_proxy()
-            return
-        if 'proxy' in self.independent_jobs:
-            return
-        sources={str(Path(c.path).resolve()) for c in self.clips
-                 if c.path and c.kind in ('video','audio') and c.source_type not in ('image','image_sequence')}
-        if sources-set(self.proxy_map):
-            self.start_proxy_generation()
-
-    def start_proxy_generation(self):
-        if self.worker or not self.proxy_enabled:
-            return
-        if not any(c.kind in ('video','audio') and c.source_type not in ('image','image_sequence')
-                   and c.path for c in self.clips):
-            self.statusBar().showMessage('FÃ¼r diese Timeline werden keine Proxy-Dateien benÃ¶tigt.',4000)
-            return
-        if self.project_path:
-            directory=Path(self.project_path).with_suffix('.proxies')
-        else:
-            directory=self.proxy_directory or self.state_dir/'proxies'/uuid.uuid4().hex
-        self.proxy_directory=directory
-        clips=[replace(c,source_paths=list(c.source_paths)) for c in self.clips]
-        assets=[replace(c,source_paths=list(c.source_paths)) for c in self.assets]
-        profile=self.proxy_profile
-        def operation(progress,cancel):
-            return create_proxy_files(clips,assets,directory,profile=profile,
-                                      progress=progress,cancel=cancel)
-        def complete(result):
-            if profile!=self.proxy_profile:
-                QTimer.singleShot(0,self.start_proxy_generation); return
-            if not result['ok']:
-                self.proxy_enabled=False
-                self.proxy_box.blockSignals(True); self.proxy_box.setChecked(False); self.proxy_box.blockSignals(False)
-                return self.job_error(result)
-            if not self.proxy_enabled:
-                self.proxy_map={}
-                return
-            self.proxy_map=result['value']; self.statusBar().showMessage(
-                f'{len(self.proxy_map)} Proxy-Dateien ({PROXY_PROFILES[self.proxy_profile]["label"]}) bereit Â· Originale bleiben fÃ¼r den Export aktiv',5000)
-            self.preview_queued=True
-            if self.clips:
-                self.render_preview()
-        self.start_independent_job('proxy','Proxy-Dateien werden erzeugt â€¦',operation,complete)
-
-    def update_render_queue_button(self):
-        if not hasattr(self,'render_queue_button'):
-            return
-        count=len(self.render_queue)+(1 if self.render_current else 0)
-        suffix=' Â· pausiert' if self.render_queue_paused and self.render_queue else ''
-        self.render_queue_button.setText(f'Render-Queue ({count}){suffix}')
-
-    def show_render_queue(self):
-        if not self.render_queue and not self.render_current:
-            self.statusBar().showMessage('Render-Queue ist leer.',3000)
-            return
-        dialog=QDialog(self); dialog.setWindowTitle('Render-Queue'); dialog.setMinimumWidth(520)
-        layout=QVBoxLayout(dialog); layout.setContentsMargins(18,16,18,16); layout.setSpacing(10)
-        layout.addWidget(label('RENDER-QUEUE Â· EXPORTS NACHEINANDER','heading'))
-        queue_list=QListWidget(); layout.addWidget(queue_list)
-        actions=QHBoxLayout(); start=button('Queue starten',lambda:None,True); clear=button('Warteschlange leeren',lambda:None); close=button('SchlieÃŸen',dialog.reject)
-        actions.addWidget(start); actions.addWidget(clear); actions.addStretch(); actions.addWidget(close); layout.addLayout(actions)
-
-        def refresh_list():
-            queue_list.clear()
-            if self.render_current:
-                queue_list.addItem('â–¶  LÃ¤uft: '+self.render_current['label'])
-            for index,item in enumerate(self.render_queue,1):
-                queue_list.addItem(f'{index}.  '+item['label'])
-            start.setEnabled(bool(self.render_queue) and not self.worker)
-            clear.setEnabled(bool(self.render_queue) and not self.worker)
-        def start_queue():
-            self.render_queue_paused=False; self.update_render_queue_button(); self.process_render_queue(); dialog.accept()
-        def clear_queue():
-            self.render_queue.clear(); self.update_render_queue_button(); refresh_list()
-        start.clicked.connect(start_queue); clear.clicked.connect(clear_queue); refresh_list(); dialog.exec()
-
-    def process_render_queue(self):
-        if self.worker or self.render_current or self.render_queue_paused or not self.render_queue:
-            self.update_render_queue_button(); return
-        item=self.render_queue.pop(0); self.render_current=item; self.update_render_queue_button()
-        def operation(progress,cancel):
-            render(item['clips'],item['tracks'],item['target'],item['size'],progress,cancel,False,
-                   item['track_states'],item['settings'],master_settings=item.get('master_settings',self.master_mixer),
-                   duration_override=item.get('duration'))
-            return str(item['target'])
-        def complete(result):
-            self.render_current=None; self.update_render_queue_button()
-            if result['ok']:
-                self.statusBar().showMessage('Export fertig: '+result['value'],6000)
-            elif result.get('cancelled'):
-                self.render_queue_paused=True; self.statusBar().showMessage(
-                    'Aktueller Export abgebrochen Â· Render-Queue pausiert',6000)
-            else:
-                self.job_error(result)
-            self.update_render_queue_button()
-            if self.render_queue and not self.render_queue_paused:
-                QTimer.singleShot(0,self.process_render_queue)
-        self.start_independent_job('export',item['label']+' wird gerendert â€¦',operation,complete)
-
-    def start_export(self):
-        if self.worker:return
-        if not self.clips:return self.error('Die Timeline ist leer.')
-        work_area=self.work_area_bounds() if (self.work_in is not None or self.work_out is not None) else None
-        dialog=ExportDialog(self,work_area)
-        if dialog.exec()!=QDialog.Accepted:return
-        export_settings=dialog.export_settings
-        format_info=EXPORT_FORMATS[export_settings['format']]
-        extension=format_info['extension']
-        path,_=QFileDialog.getSaveFileName(self,'Video exportieren','Mein-Film'+extension,
-                                            f"{format_info['label']} (*{extension});;Alle Dateien (*)",
-                                            options=QFileDialog.DontConfirmOverwrite)
-        if not path:return
-        if not path.lower().endswith(extension):path+=extension
-        target=Path(path).resolve()
-        source_files=[path for clip in self.clips+self.assets
-                      for path in ([clip.path]+list(clip.source_paths)
-                                   +([clip.background_removed_path] if clip.background_removed_path else []))]
-        if any(Path(path).resolve()==target for path in source_files if path):return self.error('Der Export darf keine Quelldatei Ã¼berschreiben.')
-        if not target.parent.is_dir() or not os.access(target.parent,os.W_OK):
-            return self.error('Zielordner nicht beschreibbar: '+str(target.parent))
-        if target.exists() and QMessageBox.question(self,'Datei ersetzen?',f'{target}\nÃ¼berschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:return
-        clips=self.snapshot()[0]
-        self.last_export_settings=dict(export_settings)
-        export_duration=None
-        if dialog.export_work_area and work_area:
-            try:
-                clips=trim_timeline_range(clips,*work_area)
-                export_duration=work_area[1]-work_area[0]
-            except Exception as exc:
-                return self.error(exc)
-        tracks=list(self.tracks);track_states={track:dict(state) for track,state in self.track_states.items()}
-        profile_size=export_settings.get('size')
-        size=tuple(profile_size) if profile_size else PRESETS[self.preset.currentText()]
-        pending_targets=[item['target'] for item in self.render_queue]
-        if self.render_current: pending_targets.append(self.render_current['target'])
-        if target in pending_targets:
-            return self.error('Dieses Ziel liegt bereits in der Render-Queue.')
-        self.render_queue.append({'target':target,'clips':clips,'tracks':tracks,'track_states':track_states,
-                                  'size':size,'settings':export_settings,'master_settings':dict(self.master_mixer),
-                                  'duration':export_duration,
-                                  'label':f"{format_info['label']} Â· {target.name}"})
-        self.update_render_queue_button()
-        if dialog.queue_only_box.isChecked():
-            self.statusBar().showMessage(f'Export eingereiht Â· {target.name}',5000)
-            return
-        self.render_queue_paused=False; self.process_render_queue()
-
-    def start_job(self,title,operation,callback):
-        if self.worker: return
-        self.cancel_preview(wait=True)
-        self.transport_stop()
-        self.player.pause()
-        self.progress=self.new_task(title)
-        self.statusBar().showMessage('Analyse lÃ¤uft Â· Navigation bleibt verfÃ¼gbar; Clip-Ã„nderungen nach Abschluss.')
-        self.worker=Job(operation);self.progress.canceled.connect(self.worker.cancel.set)
-        self.worker.progress.connect(self.progress.setValue)
-        self.worker.result.connect(lambda result:self.finish_job(result,callback))
-        self.worker.start();self.progress.show()
-
-    def finish_job(self,result,callback):
-        self.worker.wait();self.worker.deleteLater();self.worker=None
-        self.progress.close();self.progress.deleteLater()
-        if not self.independent_jobs: self.tasks_host.hide()
-        callback(result)
-
-    def job_error(self,result):
-        if result.get('cancelled'):self.statusBar().showMessage('Abgebrochen Â· keine Zieldatei ersetzt',6000)
-        else:self.error(result.get('error','Unbekannter Fehler'))
-
-    def check_for_updates(self,silent=False):
-        if self._closing or self.update_job or self.update_download_job:
-            return
-        manifest_url=configured_manifest_url()
-        if not manifest_url:
-            if not silent:
-                if update_checks_disabled():
-                    QMessageBox.information(self,'Updates','Die Update-PrÃ¼fung ist deaktiviert.\n\nEntferne FRAMECUT_DISABLE_UPDATE_CHECK oder setze die Variable auf 0, um sie wieder einzuschalten.')
-                else:
-                    QMessageBox.information(self,'Updates','Es ist keine Update-Quelle verfÃ¼gbar.\n\nSetze FRAMECUT_UPDATE_MANIFEST_URL auf deine verÃ¶ffentlichte updates.json.')
-            return
-        self.update_button.setEnabled(False); self.update_button.setText('Updates werden geprÃ¼ft â€¦')
-        self.update_job=UpdateCheckJob(manifest_url,APP_VERSION)
-        self.update_job.result.connect(lambda result:self.finish_update_check(result,silent))
-        self.update_job.finished.connect(self.update_job.deleteLater)
-        self.update_job.start()
-
-    def finish_update_check(self,result,silent=False):
-        self.update_job=None
-        self.update_button.setEnabled(True); self.update_button.setText('Nach Updates suchen')
-        if not result.get('ok'):
-            self.statusBar().showMessage('Update-PrÃ¼fung nicht mÃ¶glich: '+result.get('error','Unbekannter Fehler'),7000)
-            if not silent:
-                QMessageBox.warning(self,'Update-PrÃ¼fung',result.get('error','Unbekannter Fehler'))
-            return
-        artifact=result.get('artifact')
-        if not artifact:
-            self.statusBar().showMessage('Framecut ist auf dem aktuellen Stand.',5000)
-            if not silent:
-                QMessageBox.information(self,'Updates','Framecut ist bereits aktuell.')
-            return
-        self.update_artifact=artifact
-        self.update_button.setText(f"Update {artifact['version']} verfÃ¼gbar")
-        self.statusBar().showMessage(f"Update verfÃ¼gbar: Framecut {artifact['version']} Â· {artifact['kind']}",10000)
-        if not silent:
-            self.offer_update(artifact)
-
-    def offer_update(self,artifact):
-        notes='\n'.join(f'â€¢ {note}' for note in artifact.get('release_notes',[])) or 'Keine Release-Notizen.'
-        if artifact['kind']=='appimage' and os.environ.get('APPIMAGE'):
-            message=f"Framecut {artifact['version']} ist verfÃ¼gbar.\n\n{notes}\n\nDas verifizierte AppImage wird heruntergeladen und ersetzt die aktuelle Datei. Framecut muss danach neu gestartet werden."
-        elif artifact['kind']=='deb':
-            message=f"Framecut {artifact['version']} ist verfÃ¼gbar.\n\n{notes}\n\nDas Paket wird verifiziert heruntergeladen. Die Installation des .deb erfolgt anschlieÃŸend mit dem angezeigten sudo-Befehl."
-        else:
-            message=f"Framecut {artifact['version']} ist verfÃ¼gbar.\n\n{notes}\n\nDas AppImage wird verifiziert heruntergeladen und kann danach direkt gestartet werden."
-        if QMessageBox.question(self,'Framecut-Update',message,QMessageBox.Yes|QMessageBox.No,QMessageBox.Yes)!=QMessageBox.Yes:
-            return
-        current_path=os.environ.get('APPIMAGE') if artifact['kind']=='appimage' else None
-        install=bool(current_path and artifact['kind']=='appimage')
-        self.update_download_job=UpdateDownloadJob(artifact,install,current_path)
-        self.update_button.setEnabled(False); self.update_button.setText('Update wird geladen â€¦')
-        self.update_download_job.result.connect(self.finish_update_download)
-        self.update_download_job.finished.connect(self.update_download_job.deleteLater)
-        self.update_download_job.start()
-
-    def finish_update_download(self,result):
-        self.update_download_job=None
-        self.update_button.setEnabled(True); self.update_button.setText('Nach Updates suchen')
-        if not result.get('ok'):
-            self.statusBar().showMessage('Update fehlgeschlagen: '+result.get('error','Unbekannter Fehler'),8000)
-            QMessageBox.warning(self,'Update fehlgeschlagen',result.get('error','Unbekannter Fehler'))
-            return
-        message=result.get('message','Update verifiziert heruntergeladen.')
-        self.statusBar().showMessage(message,10000)
-        if result.get('installed'):
-            QMessageBox.information(self,'Update bereit','Das neue AppImage ist installiert. Bitte Framecut neu starten.')
-        elif self.update_artifact and self.update_artifact.get('kind')=='deb':
-            path=result.get('path','')
-            QMessageBox.information(self,'Update heruntergeladen',message+f"\n\nInstallation im Terminal:\nsudo dpkg -i '{path}'")
-        else:
-            path=result.get('path','')
-            QMessageBox.information(self,'Update heruntergeladen',message+f"\n\nStarten mit:\nchmod +x '{path}'\n'{path}'")
-
-    def resume_autosave(self):
-        if self.dirty:self.autosave_timer.start()
-
-    def autosave(self):
-        if not self.recovery_enabled or not self.dirty:return
-        if self.autosave_revision==self.revision:return
-        if self.timeline.drag:
-            self.autosave_timer.start();return
-        try:
-            backup=self.state_dir/'recovery-previous.framecut'
-            if self.recovery_path.is_file():
-                try:
-                    load_project(self.recovery_path,allow_missing=True)
-                    staged=backup.with_suffix('.tmp'); shutil.copy2(self.recovery_path,staged); os.replace(staged,backup)
-                except (OSError,ValueError): pass
-            save_project(self.recovery_path,self.clips,self.preset.currentText(),self.tracks,self.assets,self.project_path,self.track_states,self.track_names,self.markers,self.master_mixer)
-            self.last_autosave=time.time(); self.autosave_revision=self.revision
-            self.autosave_label.setText('Autosave âœ“');self.autosave_label.setToolTip(str(self.recovery_path)); self.update_project_identity()
-        except Exception as exc:
-            self.autosave_label.setText('Autosave fehlgeschlagen');self.statusBar().showMessage(str(exc)); self.update_project_identity()
-
-    def clear_recovery(self):
-        self.autosave_timer.stop()
-        if self.recovery_enabled:
-            try:self.recovery_path.unlink(missing_ok=True)
-            except OSError:pass
-            try:(self.state_dir/'recovery-previous.framecut').unlink(missing_ok=True)
-            except OSError:pass
-
-    def offer_recovery(self):
-        previous=self.state_dir/'recovery-previous.framecut'
-        if not self.recovery_path.exists() and not previous.exists():return
-        answer=QMessageBox.question(self,'Ungespeicherten Schnitt wiederherstellen?',
-            'Es gibt eine automatische Sicherung der letzten Sitzung. Wiederherstellen?',QMessageBox.Yes|QMessageBox.No,QMessageBox.Yes)
-        if answer!=QMessageBox.Yes:self.clear_recovery();return
-        try:
-            try: data=load_project(self.recovery_path,allow_missing=True)
-            except (OSError,ValueError):
-                if not previous.is_file(): raise
-                if self.recovery_path.is_file(): shutil.copy2(self.recovery_path,self.state_dir/f'recovery-unreadable-{uuid.uuid4().hex[:8]}.framecut')
-                data=load_project(previous,allow_missing=True)
-            self.apply_project(data,data.get('origin'));self.changed()
-            self.statusBar().showMessage('Autosave wiederhergestellt. Bitte als Projekt speichern.')
-        except Exception as exc:
-            # Keep unreadable recovery data even if a new session is subsequently saved.
-            backup=self.state_dir/f'recovery-unreadable-{uuid.uuid4().hex[:8]}.framecut'
-            try:
-                shutil.copy2(self.recovery_path,backup)
-                self.error(f'Sicherung konnte nicht geladen werden. Eine Kopie liegt unter:\n{backup}\n\n{exc}')
-            except OSError:
-                self.recovery_enabled=False
-                self.error('Sicherung konnte nicht geladen werden; Autosave bleibt zum Schutz dieser Datei deaktiviert.\n'+str(exc))
-
-    def save(self,save_as=False):
-        if self.worker:return False
-        path=None if save_as else self.project_path
-        if not path:
-            path,_=QFileDialog.getSaveFileName(self,'Projekt speichern',self.project_path or self.suggested_name,'Framecut (*.framecut)',options=QFileDialog.DontConfirmOverwrite)
-            if not path:return False
-            if not path.lower().endswith('.framecut'):path+='.framecut'
-            if Path(path).exists() and QMessageBox.question(self,'Projekt ersetzen?',f'{path}\nÃ¼berschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:return False
-        try:
-            save_project(path,self.clips,self.preset.currentText(),self.tracks,self.assets,None,self.track_states,self.track_names,self.markers,self.master_mixer)
-            self.project_path=str(Path(path).resolve());self.dirty=False;self.clear_recovery()
-            self.setWindowTitle(f'Framecut {APP_VERSION} Â· '+Path(path).stem);self.autosave_label.setText('Projekt gespeichert âœ“');self.update_project_identity();return True
-        except Exception as exc:self.error(exc);return False
-
-    def can_discard(self):
-        if not self.dirty:return True
-        answer=QMessageBox.question(self,'Projekt speichern?','Es gibt ungespeicherte Ã„nderungen.',QMessageBox.Save|QMessageBox.Discard|QMessageBox.Cancel,QMessageBox.Save)
-        return self.save() if answer==QMessageBox.Save else answer==QMessageBox.Discard
-
-    def apply_project(self,data,path):
-        self.project_session=getattr(self,'project_session',0)+1
-        self.cancel_interaction()
-        for key,(job,_) in self.independent_jobs.items():
-            if key!='export': job.cancel.set()
-        self.cancel_preview(wait=True); self.preview_queued=False; self.preview_play_requested=False
-        self.transport_stop()
-        self.player.stop();self.pending_seek=None;self.player.setSource(QUrl());self.video_stack.setCurrentIndex(0)
-        self.clips=data['clips'];self.tracks=data['tracks'];self.track_states=normalize_track_states(data.get('track_states'),self.tracks);self.track_names=normalize_track_names(data.get('track_names'),self.tracks);self.master_mixer=normalize_master_mixer(data.get('mixer'));self.assets=data['assets'];self.markers=normalize_markers(data.get('markers'),length(self.clips));self.project_path=path
-        self.missing_media=list(data.get('missing_media',[]));self.proxy_enabled=False;self.proxy_map={};self.proxy_directory=None;self.auto_proxy_sources=set()
-        self.proxy_box.blockSignals(True);self.proxy_box.setChecked(False);self.proxy_box.blockSignals(False)
-        self.current=self.clips[0].uid if self.clips else None;self.selection=[self.current] if self.current else [];self.playhead=0
-        self.source_clip_uid=None;self.source_in=None;self.source_out=None
-        self.work_in=None;self.work_out=None
-        self.history.clear();self.future.clear();self.revision+=1;self.preview_revision=-1;self.preview_signature=None;self.preview_path=None
-        self.direct_preview=False;self.direct_preview_revision=-1;self.direct_preview_signature=None;self.direct_clip_uid=None
-        self.history_labels.clear();self.future_labels.clear();self.refresh_history()
-        self.last_autosave=None;self.autosave_revision=-1
-        self.preset.blockSignals(True);self.preset.setCurrentText(data['preset'] if data['preset'] in PRESETS else next(iter(PRESETS)));self.preset.blockSignals(False)
-        self.mode='timeline';self.dirty=False;self.prepare_visuals(self.assets);self.refresh_media();self.refresh()
-        self.placeholder.setText('â–¶ Timeline berechnet die Mehrspur-Vorschau.\nâ€žClip ansehenâ€œ zeigt sofort die Quelle.')
-        self.preview_status.setText('Timeline geladen Â· Vorschau noch nicht berechnet')
-        self.setWindowTitle(f'Framecut {APP_VERSION} Â· '+(Path(path).stem if path else 'Neues Projekt')); self.update_project_identity()
-        # Re-opened projects should get the same instant-playback and large-file
-        # proxy treatment as newly edited timelines, without waiting for the
-        # first play button press.
-        QTimer.singleShot(0,self.ensure_missing_proxies)
-
-    def open_project_path(self,path):
-        if self.worker or not self.can_discard():return
-        try:
-            selected=Path(path).resolve()
-            project_path=selected
-            if selected.suffix.lower()=='.zip':
-                extracted=self.state_dir/'archives'/uuid.uuid4().hex
-                project_path=Path(extract_project_archive(selected,extracted))
-            data=load_project(project_path,allow_missing=True)
-            self.clear_recovery();self.apply_project(data,None if data['migrated'] else str(project_path))
-            if data['migrated']:
-                self.suggested_name=str(Path(path).with_name(Path(path).stem+'-v02.framecut'));self.changed()
-                self.statusBar().showMessage('0.1-Projekt Ã¼bernommen. Speichern legt eine neue v02-Datei an.')
-            elif data.get('missing_media'):
-                missing=list(data['missing_media'])
-                self.statusBar().showMessage(f'{len(missing)} Medien fehlen Â· â€žMedien neu verknÃ¼pfenâ€¦â€œ wÃ¤hlen',6000)
-                QTimer.singleShot(0,lambda missing=missing:self.relink_media(missing))
-            return True
-        except Exception as exc:self.error(exc);return False
-
-    def open_project(self):
-        if self.worker or not self.can_discard():return
-        path,_=QFileDialog.getOpenFileName(self,'Projekt Ã¶ffnen','','Framecut (*.framecut *.zip);;Framecut-Projekt (*.framecut);;Framecut-Archiv (*.zip)')
-        if path:self.open_project_path(path)
-
-    def new_project(self):
-        if self.worker or not self.can_discard():return
-        self.clear_recovery();self.apply_project({'clips':[],'assets':[],'tracks':[2,1,-1,-2],'track_states':{},'track_names':{},'markers':[],'mixer':normalize_master_mixer(None),'preset':next(iter(PRESETS))},None)
-        self.suggested_name='Mein-Film.framecut';self.autosave_label.setText('Autosave bereit'); self.update_project_identity()
-
-    def closeEvent(self,event):
-        if self.worker:
-            self.error('Bitte den laufenden Vorgang zuerst abschlieÃŸen oder abbrechen.');event.ignore();return
-        if self.independent_jobs:
-            answer=QMessageBox.question(self,'Hintergrundaufgaben abbrechen?',
-                'Import, Proxy-Erzeugung oder Export laufen noch. Sicher abbrechen und schlieÃŸen?',
-                QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
-            if answer!=QMessageBox.Yes: event.ignore(); return
-        if self.render_queue:
-            answer=QMessageBox.question(self,'Render-Queue schlieÃŸen?',
-                f'{len(self.render_queue)} Exporte sind noch eingereiht und werden beim SchlieÃŸen verworfen.',
-                QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
-            if answer!=QMessageBox.Yes:
-                event.ignore();return
-            self.render_queue.clear(); self.update_render_queue_button()
-        if self.can_discard():
-            self.compare_released()
-            self._closing=True
-            self.close_smooth()
-            if self.cinema_dialog is not None:
-                self.cinema_dialog.close()
-            self.autosave_timer.stop(); self.live_preview_timer.stop(); self.transport_timer.stop()
-            self.preview_queued=False; self.preview_play_requested=False
-            self.transport_stop()
-            self.cancel_preview(wait=True)
-            for attribute in ('update_job','update_download_job'):
-                job=getattr(self,attribute,None)
-                if job is not None:
-                    job.requestInterruption(); job.wait(); setattr(self,attribute,None); job.deleteLater()
-            self.clear_recovery();self.player.stop();self.player.setSource(QUrl());self.cache.cleanup();event.accept()
-        else:event.ignore()
-
-
-def main():
-    app=QApplication(sys.argv);app.setApplicationName('Framecut');app.setStyle('Fusion');app.setStyleSheet(STYLE)
-    icon=app_icon_path()
-    if icon.is_file():
-        app.setWindowIcon(QIcon(str(icon)))
-    if hasattr(app,'setDesktopFileName'):
-        app.setDesktopFileName('framecut')
-    if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
-        QMessageBox.critical(None,'FFmpeg fehlt','Bitte installieren: sudo apt install ffmpeg');return 1
-    state=state_directory();lock=QLockFile(str(state/'editor.lock'));lock.setStaleLockTime(0)
-    if not lock.tryLock(100):
-                QMessageBox.warning(None,'Framecut lÃ¤uft bereits',f'Bitte nutze das bereits geÃ¶ffnete Framecut-{APP_VERSION}-Fenster.');return 1
-    window=Editor(state);window.show()
-    project_argument=next((argument for argument in sys.argv[1:] if Path(argument).suffix.lower() in ('.framecut','.zip')),None)
-    if project_argument:
-        QTimer.singleShot(0,lambda path=project_argument:window.open_project_path(path))
-    result=app.exec();lock.unlock();return result
-
-
-if __name__=='__main__':sys.exit(main())
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×}»ÓÄèµ©hºÚn¶X§zÍHˆˆ‘œ˜[YXÝ]ËŒKŒ8 %˜]]™H[^][]˜XÚÈY]Ü‹ˆˆˆ‚š[\ÜX]š[\ÜÜÂš[\ÜÞ\Âš[\ÜÚ][š[\Ü™XY[™Âš[\Ü[\š[Bš[\Ü]ZYš[\ÜÝXœ›ØÙ\ÜÂš[\Ü[œÜXÝš[\Ü[YB™œ›ÛH]Xˆ[\Ü]™œ›ÛH]XÛ\ÜÙ\È[\Ü™\XÙB‚™œ›ÛHTÚYM‹”]ÛÜ™H[\Ü]U\›U™XYÚYÛ˜[U[Y\‹SØÚÑš[KTÚ^™B™œ›ÛHTÚYM‹”]ÝZH[\ÜPXÝ[Û‹R[XYÙKPÛÛÜ‹Q›ÛTZ[\‹T[‹RXÛÛ‹T^X\™œ›ÛHTÚYM‹”]ÚYÙ]È[\Ü
+P\XØ][Û‹SXZ[•Ú[™ÝËUÚYÙ]U›Þ^[Ý]R›Þ^[Ý]SX™[ˆT\Ú]Û‹UÛÛ]Û‹S\ÝÚYÙ]][KQš[QX[ÙËSY\ÜØYÙP›ÞTÜ]\‹QÝX›TÜ[›ÞQ›Ü›S^[Ý]ˆPÛÛX›Ð›ÞTÛY\‹TØÜ›Û\™XKT›ÙÜ™\ÜÑX[ÙËQœ˜[YKPÚXÚÐ›ÞTÝXÚÙYÚYÙ]TÜ[›ÞS[™QY]R[œ]X[ÙËTÚ^™TÛXÞKSY[KPÛÛÜ‘X[ÙËS\ÝÚYÙ]Q›ÛÛÛX›Ð›ÞQX[ÙËQX[ÙÐ]Û›ÞQÜšY^[Ý]TZ[•^Y]
+B™œ›ÛHTÚYM‹”]][[YYXH[\Ü
+SYYXT^Y\‹P]Y[ÓÝ]]SYYXPØ\\™TÙ\ÜÚ[Û‹P]Y[Ò[œ]ˆSYYXT™XÛÜ™\‹SYYXQ›Ü›X]
+B™œ›ÛH™]šY]È[\ÜšY[ÕšY]Â™œ›ÛHÛÜ™H[\Ü
+Û\‘TÑUËRS—ÐÓT’ST—Ô‘TÑUËPTÒ×ÕTTËUQS×ÐÒS“‘SÓSÑTËVÔÕSWÔ‘TÑUËQ‘‘PÕÔ‘TÑUËÑVQ”SQWÐÕT•‘TËÑVQ”SQWÐÕT•‘WÓP‘SËVÔ•Ñ“Ô“PUËVÔ•ÐÓÑP×ÓP‘SËVÔ•ÑSÓÑT—ÓP‘SËVÔ•Ô‘TÑUË“ÖWÔ“Ñ’STËUU×Ô‘Q”SQWÑ“Ô“PUËUU×Ô‘Q”SQWÑ“Ô“PUÓP‘SË]]×Ü™Yœ˜[YWØ\ÜXÝÝ\™WÜ›ÙÜ™\ÜËˆ›Ü›X[^™WÙ^ÜÜÙ][™ÜË[\ÜØÛ\[\ÜÚ[XYÙWÜÙ\]Y[˜ÙK\œÙWÜÝX]WÙš[KÝX]WØÝY\×Ùœ›ÛWØÛ\ËÜš]WÜÝX]WÙš[KØ]™WÜ›Ú™XÝØYÜ›Ú™XÝÜ]ØÛ\™[™\‹ˆ\˜Ú]™WÜ›Ú™XÝ^˜XÝÜ›Ú™XÝØ\˜Ú]™Kš[™Ü™[[š×ØØ[™Y]\Ë™[[š×Ü›Ú™XÝÛYYXKZ\ÜÚ[™×Ü›Ú™XÝÛYYXKÜ™X]WÜ›ÞWÙš[\Ëˆ™]šY]×ØXØÙ[\˜][Û—Ú[™›ËØXÚWÜÚ^™K[™WØØXÚKˆ^ÜØ[˜Ù[Y˜[Y]WÝ[Y[[™K[™Ý›Ü›X[^™WÛX\šÙ\œËY]YØÛ\™][YWÚÙ^Yœ˜[Y\Ë™][YWÝ›Û[YWÚÙ^Yœ˜[Y\Ë™][YWÜÜYYÚÙ^Yœ˜[Y\Ëˆ›Ü›X[^™WÝ˜XÚ×ÜÝ]\Ë›Ü›X[^™WÝ˜XÚ×Û˜[Y\Ë›Ü›X[^™WÛX\Ý\—ÛZ^\‹Û\ØÛ\›ÛÙY]ÛYWÙY]™][YWÝ˜XÚÚ[™×ÚÙ^Yœ˜[Y\Ë™][YWØ]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\Ë™][YWÛX\Ú×Ü]ÚÙ^Yœ˜[Y\ËˆÝ]ØÛ\Ü˜[™Ù\ËÜ]ØÛ\Ø]Ý[Y\ËZ[Ø]]×ØÝ]ÜÚ[ËX\Ú×Ü]ÚÙ^Yœ˜[Y\×Ùœ›ÛWÝ˜XÚÚ[™Ëˆš[WÝ[Y[[™WÜ˜[™ÙKÛÜÙWÝ˜XÚ×ÙØ\ËÛÜWÚÙ^Yœ˜[YWØ[™K\ÝWÚÙ^Yœ˜[YWØ[™KˆÜš]WØÚ\\—Ùš[KØ\\™WÙœ˜[YJB™œ›ÛH[Y[[™H[\Ü[Y[[™KYYXS\Ý™œ›ÛH\ÜÙ]ÛXœ˜\žH[\Ü
+\ÜÙ]Xœ˜\žT[™[Ù]ÛXœ˜\žWÚ][KXœ˜\žWÚ][\ËˆXœ˜\žWÚ][\×Ù›Ü‹Xœ˜\žWÜÛÝ[™Ü]
+B™œ›ÛHÝ[H[\ÜÕSB™œ›ÛH^[\Üš[™QÝX›TÜ[›Þ\ÈQÝX›TÜ[›Þ[™WÚXÛÛ‚™œ›ÛHÛÜšØ™[˜Ú[\ÜÛ[ÛÝÛÜšØ™[˜ÚTÕÔ–WÓSQTÂ™œ›ÛH\]WÜÞ\Ý[H[\Ü
+ÛÛ™šYÝ\™YÛX[šY™\ÝÝ\›ÝÛ›ØYÝ™\šYšYY™]ÚÛX[šY™\Ýˆ[œÝ[ÙÝÛ›ØYY™Y™\œ™YÚÚ[™ËÙ[XÝØ\Y˜XÝ\]WØØXÚWÙ\™XÝÜžKˆ\]WØÚXÚÜ×Ù\ØX›Y
+B™œ›ÛH˜[œØÜš\[Ûˆ[\Ü˜[œØÜšX™WÛYYXKZ[Ý^ÙY]Ü[‚™œ›ÛHZWÝÛÛÈ[\Ü
+RUÛÛ\œ›Ü‹™[[Ý™WØ˜XÚÙÜ›Ý[™ÛYYXK˜XÚ×Û[Ý[Û‹]]×Ü™Yœ˜[YWÝšY[Ëˆ[˜[^™WØ™X]Ë]XÝÜØÙ[™WØÚ[™Ù\Ë]XÝØ]Y[×ÛÛœÙ]
+B‚žN‚ˆTÕ‘T”ÒSÓˆH]
+×Ùš[W×ÊKÚ]Û˜[YJ	Õ‘T”ÒSÓ‰ÊKœ™XYÝ^
+[˜ÛÙ[™ÏIÝ]‹N	ÊKœÝš\
+
+HÜˆ	ÌËŒKŒ	Â™^Ù\ÔÑ\œ›ÜŽ‚ˆTÕ‘T”ÒSÓˆH	ÌËŒKŒ	Â‚‚™YˆX™[
+^˜[YOS›Û™JN‚ˆÚYÙ]TSX™[
+^
+BˆYˆ˜[YNˆÚYÙ]œÙ]Øš™XÝ˜[YJ˜[YJBˆ™]\›ˆÚYÙ]‚‚™Yˆ]ÛŠ^Ø[˜XÚËš[X\žOQ˜[ÙJN‚ˆÚYÙ]TT\Ú]ÛŠ^
+NÈÚYÙ]˜ÛXÚÙY˜ÛÛ›™XÝ
+[X™HÚXÚÙYQ˜[ÙN˜Ø[˜XÚÊ
+JBˆYˆš[X\žNˆÚYÙ]œÙ]Øš™XÝ˜[YJ	Üš[X\žIÊBˆ™]\›ˆÚYÙ]‚‚™YˆXÛÛ—ØXÝ[ÛŠÞ[X›ÛÛÛ\Ø[˜XÚË[YWÛ˜[YOS›Û™JN‚ˆˆˆÜ™X]HHÛÛ\XÝXY\ˆXÝ[ÛˆÚ]Ý]Y[™È[›Ý\ˆ^ZX]žH›Þˆˆˆ‚ˆÚYÙ]TUÛÛ]ÛŠ
+BˆXÛÛ[[™WÚXÛÛŠ[YWÛ˜[YJHYˆ[YWÛ˜[YH[ÙHRXÛÛŠ
+BˆYˆ›ÝXÛÛ‹š\Ó[
+
+N‚ˆÚYÙ]œÙ]XÛÛŠXÛÛŠBˆÚYÙ]œÙ]ÛÛ]Û”Ý[J]•ÛÛ]Û’XÛÛ“Û›JBˆ[ÙN‚ˆÚYÙ]œÙ]^
+Þ[X›Û
+BˆÚYÙ]œÙ]ÛÛ]Û”Ý[J]•ÛÛ]Û•^Û›JBˆÚYÙ]œÙ]Øš™XÝ˜[YJ	ÚXY\•ÛÛ]Û‰ÊBˆÚYÙ]œÙ]ÛÛ\
+ÛÛ\
+BˆÚYÙ]œÙ]Ý]\Õ\
+ÛÛ\
+BˆÚYÙ]œÙ]XØÙ\ÜÚX›S˜[YJÛÛ\
+BˆÚYÙ]œÙ]XÛÛ”Ú^™JTÚ^™JMËMÊJBˆÚYÙ]œÙ]š^YÚ^™JÍÌ
+BˆÚYÙ]œÙ]]]Ô˜Z\ÙJYJBˆÚYÙ]˜ÛXÚÙY˜ÛÛ›™XÝ
+[X™HÚXÚÙYQ˜[ÙN˜Ø[˜XÚÊ
+JBˆ™]\›ˆÚYÙ]‚‚™Yˆ[Y[[™WÝÛÛØ]ÛŠÞ[X›ÛÛÛ\Ø[˜XÚÏS›Û™K[YWÛ˜[YOS›Û™KÙÙÛOQ˜[ÙKØš™XÝÛ˜[YOS›Û™JN‚ˆˆˆÜ™X]HHÛÛ\XÝXÛÛ‹Yš\œÝ[Y[[™HXÝ[ÛˆÚ]H\ØÜš\]™HÛÛ\ˆˆˆ‚ˆÚYÙ]TUÛÛ]ÛŠ
+BˆÚYÙ]œÙ]^
+Þ[X›Û
+BˆXÛÛ[[™WÚXÛÛŠ[YWÛ˜[YJHYˆ[YWÛ˜[YH[ÙHRXÛÛŠ
+BˆYˆ›ÝXÛÛ‹š\Ó[
+
+N‚ˆÚYÙ]œÙ]XÛÛŠXÛÛŠBˆÚYÙ]œÙ]ÛÛ]Û”Ý[J]•ÛÛ]Û’XÛÛ“Û›JBˆ[ÙN‚ˆÚYÙ]œÙ]ÛÛ]Û”Ý[J]•ÛÛ]Û•^Û›JBˆÚYÙ]œÙ]Øš™XÝ˜[YJØš™XÝÛ˜[YHÜˆ
+	Ý[Y[[™UÛÛÙÙÛIÈYˆÙÙÛH[ÙH	Ý[Y[[™UÛÛ]Û‰ÊJBˆÚYÙ]œÙ]ÛÛ\
+ÛÛ\
+BˆÚYÙ]œÙ]Ý]\Õ\
+ÛÛ\
+BˆÚYÙ]œÙ]XØÙ\ÜÚX›S˜[YJÛÛ\
+BˆÚYÙ]œÙ]XÛÛ”Ú^™JTÚ^™JNN
+JBˆÚYÙ]œÙ]š^YÚ^™JÌ‹Ì
+BˆÚYÙ]œÙ]]]Ô˜Z\ÙJYJBˆYˆÙÙÛN‚ˆÚYÙ]œÙ]ÚXÚØX›JYJBˆYˆØ[˜XÚÈ\È›Ý›Û™N‚ˆÚYÙ]˜ÛXÚÙY˜ÛÛ›™XÝ
+[X™HÚXÚÙYQ˜[ÙN˜Ø[˜XÚÊ
+JBˆ™]\›ˆÚYÙ]‚‚™Yˆ[Y[[™WÛY[WØ]ÛŠÞ[X›ÛÛÛ\Y[K[YWÛ˜[YOS›Û™JN‚ˆˆˆÜ™X]H[ˆXÛÛ‹[Û›H[Y[[™H]Ûˆ]Ü[œÈHÛÛ\XÝXÝ[ÛˆY[Kˆˆˆ‚ˆÚYÙ]][Y[[™WÝÛÛØ]ÛŠÞ[X›ÛÛÛ\[YWÛ˜[YO][YWÛ˜[YKØš™XÝÛ˜[YOIÝ[Y[[™SY[P]Û‰ÊBˆÚYÙ]œÙ]Ü\[ÙJUÛÛ]Û‹’[œÝ[Ü\
+BˆÚYÙ]œÙ]Y[JY[JBˆ™]\›ˆÚYÙ]‚‚™Yˆ[Y[[™WÚXÛÛ—ÛX™[
+Þ[X›ÛÛÛ\
+N‚ˆˆˆ”™]\›ˆH[žHÞ[X›ÛX™[›Üˆ›Û‹XXÝ[Ûˆ[Y[[™HÛÛ›ÛËˆˆˆ‚ˆÚYÙ][X™[
+Þ[X›Û	Ý[Y[[™RXÛÛ“X™[	ÊBˆÚYÙ]œÙ]ÛÛ\
+ÛÛ\
+BˆÚYÙ]œÙ]Ý]\Õ\
+ÛÛ\
+Bˆ™]\›ˆÚYÙ]‚‚™Yˆ[Y[[™WÝÛÛÙÜ›Ý\
+]KÚYÙ]ÊN‚ˆˆˆ”]™[]Y[Y[[™HXÝ[ÛœÈ[ÈÛ™H›]ÛÛ\[X™[YÜ›Ý\ˆˆˆ‚ˆÜ›Ý\TQœ˜[YJ
+NÈÜ›Ý\œÙ]Øš™XÝ˜[YJ	Ý[Y[[™UÛÛÜ›Ý\	ÊBˆÜ›Ý\œÙ]ÛÛ\
+]JNÈÜ›Ý\œÙ]XØÙ\ÜÚX›S˜[YJ]JBˆ^[Ý]TR›Þ^[Ý]
+Ü›Ý\
+NÈ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊKKKJNÈ^[Ý]œÙ]ÜXÚ[™ÊJBˆ›ÜˆÚYÙ][ˆÚYÙ]Î‚ˆ^[Ý]˜YÚYÙ]
+ÚYÙ]
+Bˆ™]\›ˆÜ›Ý\‚‚™Yˆ[Y[[™WÜÙ\\˜]ÜŠ
+N‚ˆÙ\\˜]ÜTQœ˜[YJ
+NÈÙ\\˜]Ü‹œÙ]Øš™XÝ˜[YJ	Ý[Y[[™TÙ\\˜]Ü‰ÊNÈÙ\\˜]Ü‹œÙ]œ˜[YTÚ\JQœ˜[YK•“[™JBˆÙ\\˜]Ü‹œÙ]š^YZYÚ
+Ì
+Bˆ™]\›ˆÙ\\˜]Ü‚‚‚™Yˆ[Y[[™WÝ˜XÚ×ÙÜ›Ý\
+šY[×ÜÜ[‹]Y[×ÜÜ[ŠN‚ˆˆˆÜ™X]HHÛÛ\XÝšY[ËØ]Y[È˜XÚÈÛÝ[ÛÛ›Ûˆˆˆ‚ˆÜ›Ý\TQœ˜[YJ
+NÈÜ›Ý\œÙ]Øš™XÝ˜[YJ	Ý[Y[[™PÛÛ›ÛÜ›Ý\	ÊBˆ^[Ý]TU›Þ^[Ý]
+Ü›Ý\
+NÈ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊËËËÊNÈ^[Ý]œÙ]ÜXÚ[™ÊJBˆØ\[Û[X™[
+	ÔÔT‘S‰Ë	Ý[Y[[™QÜ›Ý\X™[	ÊNÈØ\[Û‹œÙ][YÛ›Y[
+][YÛÙ[\ŠNÈ^[Ý]˜YÚYÙ]
+Ø\[ÛŠBˆÛÛ›ÛÏTR›Þ^[Ý]
+
+NÈÛÛ›ÛËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈÛÛ›ÛËœÙ]ÜXÚ[™Ê
+BˆšY[×ÚXÛÛ][Y[[™WÚXÛÛ—ÛX™[
+	ø¥¨ÉË	ÕšY[ËTÜ\™[‰ÊNÈÛÛ›ÛË˜YÚYÙ]
+šY[×ÚXÛÛŠBˆšY[×ÜÜ[‹œÙ]š^YÚY
+
+NÈÛÛ›ÛË˜YÚYÙ]
+šY[×ÜÜ[ŠBˆ]Y[×ÚXÛÛ][Y[[™WÚXÛÛ—ÛX™[
+	ø¦jÉË	Ð]Y[ËTÜ\™[‰ÊNÈÛÛ›ÛË˜YÚYÙ]
+]Y[×ÚXÛÛŠBˆ]Y[×ÜÜ[‹œÙ]š^YÚY
+
+NÈÛÛ›ÛË˜YÚYÙ]
+]Y[×ÜÜ[ŠBˆ^[Ý]˜Y^[Ý]
+ÛÛ›ÛÊBˆ™]\›ˆÜ›Ý\‚‚™Yˆ[™[
+
+N‚ˆÚYÙ]TQœ˜[YJ
+NÈÚYÙ]œÙ]Øš™XÝ˜[YJ	Ü[™[	ÊBˆ^[Ý]TU›Þ^[Ý]
+ÚYÙ]
+NÈ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊL‹LKL‹LJNÈ^[Ý]œÙ]ÜXÚ[™Ê
+Bˆ™]\›ˆÚYÙ]^[Ý]‚‚™YˆÝ]WÙ\™XÝÜžJ
+N‚ˆ]T]
+ÜË™[š\›Û‹™Ù]
+	Ö×ÔÕUWÒÓQIËÝŠ]šÛYJ
+KÉË›ØØ[ÜÝ]IÊJJKÉÙœ˜[YXÝ]	Âˆ]›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆ™]\›ˆ]‚‚™Yˆ\ÚXÛÛ—Ü]
+
+N‚ˆ™]\›ˆ]
+×Ùš[W×ÊKÚ]Û˜[YJ	Ùœ˜[YXÝ]œÝ™ÉÊB‚‚ˆÈ]šX]H\ÝH[X™\˜][H^ÛY\ÈÛÝ\˜ÙHY[]K[Z[™ËÜ›Ý\[™È[™ˆÈ[š[X][Û‹ˆÙ^Yœ˜[Y\È]™HHYXØ]YÛ\›Ø\™ÛÈH]ZXÚÈY™™XÝ\ÝBˆÈØ[››Ý[™^XÝYHÝ™\Üš]H[Ý[Ûˆ]K‚•’QS×ÐU’P•UWÑ’QSÈH
+ˆ	Ý›Û[YIË	Ù˜YWÚ[‰Ë	Ù˜YWÛÝ]	Ë	ÝšY[×ÜØØ[IË	ÝšY[×Þ	Ë	ÝšY[×ÞIËˆ	ØÜ›ÜÛY	Ë	ØÜ›ÜÝÜ	Ë	ØÜ›ÜÜšYÚ	Ë	ØÜ›ÜØ›ÝÛIË	Ü›Ý][Û‰Ëˆ	Ù›\ÚÜš^›Û[	Ë	Ù›\Ý™\XØ[	Ë	ØœšYÚ™\ÜÉË	ØÛÛ˜\Ý	Ë	ÜØ]\˜][Û‰Ëˆ	Ùš[\—Ü™\Ù]	Ë	Û]Ü]	Ë	ØÛÛÜ—Ù^ÜÝ\™IË	ØÛÛÜ—Ý[\\˜]\™IËˆ	ØÛÛÜ—Ý[	Ë	ØÛÛÜ—ÝšXœ˜[˜ÙIË	ØÛÛÜ—ÛYÜ‰Ë	ØÛÛÜ—ÛYÙÉËˆ	ØÛÛÜ—ÛYØ‰Ë	ØÛÛÜ—ÙØ[[XWÜ‰Ë	ØÛÛÜ—ÙØ[[XWÙÉË	ØÛÛÜ—ÙØ[[XWØ‰Ëˆ	ØÛÛÜ—ÙØZ[—Ü‰Ë	ØÛÛÜ—ÙØZ[—ÙÉË	ØÛÛÜ—ÙØZ[—Ø‰Ë	ÛÜXÚ]IË	Ø›\‰Ëˆ	ÜÚ\œ[‰Ë	ÜÝXš[^˜][Û‰Ë	ÙY™™XÝÜ™\Ù]	Ëˆ	ØÚ›ÛXWÚÙ^WÙ[˜X›Y	Ë	ØÚ›ÛXWÚÙ^WØÛÛÜ‰Ë	ØÚ›ÛXWÚÙ^WÜÚ[Z[\š]IËˆ	ØÚ›ÛXWÚÙ^WØ›[™	Ë	ÛX\Ú×Ý\IË	ÛX\Ú×Þ	Ë	ÛX\Ú×ÞIË	ÛX\Ú×ÝÚY	Ëˆ	ÛX\Ú×ÚZYÚ	Ë	ÛX\Ú×Ù™X]\‰Ë	ÛX\Ú×ÜÚ[ÉË	Ø]Y[×Û›Ú\ÙWÜ™YXÝ[Û‰Ëˆ	Ø]Y[×Ù\WÛÝÉË	Ø]Y[×Ù\WÛZY	Ë	Ø]Y[×Ù\WÚYÚ	Ë	Ø]Y[×ØÛÛ\™\ÜÛÜ—Ù[˜X›Y	Ëˆ	Ø]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛ	Ë	Ø]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ÉË	Ø]Y[×ÙXÚÚ[™ÉËˆ	Ø]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‰Ë	Ø]Y[×ØÚ[›™[Û[ÙIË	Ø]Y[×Ü[‰Ëˆ	Ø]Y[×Û›Ü›X[^™IË	Ø]Y[×Û›Ü›X[^™WÝ\™Ù]	Ë	Ùœ™Y^™WÙœ˜[YIËˆ	Ùœ™Y^™WÙ\˜][Û‰Ë	Ü™]™\œÙIË	ÜÜYY	Ë	Ý˜[œÚ][Û—Ý\IËˆ	Ý˜[œÚ][Û—Ù\˜][Û‰ËŠBUQS×ÐU’P•UWÑ’QSÈH
+ˆ	Ý›Û[YIË	Ù˜YWÚ[‰Ë	Ù˜YWÛÝ]	Ë	Ø]Y[×Û›Ú\ÙWÜ™YXÝ[Û‰Ë	Ø]Y[×Ù\WÛÝÉËˆ	Ø]Y[×Ù\WÛZY	Ë	Ø]Y[×Ù\WÚYÚ	Ë	Ø]Y[×ØÛÛ\™\ÜÛÜ—Ù[˜X›Y	Ëˆ	Ø]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛ	Ë	Ø]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ÉË	Ø]Y[×ÙXÚÚ[™ÉËˆ	Ø]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‰Ë	Ø]Y[×ØÚ[›™[Û[ÙIË	Ø]Y[×Ü[‰Ëˆ	Ø]Y[×Û›Ü›X[^™IË	Ø]Y[×Û›Ü›X[^™WÝ\™Ù]	Ë	ÜÜYY	Ë	Ü™]™\œÙIËˆ	Ý˜[œÚ][Û—Ý\IË	Ý˜[œÚ][Û—Ù\˜][Û‰ËŠB•VÐU’P•UWÑ’QSÈH
+ˆ	Ý›Û[YIË	Ù˜YWÚ[‰Ë	Ù˜YWÛÝ]	Ë	Ù›ÛÜÚ^™IË	ØÛÛÜ‰Ë	Ù›ÛÙ˜[Z[IËˆ	Ù›ÛØ›Û	Ë	Ù›ÛÚ][XÉË	ÛÝ][™WÝÚY	Ë	ÛÝ][™WØÛÛÜ‰Ëˆ	ÜÚYÝ×ÜÚ^™IË	ÜÚYÝ×ØÛÛÜ‰Ë	Ø˜XÚÙÜ›Ý[™Ù[˜X›Y	Ë	Ø˜XÚÙÜ›Ý[™ØÛÛÜ‰Ëˆ	Ø˜XÚÙÜ›Ý[™ÛÜXÚ]IË	Ø˜XÚÙÜ›Ý[™ÜY[™ÉË	Ý^Ø[š[X][Û‰Ëˆ	Ý^Ø[š[X][Û—Ù\˜][Û‰Ë	Þ	Ë	ÞIËŠB‚‚˜Û\ÜÈÙ^Yœ˜[YQÜ˜\ÚYÙ]
+UÚYÙ]
+N‚ˆˆˆÛÛ\XÝ˜YÙØX›HÝ\™HY]Üˆ›ÜˆHÛ\˜[œÙ›Ü›HÙ^Yœ˜[Y\Ëˆˆˆ‚ˆÚ[Û[Ý™YHÚYÛ˜[
+[›Ø]›Ø]
+BˆÚ[ØYYHÚYÛ˜[
+›Ø]›Ø]
+BˆÚ[ÜÙ[XÝYHÚYÛ˜[
+[
+Bˆ˜Y×ÜÝ\YHÚYÛ˜[
+
+Bˆ˜Y×Ùš[š\ÚYHÚYÛ˜[
+
+BˆS‘ÑTÈHÂˆ	ÜØØ[IÎˆ
+ŒKŒ	Ö›ÛÛIÊKˆ	Þ	Îˆ
+ŒKŒ	Ðš[	ÊKˆ	ÞIÎˆ
+ŒKŒ	Ðš[IÊKˆ	Ü›Ý][Û‰Îˆ
+LÍŒŒÍŒŒ	Ô›Ý][Û‰ÊKˆ	ÛÜXÚ]IÎˆ
+ŒKŒ	ÑXÚÚÜ˜Y	ÊKˆ	Ø›\‰Îˆ
+ŒŒŒ	Õ[œØÚ0é™™IÊKˆB‚ˆYˆ×Ú[š]×ÊÙ[‹\™[S›Û™JN‚ˆÝ\\Š
+K—×Ú[š]×Ê\™[
+BˆÙ[‹œÙ]Z[š[][RZYÚ
+MŠBˆÙ[‹œÙ]X^[][RZYÚ
+NL
+BˆÙ[‹œÙ][Ý\ÙU˜XÚÚ[™ÊYJBˆÙ[‹™œ˜[Y\ÈH×BˆÙ[‹™\˜][ÛˆHKŒˆÙ[‹™šY[H	ÜØØ[IÂˆÙ[‹™Y˜][HKŒˆÙ[‹œÙ[XÝYHLBˆÙ[‹™˜YÙÚ[™ÈH˜[ÙB‚ˆYˆÙ]Ù]JÙ[‹œ˜[Y\Ë\˜][Û‹šY[Y˜][
+N‚ˆÙ[‹™œ˜[Y\ÈHÙXÝ
+œ˜[YJH›Üˆœ˜[YH[ˆœ˜[Y\×BˆÙ[‹™\˜][ÛˆHX^
+ŒK›Ø]
+\˜][ÛŠJBˆÙ[‹™šY[HšY[YˆšY[[ˆÙ[‹”S‘ÑTÈ[ÙH	ÜØØ[IÂˆÙ[‹™Y˜][H›Ø]
+Y˜][
+BˆÙ[‹œÙ[XÝYHZ[ŠÙ[‹œÙ[XÝY[ŠÙ[‹™œ˜[Y\ÊKLJBˆÙ[‹™˜YÙÚ[™ÈH˜[ÙBˆÙ[‹\]J
+B‚ˆYˆÜÝ
+Ù[ŠN‚ˆ™]\›ˆÙ[‹œ™XÝ
+
+K˜Y\ÝY
+ÌL‹LL‹L
+B‚ˆYˆÜ˜[™ÙJÙ[ŠN‚ˆÝËYÚÈHÙ[‹”S‘ÑTÖÜÙ[‹™šY[Bˆ™]\›ˆÝËYÚ‚ˆYˆÝ˜[YJÙ[‹œ˜[YJN‚ˆ™]\›ˆ›Ø]
+œ˜[YK™Ù]
+Ù[‹™šY[Ù[‹™Y˜][
+JB‚ˆYˆÛX\
+Ù[‹[YK˜[YJN‚ˆÝHÙ[‹—ÜÝ
+
+NÈÝËYÚHÙ[‹—Ü˜[™ÙJ
+BˆHÝ›Y
+
+H
+ÈX^
+ŒZ[ŠÙ[‹™\˜][Û‹›Ø]
+[YJJJHÈÙ[‹™\˜][Ûˆ
+ˆÝÚY
+
+Bˆ˜][ÈH
+›Ø]
+˜[YJK[ÝÊHÈX^
+YKNKYÚ[ÝÊBˆHHÝ˜›ÝÛJ
+HHX^
+ŒZ[ŠKŒ˜][ÊJH
+ˆÝšZYÚ
+
+Bˆ™]\›ˆB‚ˆYˆÝ[›X\
+Ù[‹Ú[
+N‚ˆÝHÙ[‹—ÜÝ
+
+NÈÝËYÚHÙ[‹—Ü˜[™ÙJ
+Bˆ[YHH
+Ú[ž
+
+K\Ý›Y
+
+JHÈX^
+KÝÚY
+
+JH
+ˆÙ[‹™\˜][Û‚ˆ˜][ÈH
+Ý˜›ÝÛJ
+K\Ú[žJ
+JHÈX^
+KÝšZYÚ
+
+JBˆ™]\›ˆX^
+ŒZ[ŠÙ[‹™\˜][Û‹[YJJKX^
+ÝËZ[ŠYÚÝÊÜ˜][ÊŠYÚ[ÝÊJJB‚ˆYˆÝ˜[YWØ]
+Ù[‹[YJN‚ˆYˆ›ÝÙ[‹™œ˜[Y\Î‚ˆ™]\›ˆÙ[‹™Y˜][ˆœ˜[Y\ÈHÛÜY
+Ù[‹™œ˜[Y\ËÙ^O[[X™H˜[YNˆ›Ø]
+˜[YK™Ù]
+	Ý[YIËŒ
+JJBˆYˆ[YHH›Ø]
+œ˜[Y\ÖÌK™Ù]
+	Ý[YIËŒ
+JN‚ˆ™]\›ˆÙ[‹™Y˜][Yˆ›Ø]
+œ˜[Y\ÖÌK™Ù]
+	Ý[YIËŒ
+JHˆYKMÈ[ÙHÙ[‹—Ý˜[YJœ˜[Y\ÖÌJBˆ›ÜˆYšYÚ[ˆš\
+œ˜[Y\Ëœ˜[Y\ÖÌN—JN‚ˆYÝ[YKšYÚÝ[YHH›Ø]
+Y™Ù]
+	Ý[YIËŒ
+JK›Ø]
+šYÚ™Ù]
+	Ý[YIËŒ
+JBˆYˆ[YHHšYÚÝ[YN‚ˆ˜][ÈH
+[YK[YÝ[YJHÈX^
+YKNKšYÚÝ[YK[YÝ[YJBˆ˜][ÈHÝ\™WÜ›ÙÜ™\ÜÊ˜][ËY™Ù]
+	ØÝ\™IË	Û[™X\‰ÊJBˆ™]\›ˆÙ[‹—Ý˜[YJY
+H
+È
+Ù[‹—Ý˜[YJšYÚ
+K\Ù[‹—Ý˜[YJY
+JJœ˜][Âˆ™]\›ˆÙ[‹—Ý˜[YJœ˜[Y\ÖËLWJB‚ˆYˆÚ]
+Ù[‹Ú[
+N‚ˆ™X\™\ÝHLNÈ\Ý[˜ÙHHYNBˆ›Üˆ[™^œ˜[YH[ˆ[[Y\˜]JÙ[‹™œ˜[Y\ÊN‚ˆHHÙ[‹—ÛX\
+œ˜[YK™Ù]
+	Ý[YIËŒ
+KÙ[‹—Ý˜[YJœ˜[YJJBˆÝ\œ™[H
+\Ú[ž
+
+JJŠŒˆ
+È
+K\Ú[žJ
+JJŠŒ‚ˆYˆÝ\œ™[\Ý[˜ÙH[™Ý\œ™[HLŠŠŒŽ‚ˆ™X\™\Ý\Ý[˜ÙHH[™^Ý\œ™[ˆ™]\›ˆ™X\™\Ý‚ˆYˆZ[]™[
+Ù[‹]™[
+N‚ˆZ[\ˆHTZ[\ŠÙ[ŠBˆZ[\‹™š[™XÝ
+Ù[‹œ™XÝ
+
+KPÛÛÜŠ	ÈÌLMÌŒ‰ÊJBˆÝHÙ[‹—ÜÝ
+
+NÈÝËYÚHÙ[‹—Ü˜[™ÙJ
+NÈ]HHÙ[‹”S‘ÑTÖÜÙ[‹™šY[VÌ—BˆZ[\‹œÙ][ŠT[ŠPÛÛÜŠ	ÈÍÌIÊKJJBˆZ[\‹™˜]Õ^
+‹MK]JBˆZ[\‹œÙ][ŠT[ŠPÛÛÜŠ	ÈÌLÌ‰ÊKJJBˆ›ÜˆÝ\[ˆ˜[™ÙJJN‚ˆHHÝÜ
+
+H
+ÈÝ\
+ˆÝšZYÚ
+
+HÈˆZ[\‹™˜]Ó[™JÝ›Y
+
+K[
+JKÝœšYÚ
+
+K[
+JJBˆ›ÜˆÝ\[ˆ˜[™ÙJJN‚ˆHÝ›Y
+
+H
+ÈÝ\
+ˆÝÚY
+
+HÈˆZ[\‹™˜]Ó[™J[
+
+KÝÜ
+
+K[
+
+KÝ˜›ÝÛJ
+JBˆZ[\‹œÙ][ŠT[ŠPÛÛÜŠ	ÈÍÙM‰ÊKJJBˆZ[\‹™˜]Õ^
+Ý›Y
+
+KÙ[‹šZYÚ
+
+KM‹	ÌÉÊBˆZ[\‹™˜]Õ^
+ÝœšYÚ
+
+KLÍÙ[‹šZYÚ
+
+KM‹‰ÞÜÙ[‹™\˜][ÛŽ‹ŒYŸHÉÊBˆYˆ›ÝÙ[‹™œ˜[Y\Î‚ˆZ[\‹œÙ][ŠT[ŠPÛÛÜŠ	ÈÎŽNXIÊKJJBˆZ[\‹™˜]Õ^
+Ý›Y
+
+JÎÝ˜Ù[\Š
+KžJ
+K	ÒÙ^Yœ˜[Y\È[H[œÜXÝÜˆÙ]™[ˆÙ\ˆÜ[ÛXÚÙ[‰ÊBˆ™]\›‚ˆÝ\™WÜÚ[ÈH×Bˆ›Üˆ[™^[ˆ˜[™ÙJJN‚ˆ[YHHÙ[‹™\˜][Ûˆ
+ˆ[™^ÈˆÝ\™WÜÚ[Ë˜\[™
+Ù[‹—ÛX\
+[YKÙ[‹—Ý˜[YWØ]
+[YJJJBˆZ[\‹œÙ][ŠT[ŠPÛÛÜŠ	ÈÍŒÙXY	ÊKŠJBˆ›ÜˆYšYÚ[ˆš\
+Ý\™WÜÚ[ËÝ\™WÜÚ[ÖÌN—JN‚ˆZ[\‹™˜]Ó[™J[
+YÌJK[
+YÌWJK[
+šYÚÌJK[
+šYÚÌWJJBˆ›Üˆ[™^œ˜[YH[ˆ[[Y\˜]JÙ[‹™œ˜[Y\ÊN‚ˆHHÙ[‹—ÛX\
+œ˜[YK™Ù]
+	Ý[YIËŒ
+KÙ[‹—Ý˜[YJœ˜[YJJBˆÛÛÜˆHPÛÛÜŠ	ÈÙŽÎ™‰ÈYˆ[™^OHÙ[‹œÙ[XÝY[ÙH	ÈÍŒÙXY	ÊBˆZ[\‹œÙ][ŠT[ŠÛÛÜ‹ŠJNÈZ[\‹œÙ]œ\Ú
+ÛÛÜŠBˆZ[\‹™˜]Ñ[\ÙJ[
+
+KM[
+JKM
+B‚ˆYˆ[Ý\ÙT™\ÜÑ]™[
+Ù[‹]™[
+N‚ˆYˆ]™[˜]ÛŠ
+HOH]“Y]ÛŽ‚ˆ™]\›‚ˆÚ[H]™[œÜÚ][ÛŠ
+KÔÚ[
+
+BˆÙ[‹œÙ[XÝYHÙ[‹—Ú]
+Ú[
+BˆYˆÙ[‹œÙ[XÝYH‚ˆÙ[‹™˜YÙÚ[™ÈHYBˆÙ[‹™˜Y×ÜÝ\Y™[Z]
+
+BˆÙ[‹œÚ[ÜÙ[XÝY™[Z]
+Ù[‹œÙ[XÝY
+BˆÙ[‹\]J
+B‚ˆYˆ[Ý\ÙS[Ý™Q]™[
+Ù[‹]™[
+N‚ˆYˆ›ÝÙ[‹™˜YÙÚ[™ÈÜˆÙ[‹œÙ[XÝY‚ˆ™]\›‚ˆ[YK˜[YHHÙ[‹—Ý[›X\
+]™[œÜÚ][ÛŠ
+KÔÚ[
+
+JBˆYˆÙ[‹œÙ[XÝYˆ‚ˆ[YHHX^
+[YK›Ø]
+Ù[‹™œ˜[Y\ÖÜÙ[‹œÙ[XÝYLWK™Ù]
+	Ý[YIËŒ
+JJËŒJBˆYˆÙ[‹œÙ[XÝY
+ÈH[ŠÙ[‹™œ˜[Y\ÊN‚ˆ[YHHZ[Š[YK›Ø]
+Ù[‹™œ˜[Y\ÖÜÙ[‹œÙ[XÝY
+ÌWK™Ù]
+	Ý[YIËÙ[‹™\˜][ÛŠJKKŒJBˆœ˜[YHHÙ[‹™œ˜[Y\ÖÜÙ[‹œÙ[XÝYBˆœ˜[YVÉÝ[YI×HH›Ý[™
+X^
+ŒZ[ŠÙ[‹™\˜][Û‹[YJJKŠBˆœ˜[YVÜÙ[‹™šY[HH›Ý[™
+˜[YKŠBˆÙ[‹œÚ[Û[Ý™Y™[Z]
+Ù[‹œÙ[XÝYœ˜[YVÉÝ[YI×Kœ˜[YVÜÙ[‹™šY[JBˆÙ[‹\]J
+B‚ˆYˆ[Ý\ÙT™[X\ÙQ]™[
+Ù[‹]™[
+N‚ˆYˆÙ[‹™˜YÙÚ[™Î‚ˆÙ[‹™˜Y×Ùš[š\ÚY™[Z]
+
+BˆÙ[‹™˜YÙÚ[™ÈH˜[ÙB‚ˆYˆ[Ý\ÙQÝX›PÛXÚÑ]™[
+Ù[‹]™[
+N‚ˆYˆ]™[˜]ÛŠ
+HOH]“Y]ÛŽ‚ˆ™]\›‚ˆ[YK˜[YHHÙ[‹—Ý[›X\
+]™[œÜÚ][ÛŠ
+KÔÚ[
+
+JBˆÙ[‹œÚ[ØYY™[Z]
+›Ý[™
+[YKŠK›Ý[™
+˜[YKŠJB‚‚˜Û\ÜÈ^ÜX[ÙÊQX[ÙÊN‚ˆˆˆ”ÛX[^XÚ]^Ü›Ùš[HX[ÙÈ˜XÚÙYžHÛÜ™H˜[Y][Û‹ˆˆˆ‚ˆYˆ×Ú[š]×ÊÙ[‹\™[S›Û™KÛÜš×Ø\™XOS›Û™JN‚ˆÝ\\Š
+K—×Ú[š]×Ê\™[
+BˆÙ[‹œÙ]Ú[™ÝÕ]J	Ñ^ÜQZ[œÝ[[™Ù[‰ÊBˆÙ[‹œÙ]Z[š[][UÚY
+Ì
+BˆÙ[‹ÛÜš×Ø\™XO]ÛÜš×Ø\™XBˆ^[Ý]TU›Þ^[Ý]
+Ù[ŠNÈ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊNM‹NMŠNÈ^[Ý]œÙ]ÜXÚ[™ÊLŠBˆ^[Ý]˜YÚYÙ]
+X™[
+	ÑVÔ•0­È‘T•QÑSˆ’SHÔRPÒT“‰Ë	ÚXY[™ÉÊJBˆÙ[‹œÝ[[X\žO[X™[
+	ÉË	Ü›Ú™XÝ]IÊNÈÙ[‹œÝ[[X\žKœÙ]ÛÜ™Ü˜\
+YJNÈ^[Ý]˜YÚYÙ]
+Ù[‹œÝ[[X\žJBˆ›Ü›OTQ›Ü›S^[Ý]
+
+BˆÙ[‹œ™\Ù]ØÛÛX›ÏTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YK[™›È[ˆVÔ•Ô‘TÑUËš][\Ê
+N‚ˆÙ[‹œ™\Ù]ØÛÛX›Ë˜Y][J[™›ÖÉÛX™[	×K˜[YJBˆ›Ü›K˜Y›ÝÊ	Ñ^ÜT™\Ù]	ËÙ[‹œ™\Ù]ØÛÛX›ÊBˆÙ[‹™›Ü›X]ØÛÛX›ÏTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YK[™›È[ˆVÔ•Ñ“Ô“PUËš][\Ê
+NˆÙ[‹™›Ü›X]ØÛÛX›Ë˜Y][J[™›ÖÉÛX™[	×K˜[YJBˆÙ[‹˜ÛÙX×ØÛÛX›ÏTPÛÛX›Ð›Þ
+
+BˆÙ[‹™œÏTQÝX›TÜ[›Þ
+
+NÈÙ[‹™œËœÙ]˜[™ÙJKLŒ
+NÈÙ[‹™œËœÙ]XÚ[X[ÊŠNÈÙ[‹™œËœÙ]Ú[™ÛTÝ\
+JNÈÙ[‹™œËœÙ]˜[YJÌ
+NÈÙ[‹™œËœÙ]ÝY™š^
+	È”ÉÊBˆÙ[‹˜š]˜]OTTÜ[›Þ
+
+NÈÙ[‹˜š]˜]KœÙ]˜[™ÙJM‹Œ
+NÈÙ[‹˜š]˜]KœÙ]Ú[™ÛTÝ\
+L
+NÈÙ[‹˜š]˜]KœÙ]˜[YJLŒ
+NÈÙ[‹˜š]˜]KœÙ]ÝY™š^
+	ÈØš]ÜÉÊBˆÙ[‹™[˜ÛÙ\—ØÛÛX›ÏTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YK]H[ˆVÔ•ÑSÓÑT—ÓP‘SËš][\Ê
+NˆÙ[‹™[˜ÛÙ\—ØÛÛX›Ë˜Y][J]K˜[YJBˆÙ[‹šTPÚXÚÐ›Þ
+	ÒŒL0­È•ŒŒŒÈIÊBˆÙ[‹š‹œÙ]ÛÛ\
+	ÌLPš]UšY[ÈZ]‹Q˜\˜›Y]Y][ŽÈ™[°íYÝŒKÒUÈÙ\ˆUŒK‰ÊBˆ›Ü›K˜Y›ÝÊ	Ñ›Ü›X]	ËÙ[‹™›Ü›X]ØÛÛX›ÊNÈ›Ü›K˜Y›ÝÊ	Ðš[˜]IËÙ[‹™œÊBˆ^[Ý]˜Y^[Ý]
+›Ü›JBˆÙ[‹˜Y˜[˜ÙYÝÙÙÛOTUÛÛ]ÛŠ
+NÈÙ[‹˜Y˜[˜ÙYÝÙÙÛKœÙ]^
+	Ñ\ÙZ]\0­ÈÛÙXÈ[™]X[]0é	ÊBˆÙ[‹˜Y˜[˜ÙYÝÙÙÛKœÙ]ÚXÚØX›JYJNÈÙ[‹˜Y˜[˜ÙYÝÙÙÛKœÙ]\œ›ÝÕ\J]”šYÚ\œ›ÝÊBˆÙ[‹˜Y˜[˜ÙYÝÙÙÛKœÙ]ÛÛ]Û”Ý[J]•ÛÛ]Û•^™\ÚYRXÛÛŠNÈ^[Ý]˜YÚYÙ]
+Ù[‹˜Y˜[˜ÙYÝÙÙÛJBˆÙ[‹˜Y˜[˜ÙYÜ[™[TUÚYÙ]
+
+NÈY˜[˜ÙYTQ›Ü›S^[Ý]
+Ù[‹˜Y˜[˜ÙYÜ[™[
+BˆY˜[˜ÙY˜Y›ÝÊ	ÕšY[ØÛÙXÉËÙ[‹˜ÛÙX×ØÛÛX›ÊNÈY˜[˜ÙY˜Y›ÝÊ	ÕšY[Øš]˜]IËÙ[‹˜š]˜]JBˆY˜[˜ÙY˜Y›ÝÊ	Ñ[˜ÛÙ[™ÉËÙ[‹™[˜ÛÙ\—ØÛÛX›ÊNÈY˜[˜ÙY˜Y›ÝÊ	Ñ˜\˜œ˜][IËÙ[‹šŠBˆ^[Ý]˜YÚYÙ]
+Ù[‹˜Y˜[˜ÙYÜ[™[
+NÈÙ[‹˜Y˜[˜ÙYÜ[™[šYJ
+BˆÙ[‹˜Y˜[˜ÙYÝÙÙÛKÙÙÛY˜ÛÛ›™XÝ
+[X™Hš\ÚX›NŠÙ[‹˜Y˜[˜ÙYÜ[™[œÙ]š\ÚX›Jš\ÚX›JKÙ[‹˜Y˜[˜ÙYÝÙÙÛKœÙ]\œ›ÝÕ\J]‘ÝÛ\œ›ÝÈYˆš\ÚX›H[ÙH]”šYÚ\œ›ÝÊJJBˆÙ[‹ÛÜš×Ø\™XWØ›ÞTPÚXÚÐ›Þ
+	Ó\ˆ\˜™Z]Ø™\™ZXÚ^ÜY\™[‰ÊBˆÙ[‹ÛÜš×Ø\™XWØ›ÞœÙ][˜X›Y
+›ÛÛ
+ÛÜš×Ø\™XJJBˆYˆÛÜš×Ø\™XN‚ˆÙ[‹ÛÜš×Ø\™XWØ›ÞœÙ]ÛÛ\
+‰Ñ^ÜY\\ˆÝÛÜš×Ø\™XVÌN‹Œ™Ÿx $ÞÝÛÜš×Ø\™XVÌWN‹Œ™ŸHË‰ÊBˆ[ÙN‚ˆÙ[‹ÛÜš×Ø\™XWØ›ÞœÙ]ÛÛ\
+	ÔÙ]™HY\œÝ\˜™Z]Ø™\™ZXÚR[ˆ[™\˜™Z]Ø™\™ZXÚSÝ][ˆ\ˆ›ÜœØÚ]K‰ÊBˆ^[Ý]˜YÚYÙ]
+Ù[‹ÛÜš×Ø\™XWØ›Þ
+BˆÙ[‹œ]Y]YWÛÛ›WØ›ÞTPÚXÚÐ›Þ
+	Ó\ˆ[ˆ™[™\‹T]Y]YHZ[œ™ZZ[‰ÊBˆÙ[‹œ]Y]YWÛÛ›WØ›ÞœÙ]ÛÛ\
+	Ñ\ˆ^ÜÝ\]\œÝÙ[›ˆYH™[™\‹T]Y]YHÙ\Ý\]Ú\™‰ÊBˆ^[Ý]˜YÚYÙ]
+Ù[‹œ]Y]YWÛÛ›WØ›Þ
+BˆÙ[‹š[[X™[
+	ÑYH]\ÝØZÚ\™\™ZÝ[H‘›\YËQ^Ü™\Ù[™]‰Ë	Û]]Y	ÊNÈÙ[‹š[œÙ]ÛÜ™Ü˜\
+YJNÈ^[Ý]˜YÚYÙ]
+Ù[‹š[
+Bˆ]ÛœÏTQX[ÙÐ]Û›Þ
+QX[ÙÐ]Û›Þ“ÚßQX[ÙÐ]Û›ÞØ[˜Ù[
+Bˆ]ÛœË˜XØÙ\Y˜ÛÛ›™XÝ
+Ù[‹˜XØÙ\
+NÈ]ÛœËœ™Z™XÝY˜ÛÛ›™XÝ
+Ù[‹œ™Z™XÝ
+NÈ^[Ý]˜YÚYÙ]
+]ÛœÊBˆÙ[‹™›Ü›X]ØÛÛX›Ë˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹™›Ü›X]ØÚ[™ÙY
+BˆÙ[‹˜ÛÙX×ØÛÛX›Ë˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹˜ÛÙX×ØÚ[™ÙY
+BˆÙ[‹œ™\Ù]ØÛÛX›Ë˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹œ™\Ù]ØÚ[™ÙY
+BˆÙ[‹œ™\Ù]ØÛÛX›ËœÙ]Ý\œ™[[™^
+Ù[‹œ™\Ù]ØÛÛX›Ë™š[™]J	ÛX\Ý\‰ÊJBˆÙ[‹œ™\Ù]ØÚ[™ÙY
+
+BˆYˆ\™[\È›Ý›Û™H[™\Ø]Š\™[	ØÛ\ÉÊN‚ˆÛÝ\˜ÙO[™^
+
+È›ÜˆÈ[ˆ\™[˜Û\ÈYˆËšÚ[™OIÝšY[ÉÈ[™ËœÛÝ\˜ÙWÝ\H›Ý[ˆ
+	Ú[XYÙIË	ØY\ÝY[	ÊJK›Û™JBˆÙ[‹™œËœÙ]˜[YJÛÝ\˜ÙKœÛÝ\˜ÙWÙœÈYˆÛÝ\˜ÙH[ÙHÌ
+BˆØ]™YYÙ]]Š\™[	Û\ÝÙ^ÜÜÙ][™ÜÉËßJBˆžNˆØ]™Y[›Ü›X[^™WÙ^ÜÜÙ][™ÜÊØ]™Y
+HYˆØ]™Y[ÙHßBˆ^Ù\
+˜[YQ\œ›Ü‹\Q\œ›ÜŠNˆØ]™Y^ßBˆYˆØ]™Y‚ˆÙ[‹™›Ü›X]ØÛÛX›ËœÙ]Ý\œ™[[™^
+Ù[‹™›Ü›X]ØÛÛX›Ë™š[™]JØ]™YÉÙ›Ü›X]	×JJBˆÙ[‹˜ÛÙX×ØÛÛX›ËœÙ]Ý\œ™[[™^
+Ù[‹˜ÛÙX×ØÛÛX›Ë™š[™]JØ]™YÉÝšY[×ØÛÙXÉ×JJBˆÙ[‹™œËœÙ]˜[YJØ]™YÉÙœÉ×JNÈÙ[‹˜š]˜]KœÙ]˜[YJØ]™YÉØš]˜]WÚØœÉ×JBˆÙ[‹™[˜ÛÙ\—ØÛÛX›ËœÙ]Ý\œ™[[™^
+Ù[‹™[˜ÛÙ\—ØÛÛX›Ë™š[™]JØ]™YÉÙ[˜ÛÙ\‰×JJNÈÙ[‹š‹œÙ]ÚXÚÙY
+Ø]™YÉÚ‰×JBˆÙ[‹™œË˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹\]WÜÝ[[X\žJNÈÙ[‹™›Ü›X]ØÛÛX›Ë˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹\]WÜÝ[[X\žJBˆÙ[‹œ™\Ù]ØÛÛX›Ë˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹\]WÜÝ[[X\žJNÈÙ[‹ÛÜš×Ø\™XWØ›ÞÙÙÛY˜ÛÛ›™XÝ
+Ù[‹\]WÜÝ[[X\žJBˆÙ[‹\]WÜÝ[[X\žJ
+B‚ˆYˆ\]WÜÝ[[X\žJÙ[‹
+—ÊN‚ˆ\™[\Ù[‹œ\™[
+
+NÈ™\Ù]QVÔ•Ô‘TÑUË™Ù]
+Ù[‹œ™\Ù]ØÛÛX›Ë˜Ý\œ™[]J
+KßJBˆÚ^™O\™\Ù]™Ù]
+	ÜÚ^™IÊHÜˆ
+‘TÑUÖÜ\™[œ™\Ù]˜Ý\œ™[^
+
+WHYˆ\™[\È›Ý›Û™H[™\Ø]Š\™[	Ü™\Ù]	ÊH[ÙH
+NLŒL
+JBˆ\™XOIÐ\˜™Z]Ø™\™ZXÚ	ÈYˆÙ[‹ÛÜš×Ø\™XWØ›Þš\ÐÚXÚÙY
+
+H[ÙH	ÑÙ\Ø[]H[Y[[™IÂˆÙ[‹œÝ[[X\žKœÙ]^
+‰ÞÜÚ^™VÌ_H0åÈÜÚ^™VÌW_H0­ÈÜÙ[‹™œË˜[YJ
+N™ßH”È0­ÈÜÙ[‹™›Ü›X]ØÛÛX›Ë˜Ý\œ™[^
+
+_WžØ\™X_H0­ÈÜšYÚ[˜[YYY[‰ÊB‚ˆYˆ™\Ù]ØÚ[™ÙY
+Ù[‹
+—ÊN‚ˆ˜[Y\ÏQVÔ•Ô‘TÑUË™Ù]
+Ù[‹œ™\Ù]ØÛÛX›Ë˜Ý\œ™[]J
+JBˆYˆ›Ý˜[Y\Î‚ˆ™]\›‚ˆÙ[‹™›Ü›X]ØÛÛX›Ë˜›ØÚÔÚYÛ˜[ÊYJNÈÙ[‹˜ÛÙX×ØÛÛX›Ë˜›ØÚÔÚYÛ˜[ÊYJBˆÙ[‹™›Ü›X]ØÛÛX›ËœÙ]Ý\œ™[[™^
+Ù[‹™›Ü›X]ØÛÛX›Ë™š[™]J˜[Y\ÖÉÙ›Ü›X]	×JJBˆÙ[‹™›Ü›X]ØÛÛX›Ë˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆÙ[‹™›Ü›X]ØÚ[™ÙY
+
+BˆÙ[‹˜ÛÙX×ØÛÛX›Ë˜›ØÚÔÚYÛ˜[ÊYJBˆÙ[‹˜ÛÙX×ØÛÛX›ËœÙ]Ý\œ™[[™^
+Ù[‹˜ÛÙX×ØÛÛX›Ë™š[™]J˜[Y\ÖÉÝšY[×ØÛÙXÉ×JJBˆÙ[‹˜ÛÙX×ØÛÛX›Ë˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆÙ[‹™œËœÙ]˜[YJ˜[Y\ÖÉÙœÉ×JNÈÙ[‹˜š]˜]KœÙ]˜[YJ˜[Y\ÖÉØš]˜]WÚØœÉ×JBˆ[˜ÛÙ\—Ú[™^\Ù[‹™[˜ÛÙ\—ØÛÛX›Ë™š[™]J˜[Y\ÖÉÙ[˜ÛÙ\‰×JBˆYˆ[˜ÛÙ\—Ú[™^H‚ˆÙ[‹™[˜ÛÙ\—ØÛÛX›ËœÙ]Ý\œ™[[™^
+[˜ÛÙ\—Ú[™^
+BˆÙ[‹š‹œÙ]ÚXÚÙY
+›ÛÛ
+˜[Y\ÖÉÚ‰×JJBˆÙ[‹˜ÛÙX×ØÚ[™ÙY
+
+B‚ˆYˆ›Ü›X]ØÚ[™ÙY
+Ù[‹
+—ÊN‚ˆÛ\Ù[‹˜ÛÙX×ØÛÛX›Ë˜Ý\œ™[]J
+NÈÙ[‹˜ÛÙX×ØÛÛX›Ë˜›ØÚÔÚYÛ˜[ÊYJNÈÙ[‹˜ÛÙX×ØÛÛX›Ë˜ÛX\Š
+Bˆ[™›ÏQVÔ•Ñ“Ô“PUÖÜÙ[‹™›Ü›X]ØÛÛX›Ë˜Ý\œ™[]J
+WBˆ›Üˆ˜[YH[ˆ[™›ÖÉØÛÙXÜÉ×NˆÙ[‹˜ÛÙX×ØÛÛX›Ë˜Y][JVÔ•ÐÓÑP×ÓP‘SÖÝ˜[YWK˜[YJBˆ[™^\Ù[‹˜ÛÙX×ØÛÛX›Ë™š[™]JÛ
+BˆÙ[‹˜ÛÙX×ØÛÛX›ËœÙ]Ý\œ™[[™^
+[™^Yˆ[™^H[ÙH
+NÈÙ[‹˜ÛÙX×ØÛÛX›Ë˜›ØÚÔÚYÛ˜[Ê˜[ÙJNÈÙ[‹˜ÛÙX×ØÚ[™ÙY
+
+B‚ˆYˆÛÙX×ØÚ[™ÙY
+Ù[‹
+—ÊN‚ˆ[˜X›Y\Ù[‹˜ÛÙX×ØÛÛX›Ë˜Ý\œ™[]J
+H[ˆ
+	Ú]˜ÉË	Ø]ŒIÊBˆÙ[‹š‹œÙ][˜X›Y
+[˜X›Y
+BˆYˆ›Ý[˜X›YœÙ[‹š‹œÙ]ÚXÚÙY
+˜[ÙJB‚ˆYˆÙ][™ÜÊÙ[ŠN‚ˆ™]\›ˆÉÙ›Ü›X]	ÎœÙ[‹™›Ü›X]ØÛÛX›Ë˜Ý\œ™[]J
+K	ÝšY[×ØÛÙXÉÎœÙ[‹˜ÛÙX×ØÛÛX›Ë˜Ý\œ™[]J
+Kˆ	ÙœÉÎœÙ[‹™œË˜[YJ
+K	Øš]˜]WÚØœÉÎœÙ[‹˜š]˜]K˜[YJ
+Kˆ	Ù[˜ÛÙ\‰ÎœÙ[‹™[˜ÛÙ\—ØÛÛX›Ë˜Ý\œ™[]J
+K	Ú‰ÎœÙ[‹š‹š\ÐÚXÚÙY
+
+Kˆ	Ù^ÜÜ™\Ù]	ÎœÙ[‹œ™\Ù]ØÛÛX›Ë˜Ý\œ™[]J
+Kˆ	ÜÚ^™IÎ‘VÔ•Ô‘TÑUË™Ù]
+Ù[‹œ™\Ù]ØÛÛX›Ë˜Ý\œ™[]J
+KßJK™Ù]
+	ÜÚ^™IÊ_B‚ˆYˆXØÙ\
+Ù[ŠN‚ˆžN‚ˆÙ[‹™^ÜÜÙ][™ÜÏ[›Ü›X[^™WÙ^ÜÜÙ][™ÜÊÙ[‹œÙ][™ÜÊ
+JBˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆSY\ÜØYÙP›ÞØ\›š[™ÊÙ[‹	Ñ^ÜQZ[œÝ[[™Ù[‰ËÝŠ^ÊJNÈ™]\›‚ˆÙ[‹™^ÜÝÛÜš×Ø\™XO\Ù[‹ÛÜš×Ø\™XWØ›Þš\ÐÚXÚÙY
+
+BˆÝ\\Š
+K˜XØÙ\
+
+B‚‚˜Û\ÜÈ]]ÛX]XÔÝX]QX[ÙÊQX[ÙÊN‚ˆˆˆÚÛÜÙHHØØ[ÛÝ\˜ÙH[™Ù][™ÜÈ›ÜˆÜYXÚ]Ë]^ÝX]\Ëˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹ÛÝ\˜Ù\Ë\™[S›Û™JN‚ˆÝ\\Š
+K—×Ú[š]×Ê\™[
+BˆÙ[‹œÙ]Ú[™ÝÕ]J	Ð]]ÛX]\ØÚH[\][	ÊBˆÙ[‹œÙ]Z[š[][UÚY
+MŒ
+Bˆ^[Ý]HU›Þ^[Ý]
+Ù[ŠBˆ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊNM‹NMŠBˆ^[Ý]œÙ]ÜXÚ[™ÊLJBˆ^[Ý]˜YÚYÙ]
+X™[
+	ÐUUÓPUTÐÒHS•T•US0­ÈÒÐSHÔPÒT’ÑS“•S‘ÉË	ÚXY[™ÉÊJBˆ[›ÈHX™[
+ˆ	Ñœ˜[YXÝ]Ø[™[YHÜ˜XÚH]\ÈZ[™[HšY[ÈÙ\ˆZ[™\ˆ]Y[Ù]ZH[ˆY]Y\˜˜\™H^Û\È[Kˆ	Âˆ	ÑYH]Y[]ZH›ZX]YˆZ[™[H™XÚ™\ŽÈ™Z[H\œÝ[ˆZ[œØ]ˆÚ\™\ˆ\ÈÙ]ðéHÜ˜XÚ[Ù[Ù[Y[‹‰Ëˆ	Û]]Y	ÊBˆ[›ËœÙ]ÛÜ™Ü˜\
+YJBˆ^[Ý]˜YÚYÙ]
+[›ÊB‚ˆ›Ü›HHQ›Ü›S^[Ý]
+
+BˆÛÝ\˜ÙWÜ›ÝÈHR›Þ^[Ý]
+
+BˆÙ[‹œÛÝ\˜ÙWØÛÛX›ÈHPÛÛX›Ð›Þ
+
+Bˆ›Üˆ]K][ˆÛÝ\˜Ù\Î‚ˆÙ[‹œÛÝ\˜ÙWØÛÛX›Ë˜Y][J]KÝŠ]
+JBˆÙ[‹œÛÝ\˜ÙWØÛÛX›ËœÙ]ÛÛ\
+	Ð™\™Z]È[\ÜY\\ÈšY[ÈÙ\ˆ]Y[È™\Ù[™[‰ÊBˆÛÝ\˜ÙWÜ›ÝË˜YÚYÙ]
+Ù[‹œÛÝ\˜ÙWØÛÛX›ËJBˆœ›ÝÜÙHHT\Ú]ÛŠ	Ñ]ZH]\Ýðé[ˆ8 )‰ÊBˆœ›ÝÜÙK˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜ÚÛÜÙWÙš[JBˆÛÝ\˜ÙWÜ›ÝË˜YÚYÙ]
+œ›ÝÜÙJBˆÛÝ\˜ÙWÝÚYÙ]HUÚYÙ]
+
+NÈÛÝ\˜ÙWÝÚYÙ]œÙ]^[Ý]
+ÛÝ\˜ÙWÜ›ÝÊBˆ›Ü›K˜Y›ÝÊ	Ô]Y[IËÛÝ\˜ÙWÝÚYÙ]
+B‚ˆÙ[‹›[™ÝXYÙWØÛÛX›ÈHPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YK]H[ˆ
+ˆ
+	Ø]]ÉË	Ð]]ÛX]\ØÚ\šÙ[›™[‰ÊKˆ
+	ÙIË	Ñ]]ØÚ	ÊKˆ
+	Ù[‰Ë	Ñ[™Û\Ú	ÊKˆ
+	Ý‰Ë	Õ0ïšðéÙIÊKˆ
+	Ø^‰Ë	Ð^²f\˜˜^XØ[˜ØIÊKˆ
+	Ù\ÉË	Ñ\Üpì[Û	ÊKˆ
+	Ùœ‰Ë	Ñœ˜[°éØZ\ÉÊKˆ
+N‚ˆÙ[‹›[™ÝXYÙWØÛÛX›Ë˜Y][J]K˜[YJBˆÙ[‹›[™ÝXYÙWØÛÛX›ËœÙ]ÛÛ\
+	ÑZ[™H™ZØ[›HÜ˜XÚHØ[›ˆYH\šÙ[›[™È™\ØÚ][šYÙ[‰ÊBˆ›Ü›K˜Y›ÝÊ	ÔÜ˜XÚIËÙ[‹›[™ÝXYÙWØÛÛX›ÊB‚ˆÙ[‹›[Ù[ØÛÛX›ÈHPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YK]H[ˆ
+ˆ
+	Ý[žIË	ÔØÚ™[0­È[žIÊKˆ
+	Ø˜\ÙIË	Ð]\ÙÙ]ÛÙÙ[ˆ0­È˜\ÙIÊKˆ
+	ÜÛX[	Ë	ÑÙ[˜]Y\ˆ0­ÈÛX[	ÊKˆ
+N‚ˆÙ[‹›[Ù[ØÛÛX›Ë˜Y][J]K˜[YJBˆÙ[‹›[Ù[ØÛÛX›ËœÙ]Ý\œ™[[™^
+Ù[‹›[Ù[ØÛÛX›Ë™š[™]J	Ø˜\ÙIÊJBˆÙ[‹›[Ù[ØÛÛX›ËœÙ]ÛÛ\
+	ÑÜ°í°çÙ\™H[Ù[HÚ[™Ù[˜]Y\‹œ˜]XÚ[ˆX™\ˆ0é™Ù\ˆ[™YZˆÜZXÚ\‰ÊBˆ›Ü›K˜Y›ÝÊ	Ó[Ù[	ËÙ[‹›[Ù[ØÛÛX›ÊBˆ^[Ý]˜Y^[Ý]
+›Ü›JB‚ˆ[HX™[
+	ÑYH™\˜\˜™Z][™È0éY[È[\™Ü[™›Ü™Ø[™È[™Ø[›ˆ™Y\ž™Z]X™ÙXœ›ØÚ[ˆÙ\™[‹ˆ	Âˆ	Ñ\È[Ù[Ú\™[Hœ˜[YXÝ]P™[]™\›Ü™™\ˆÚ\ØÚ[™Ù\ÜZXÚ\‰Ë	Û]]Y	ÊBˆ[œÙ]ÛÜ™Ü˜\
+YJBˆ^[Ý]˜YÚYÙ]
+[
+Bˆ]ÛœÈHQX[ÙÐ]Û›Þ
+QX[ÙÐ]Û›Þ“ÚÈQX[ÙÐ]Û›ÞØ[˜Ù[
+Bˆ]ÛœË˜]ÛŠQX[ÙÐ]Û›Þ“ÚÊKœÙ]^
+	Õ[\][\œÝ[[‰ÊBˆ]ÛœË˜]ÛŠQX[ÙÐ]Û›ÞØ[˜Ù[
+KœÙ]^
+	ÐX˜œ™XÚ[‰ÊBˆ]ÛœË˜XØÙ\Y˜ÛÛ›™XÝ
+Ù[‹˜XØÙ\
+Bˆ]ÛœËœ™Z™XÝY˜ÛÛ›™XÝ
+Ù[‹œ™Z™XÝ
+Bˆ^[Ý]˜YÚYÙ]
+]ÛœÊB‚ˆYˆÚÛÜÙWÙš[JÙ[ŠN‚ˆ]ÈHQš[QX[ÙË™Ù]Ü[‘š[S˜[YJˆÙ[‹	Ô]Y[H°ïˆ]]ÛX]\ØÚH[\][]\Ýðé[‰Ë	ÉËˆ	ÕšY[È[™]Y[È
+
+‹›\
+‹›ZÝˆ
+‹›[Ýˆ
+‹ÙX›H
+‹˜]šH
+‹›\È
+‹Ø]ˆ
+‹›MH
+‹™›XÈ
+‹›ÙÙÊNÎÐ[H]ZY[ˆ
+
+ŠIÊBˆYˆ›Ý]‚ˆ™]\›‚ˆ]HÝŠ]
+]
+K™^[™\Ù\Š
+Kœ™\ÛÛ™J
+JBˆ[™^HÙ[‹œÛÝ\˜ÙWØÛÛX›Ë™š[™]J]
+BˆYˆ[™^‚ˆÙ[‹œÛÝ\˜ÙWØÛÛX›Ëš[œÙ\][J‰ÞÔ]
+]
+K›˜[Y_H0­È]ZIË]
+Bˆ[™^HˆÙ[‹œÛÝ\˜ÙWØÛÛX›ËœÙ]Ý\œ™[[™^
+[™^
+B‚ˆYˆÙ][™ÜÊÙ[ŠN‚ˆ™]\›ˆÂˆ	Ü]	ÎˆÙ[‹œÛÝ\˜ÙWØÛÛX›Ë˜Ý\œ™[]J
+Kˆ	Û[™ÝXYÙIÎˆÙ[‹›[™ÝXYÙWØÛÛX›Ë˜Ý\œ™[]J
+Kˆ	Û[Ù[ÜÚ^™IÎˆÙ[‹›[Ù[ØÛÛX›Ë˜Ý\œ™[]J
+KˆB‚ˆYˆXØÙ\
+Ù[ŠN‚ˆ]HÙ[‹œÛÝ\˜ÙWØÛÛX›Ë˜Ý\œ™[]J
+BˆYˆ›Ý]‚ˆSY\ÜØYÙP›ÞØ\›š[™ÊÙ[‹	Ð]]ÛX]\ØÚH[\][	Ë	ÕðéHY\œÝZ[ˆšY[ÈÙ\ˆZ[™H]Y[Ù]ZH]\Ë‰ÊBˆ™]\›‚ˆYˆ›Ý]
+]
+Kš\×Ùš[J
+N‚ˆSY\ÜØYÙP›ÞØ\›š[™ÊÙ[‹	Ð]]ÛX]\ØÚH[\][	Ë‰ÑYH]Y[]ZHÝ\™HšXÚÙY[™[Ž—žÜ]IÊBˆ™]\›‚ˆÝ\\Š
+K˜XØÙ\
+
+B‚‚˜Û\ÜÈÛÛ[X[™[]QX[ÙÊQX[ÙÊN‚ˆˆˆ”ÙX\˜ÚX›H][˜Ú\ˆ›ÜˆHY]Ü‰ÜÈ[ÜÝ[\Ü[XÝ[ÛœËˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹Y]ÜŠN‚ˆÝ\\Š
+K—×Ú[š]×ÊY]ÜŠBˆÙ[‹™Y]ÜˆHY]Ü‚ˆÙ[‹œÙ]Ú[™ÝÕ]J	Ñœ˜[YXÝ]0­È™Y™ZIÊBˆÙ[‹œÙ][Ù[
+YJBˆÙ[‹œÙ]Z[š[][TÚ^™JMŒÌ
+Bˆ^[Ý]HU›Þ^[Ý]
+Ù[ŠBˆ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊNM‹NMŠBˆ^[Ý]œÙ]ÜXÚ[™ÊL
+Bˆ^[Ý]˜YÚYÙ]
+X™[
+	Ð‘Q‘RHS‘ÒÔ•ÕUÉË	ÚXY[™ÉÊJBˆ[HX™[
+	ÔÝXÚHZ[™HZÝ[Ûˆ[™™\Ý0éYÙHZ][\‹ˆ0å™™›™[ˆ™Y\ž™Z]Z]Ý™ÊÒË‰Ë	Û]]Y	ÊBˆ[œÙ]ÛÜ™Ü˜\
+YJBˆ^[Ý]˜YÚYÙ]
+[
+BˆÙ[‹œ]Y\žHHS[™QY]
+
+BˆÙ[‹œ]Y\žKœÙ]XÙZÛ\•^
+	Ð™Y™ZÝXÚ[ˆ8 )‰ÊBˆÙ[‹œ]Y\žKœÙ]ÛX\]Û‘[˜X›Y
+YJBˆ^[Ý]˜YÚYÙ]
+Ù[‹œ]Y\žJBˆÙ[‹˜ÛÛ[X[™ÈHY]Ü‹˜ÛÛ[X[™ÙYš[š][ÛœÊ
+BˆÙ[‹œ™\Ý[ÈHS\ÝÚYÙ]
+
+BˆÙ[‹œ™\Ý[ËœÙ]šY]Ó[ÙJS\ÝÚYÙ]“\Ý[ÙJBˆÙ[‹œ™\Ý[Ëš][QÝX›PÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹œ[—ÜÙ[XÝY
+Bˆ^[Ý]˜YÚYÙ]
+Ù[‹œ™\Ý[ËJBˆ›ÛÝ\ˆHR›Þ^[Ý]
+
+Bˆ›ÛÝ\‹˜YÚYÙ]
+X™[
+	ø¡¤H8¡¤È]\Ýðé[ˆ0­È[\ˆ]\Ù°ï™[ˆ0­È\ØÈØÚYpçÙ[‰Ë	Û]]Y	ÊJBˆ›ÛÝ\‹˜YÝ™]Ú
+
+BˆÛÜÙHHT\Ú]ÛŠ	ÔØÚYpçÙ[‰ÊBˆÛÜÙK˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹œ™Z™XÝ
+Bˆ›ÛÝ\‹˜YÚYÙ]
+ÛÜÙJBˆ^[Ý]˜Y^[Ý]
+›ÛÝ\ŠBˆÙ[‹œ]Y\žK^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹œ™Yœ™\ÚÜ™\Ý[ÊBˆÙ[‹œ]Y\žKœ™]\›”™\ÜÙY˜ÛÛ›™XÝ
+Ù[‹œ[—ÜÙ[XÝY
+BˆÙ[‹œ™Yœ™\ÚÜ™\Ý[Ê
+BˆÙ[‹œ]Y\žKœÙ]›ØÝ\Ê
+B‚ˆYˆ™Yœ™\ÚÜ™\Ý[ÊÙ[‹
+—ÊN‚ˆ]Y\žHHÙ[‹œ]Y\žK^
+
+KœÝš\
+
+K˜Ø\ÙY›Û
+
+BˆÙ[‹œ™\Ý[Ë˜ÛX\Š
+Bˆ›Üˆ]KÚÜÝ]Ø[˜XÚÈ[ˆÙ[‹˜ÛÛ[X[™Î‚ˆÙX\˜ÚX›HH‰ÞÝ]_HÜÚÜÝ]IË˜Ø\ÙY›Û
+
+BˆYˆ]Y\žH[™]Y\žH›Ý[ˆÙX\˜ÚX›N‚ˆÛÛ[YBˆ][HHS\ÝÚYÙ]][J‰ÞÝ]_HÜÚÜÝ]IÊBˆ][KœÙ]]J]•\Ù\”›ÛKØ[˜XÚÊBˆÙ[‹œ™\Ý[Ë˜Y][J][JBˆYˆÙ[‹œ™\Ý[Ë˜ÛÝ[
+
+N‚ˆÙ[‹œ™\Ý[ËœÙ]Ý\œ™[›ÝÊ
+Bˆ[ÙN‚ˆ[\HHS\ÝÚYÙ]][J	ÒÙZ[™H\ÜÙ[™[ˆ™Y™ZIÊBˆ[\KœÙ]›YÜÊ]“›Ò][Q›YÜÊBˆÙ[‹œ™\Ý[Ë˜Y][J[\JB‚ˆYˆ[—ÜÙ[XÝY
+Ù[‹
+—ÊN‚ˆ][HHÙ[‹œ™\Ý[Ë˜Ý\œ™[][J
+BˆØ[˜XÚÈH][K™]J]•\Ù\”›ÛJHYˆ][H\È›Ý›Û™H[ÙH›Û™BˆYˆ›ÝØ[X›JØ[˜XÚÊN‚ˆ™]\›‚ˆÙ[‹˜XØÙ\
+
+BˆU[Y\‹œÚ[™ÛTÚÝ
+Ø[˜XÚÊB‚ˆYˆÙ^T™\ÜÑ]™[
+Ù[‹]™[
+N‚ˆYˆ]™[šÙ^J
+HOH]’Ù^WÑ\ØØ\N‚ˆÙ[‹œ™Z™XÝ
+
+Bˆ™]\›‚ˆÝ\\Š
+KšÙ^T™\ÜÑ]™[
+]™[
+B‚‚˜Û\ÜÈÚ[™[XT™]šY]ÑX[ÙÊQX[ÙÊN‚ˆˆˆ‘[ØÜ™Y[ˆ™]šY]È][\Ü˜\š[H\Ù\È]ÈÝÛˆšY[ÈÚ[šËˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹Y]ÜŠN‚ˆÝ\\Š
+K—×Ú[š]×ÊY]ÜŠBˆÙ[‹™Y]ÜˆHY]Ü‚ˆÙ[‹œÙ]Øš™XÝ˜[YJ	ØÚ[™[XQX[ÙÉÊBˆÙ[‹œÙ]Ú[™ÝÕ]J‰Ñœ˜[YXÝ]ÐTÕ‘T”ÒSÓŸH0­ÈÚ[™[XKU›ÜœØÚ]IÊBˆÙ[‹œÙ]Ú[™ÝÑ›YÊ]•Ú[™ÝÊBˆÙ[‹œÙ]]šX]J]•ÐWÑ[]SÛÛÜÙJBˆ^[Ý]HU›Þ^[Ý]
+Ù[ŠBˆ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊŒ‹NŒ‹MŠBˆ^[Ý]œÙ]ÜXÚ[™ÊL
+BˆXY\ˆHR›Þ^[Ý]
+
+BˆXY\‹˜YÚYÙ]
+X™[
+	Ñ”SQPÕU0­ÈÒS‘SPH‘U’QUÉË	ÚXY[™ÉÊJBˆXY\‹˜YÝ™]Ú
+
+BˆÛÜÙHHT\Ú]ÛŠ	ÔØÚYpçÙ[ˆ\ØÉÊBˆÛÜÙKœÙ]Øš™XÝ˜[YJ	ÚXÛÛ]Û‰ÊBˆÛÜÙK˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜ÛÜÙJBˆXY\‹˜YÚYÙ]
+ÛÜÙJBˆ^[Ý]˜Y^[Ý]
+XY\ŠBˆÙ[‹˜Ø[˜\ÈHšY[ÕšY]Ê
+BˆÙ[‹˜Ø[˜\ËœÙ]Ú^™TÛXÞJTÚ^™TÛXÞK‘^[™[™ËTÚ^™TÛXÞK‘^[™[™ÊBˆÙ[‹˜Ø[˜\Ë™œ˜[YHHY]Ü‹šY[Ë™œ˜[YBˆ^[Ý]˜YÚYÙ]
+Ù[‹˜Ø[˜\ËJBˆÛÛ›ÛÈHR›Þ^[Ý]
+
+BˆÙ[‹œ^WØ]ÛˆHT\Ú]ÛŠ	ø¥­ˆ[Y[[™IÊBˆÙ[‹œ^WØ]Û‹˜ÛXÚÙY˜ÛÛ›™XÝ
+Y]Ü‹ÙÙÛWÜ^JBˆÛÛ›ÛË˜YÚYÙ]
+Ù[‹œ^WØ]ÛŠBˆÛÛ›ÛË˜YÚYÙ]
+X™[
+	ÑŒLHÙ\ˆ\ØÈ[HØÚYpçÙ[‰Ë	Û]]Y	ÊJBˆÛÛ›ÛË˜YÝ™]Ú
+
+BˆÙ[‹[YHHX™[
+Y]Ü‹[YWÛX™[^
+
+K	Û]]Y	ÊBˆÛÛ›ÛË˜YÚYÙ]
+Ù[‹[YJBˆ^[Ý]˜Y^[Ý]
+ÛÛ›ÛÊBˆY]Ü‹œ^Y\‹œÙ]šY[ÔÚ[šÊÙ[‹˜Ø[˜\ËœÚ[šÊBˆY]Ü‹œ^Y\‹œ^X˜XÚÔÝ]PÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹œÞ[˜×Ü^WÜÝ]JBˆY]Ü‹œ^Y\‹œÜÚ][ÛÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹œÞ[˜×Ý[YJBˆÙ[‹œÞ[˜×Ü^WÜÝ]JY]Ü‹œ^Y\‹œ^X˜XÚÔÝ]J
+JB‚ˆYˆÞ[˜×Ü^WÜÝ]JÙ[‹Ý]JN‚ˆYˆÝ]HOHSYYXT^Y\‹”^Z[™ÔÝ]N‚ˆÙ[‹œ^WØ]Û‹œÙ]^
+	ø¡hH]\ÙIÊBˆ[ÙN‚ˆÙ[‹œ^WØ]Û‹œÙ]^
+	ø¥­ˆ[Y[[™IÊB‚ˆYˆÞ[˜×Ý[YJÙ[‹
+—ÊN‚ˆÙ[‹[YKœÙ]^
+Ù[‹™Y]Ü‹[YWÛX™[^
+
+JB‚ˆYˆÙ^T™\ÜÑ]™[
+Ù[‹]™[
+N‚ˆYˆ]™[šÙ^J
+H[ˆ
+]’Ù^WÑ\ØØ\K]’Ù^WÑŒLJN‚ˆÙ[‹˜ÛÜÙJ
+Bˆ™]\›‚ˆÝ\\Š
+KšÙ^T™\ÜÑ]™[
+]™[
+B‚ˆYˆÛÜÙQ]™[
+Ù[‹]™[
+N‚ˆÙ[‹™Y]Ü‹œ^Y\‹œÙ]šY[ÔÚ[šÊÙ[‹™Y]Ü‹šY[ËœÚ[šÊBˆÙ[‹™Y]Ü‹šY[Ë™œ˜[YHHÙ[‹˜Ø[˜\Ë™œ˜[YBˆÙ[‹™Y]Ü‹šY[Ë\]J
+BˆÙ[‹™Y]Ü‹˜Ú[™[XWÙX[ÙÈH›Û™BˆYˆ\Ø]ŠÙ[‹™Y]Ü‹	ØÚ[™[XWØ]Û‰ÊN‚ˆÙ[‹™Y]Ü‹˜Ú[™[XWØ]Û‹œÙ]^
+	ø¦íˆÚ[™[XIÊBˆÝ\\Š
+K˜ÛÜÙQ]™[
+]™[
+B‚‚˜Û\ÜÈ]™[Y]\ŠUÚYÙ]
+N‚ˆˆˆÛÛ\XÝ\[™[˜ÞKYœ™YHZ^\ˆY]\ˆš]™[ˆžHHÝ\œ™[^ZXYˆˆˆ‚ˆYˆ×Ú[š]×ÊÙ[‹\™[S›Û™JN‚ˆÝ\\Š
+K—×Ú[š]×Ê\™[
+BˆÙ[‹›]™[HŒˆÙ[‹œÙ]Z[š[][UÚY
+LŠBˆÙ[‹œÙ]Z[š[][RZYÚ
+MŠB‚ˆYˆÙ]Û]™[
+Ù[‹˜[YJN‚ˆ˜[YHHX^
+ŒZ[ŠKŒ›Ø]
+˜[YJJJBˆYˆXœÊ˜[YHHÙ[‹›]™[
+HˆŒN‚ˆÙ[‹›]™[H˜[YBˆÙ[‹\]J
+B‚ˆYˆZ[]™[
+Ù[‹]™[
+N‚ˆZ[\ˆHTZ[\ŠÙ[ŠBˆZ[\‹™š[™XÝ
+Ù[‹œ™XÝ
+
+KPÛÛÜŠ	ÈÌŒLMÉÊJBˆÚYHX^
+[
+
+Ù[‹ÚY
+
+KM
+H
+ˆÙ[‹›]™[
+JBˆYˆÚY‚ˆÜ™Y[ˆHX^
+Z[ŠÚY[
+Ù[‹ÚY
+
+J‹Ì
+JJBˆY[ÝÈHX^
+Z[ŠÚYYÜ™Y[‹[
+Ù[‹ÚY
+
+J‹ŒŒ
+JJBˆZ[\‹™š[™XÝ
+‹‹Ü™Y[‹X^
+KÙ[‹šZYÚ
+
+KM
+KPÛÛÜŠ	ÈÍŒÙXMIÊJBˆZ[\‹™š[™XÝ
+ŠÙÜ™Y[‹‹Y[ÝËX^
+KÙ[‹šZYÚ
+
+KM
+KPÛÛÜŠ	ÈÙXÎ˜‰ÊJBˆZ[\‹™š[™XÝ
+ŠÙÜ™Y[ŠÞY[ÝË‹X^
+ÚYYÜ™Y[‹^Y[ÝÊKX^
+KÙ[‹šZYÚ
+
+KM
+KPÛÛÜŠ	ÈÙ™ÍÍÍÉÊJBˆZ[\‹œÙ][ŠPÛÛÜŠ	ÈÌÌÍMIÊJBˆZ[\‹™˜]Ô™XÝ
+KKÙ[‹ÚY
+
+KLËÙ[‹šZYÚ
+
+KLÊB‚‚˜Û\ÜÈZ^\‘X[ÙÊQX[ÙÊN‚ˆˆˆ•˜XÚÈZ^\ˆÚ]]™H˜Y\œË[‹ÛÛËÛ]]H[™X\Ý\ˆÛÛ›ÛËˆˆˆ‚ˆYˆ×Ú[š]×ÊÙ[‹Y]ÜŠN‚ˆÝ\\Š
+K—×Ú[š]×ÊY]ÜŠBˆÙ[‹™Y]ÜˆHY]Ü‚ˆÙ[‹œÙ]Ú[™ÝÕ]J	Ð]Y[ËSZ^\‰ÊBˆÙ[‹œÙ]Z[š[][TÚ^™JÍŒŒ
+BˆÙ[‹—ÛØY[™ÈHYBˆÙ[‹—ØÚXÚÜÚ[YH˜[ÙBˆÙ[‹˜XÚ×ØÛÛ›ÛÈHßBˆ^[Ý]HU›Þ^[Ý]
+Ù[ŠBˆ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊNM‹NMŠBˆ^[Ý]œÙ]ÜXÚ[™ÊL
+Bˆ^[Ý]˜YÚYÙ]
+X™[
+	ÐUQSËSRVTˆ0­ÈÔT‘S‹PTÕTˆS‘QÑS	Ë	ÚXY[™ÉÊJBˆ[HX™[
+	Ñ˜Y\ˆ[™[›Ü˜[XHÚ\šÙ[ˆ[ˆ›ÜœØÚ]H[™^ÜˆÛÛÈØÚ[][H[™\™[ˆÛœÜ\™[ˆ°ïˆ[ˆXš0íœ›Z^]\Ë‰Ë	Û]]Y	ÊBˆ[œÙ]ÛÜ™Ü˜\
+YJNÈ^[Ý]˜YÚYÙ]
+[
+B‚ˆÜšYHQÜšY^[Ý]
+
+NÈÜšYœÙ]Üš^›Û[ÜXÚ[™Ê
+NÈÜšYœÙ]™\XØ[ÜXÚ[™ÊŠBˆ›ÜˆÛÛ[[‹]H[ˆ[[Y\˜]J
+	ÔÜ\‰Ë	Ó]]Ý0éšÙIË	Ô[›Ü˜[XIË	ÓHÈÉË	ÔYÙ[	ÊJN‚ˆÜšY˜YÚYÙ]
+X™[
+]K	Û]]Y	ÊKÛÛ[[ŠBˆ›Üˆ›ÝË˜XÚÈ[ˆ[[Y\˜]JY]Ü‹˜XÚÜËJN‚ˆÝ]HHY]Ü‹˜XÚ×ÜÝ]\Ë™Ù]
+˜XÚËßJBˆ˜[YHHY]Ü‹˜XÚ×Û˜[Y\Ë™Ù]
+˜XÚËY]Ü‹™Y˜][Ý˜XÚ×Û˜[YJ˜XÚÊJBˆÜšY˜YÚYÙ]
+X™[
+˜[YJK›ÝË
+Bˆ›Û[YWÜÛY\ˆHTÛY\Š]’Üš^›Û[
+NÈ›Û[YWÜÛY\‹œÙ]˜[™ÙJŒ
+NÈ›Û[YWÜÛY\‹œÙ]˜[YJ›Ý[™
+›Ø]
+Ý]K™Ù]
+	Ý›Û[YIËJJJŒL
+JNÈ›Û[YWÜÛY\‹œÙ]ÛÛ\
+	ÔÜ\›]]Ý0éšÙH8 $ÌŒ	IÊBˆ›Û[YWÜÜ[ˆHQÝX›TÜ[›Þ
+
+NÈ›Û[YWÜÜ[‹œÙ]˜[™ÙJŒ
+NÈ›Û[YWÜÜ[‹œÙ]XÚ[X[Ê
+NÈ›Û[YWÜÜ[‹œÙ]ÝY™š^
+	È	IÊNÈ›Û[YWÜÜ[‹œÙ]˜[YJ›Ø]
+Ý]K™Ù]
+	Ý›Û[YIËJJJŒL
+Bˆ›Û[YWØ›ÞHR›Þ^[Ý]
+
+NÈ›Û[YWØ›ÞœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ›Û[YWØ›Þ˜YÚYÙ]
+›Û[YWÜÛY\‹JNÈ›Û[YWØ›Þ˜YÚYÙ]
+›Û[YWÜÜ[ŠBˆ›Û[YWÝÚYÙ]HUÚYÙ]
+
+NÈ›Û[YWÝÚYÙ]œÙ]^[Ý]
+›Û[YWØ›Þ
+NÈÜšY˜YÚYÙ]
+›Û[YWÝÚYÙ]›ÝËJBˆ[—ÜÛY\ˆHTÛY\Š]’Üš^›Û[
+NÈ[—ÜÛY\‹œÙ]˜[™ÙJLLL
+NÈ[—ÜÛY\‹œÙ]˜[YJ›Ý[™
+›Ø]
+Ý]K™Ù]
+	Ü[‰Ë
+JJŒL
+JNÈ[—ÜÛY\‹œÙ]ÛÛ\
+	Ô[›Ü˜[XH[šÜËÜ™XÚÉÊBˆ[—ÜÜ[ˆHQÝX›TÜ[›Þ
+
+NÈ[—ÜÜ[‹œÙ]˜[™ÙJLLL
+NÈ[—ÜÜ[‹œÙ]XÚ[X[Ê
+NÈ[—ÜÜ[‹œÙ]ÝY™š^
+	È	IÊNÈ[—ÜÜ[‹œÙ]˜[YJ›Ø]
+Ý]K™Ù]
+	Ü[‰Ë
+JJŒL
+Bˆ[—Ø›ÞHR›Þ^[Ý]
+
+NÈ[—Ø›ÞœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ[—Ø›Þ˜YÚYÙ]
+[—ÜÛY\‹JNÈ[—Ø›Þ˜YÚYÙ]
+[—ÜÜ[ŠBˆ[—ÝÚYÙ]HUÚYÙ]
+
+NÈ[—ÝÚYÙ]œÙ]^[Ý]
+[—Ø›Þ
+NÈÜšY˜YÚYÙ]
+[—ÝÚYÙ]›ÝËŠBˆ]]HHPÚXÚÐ›Þ
+	ÓIÊNÈ]]KœÙ]ÚXÚÙY
+›ÛÛ
+Ý]K™Ù]
+	Û]]Y	Ë˜[ÙJJJNÈ]]KœÙ]ÛÛ\
+	ÔÜ\ˆÝ[[\ØÚ[[‰ÊBˆÛÛÈHPÚXÚÐ›Þ
+	ÔÉÊNÈÛÛËœÙ]ÚXÚÙY
+›ÛÛ
+Ý]K™Ù]
+	ÜÛÛÉË˜[ÙJJJNÈÛÛËœÙ]ÛÛ\
+	ÔÜ\ˆÛÛÈXš0íœ™[‰ÊBˆ]ÛœÈHR›Þ^[Ý]
+
+NÈ]ÛœËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ]ÛœË˜YÚYÙ]
+]]JNÈ]ÛœË˜YÚYÙ]
+ÛÛÊBˆ]Û—ÝÚYÙ]HUÚYÙ]
+
+NÈ]Û—ÝÚYÙ]œÙ]^[Ý]
+]ÛœÊNÈÜšY˜YÚYÙ]
+]Û—ÝÚYÙ]›ÝËÊBˆY]\ˆH]™[Y]\Š
+NÈÜšY˜YÚYÙ]
+Y]\‹›ÝË
+BˆÙ[‹˜XÚ×ØÛÛ›ÛÖÝ˜XÚ×HHÉÝ›Û[YWÜÛY\‰Î›Û[YWÜÛY\‹	Ý›Û[YWÜÜ[‰Î›Û[YWÜÜ[‹ˆ	Ü[—ÜÛY\‰Îœ[—ÜÛY\‹	Ü[—ÜÜ[‰Îœ[—ÜÜ[‹	Û]]IÎ›]]Kˆ	ÜÛÛÉÎœÛÛË	ÛY]\‰Î›Y]\ŸBˆ›Û[YWÜÛY\‹˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+[X™H˜[YKÏ]›Û[YWÜÜ[ŽˆËœÙ]˜[YJ˜[YJJBˆ›Û[YWÜÜ[‹˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+[X™H˜[YKÏ]›Û[YWÜÛY\ŽˆËœÙ]˜[YJ›Ý[™
+˜[YJJJBˆ[—ÜÛY\‹˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+[X™H˜[YKÏ\[—ÜÜ[ŽˆËœÙ]˜[YJ˜[YJJBˆ[—ÜÜ[‹˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+[X™H˜[YKÏ\[—ÜÛY\ŽˆËœÙ]˜[YJ›Ý[™
+˜[YJJJBˆ›ÜˆÛÛ›Û[ˆ
+›Û[YWÜÛY\‹[—ÜÛY\ŠN‚ˆÛÛ›ÛœÛY\”™\ÜÙY˜ÛÛ›™XÝ
+[X™NœÙ]]ŠÙ[‹	×ØÚXÚÜÚ[Y	Ë˜[ÙJJBˆÛÛ›ÛœÛY\”™[X\ÙY˜ÛÛ›™XÝ
+[X™NœÙ]]ŠÙ[‹	×ØÚXÚÜÚ[Y	Ë˜[ÙJJBˆ›ÜˆÛÛ›Û[ˆ
+›Û[YWÜÜ[‹[—ÜÜ[ŠN‚ˆÛÛ›Û™Y][™Ñš[š\ÚY˜ÛÛ›™XÝ
+[X™NœÙ]]ŠÙ[‹	×ØÚXÚÜÚ[Y	Ë˜[ÙJJBˆ›Û[YWÜÜ[‹˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+[X™H˜[YK]˜XÚÎˆÙ[‹œÙ]Ý˜XÚÊ›Û[YO]˜[YKÌLŒ
+JBˆ[—ÜÜ[‹˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+[X™H˜[YK]˜XÚÎˆÙ[‹œÙ]Ý˜XÚÊ[]˜[YKÌLŒ
+JBˆ]]KÙÙÛY˜ÛÛ›™XÝ
+[X™H˜[YK]˜XÚÎˆÙ[‹œÙ]Ý˜XÚÊ]]Y]˜[YJJBˆÛÛËÙÙÛY˜ÛÛ›™XÝ
+[X™H˜[YK]˜XÚÎˆÙ[‹œÙ]Ý˜XÚÊÛÛÏ]˜[YJJBˆØÜ›ÛØÛÛ[HUÚYÙ]
+
+NÈØÜ›ÛØÛÛ[œÙ]^[Ý]
+ÜšY
+BˆØÜ›ÛHTØÜ›Û\™XJ
+NÈØÜ›ÛœÙ]ÚYÙ]™\Ú^˜X›JYJNÈØÜ›ÛœÙ]ÚYÙ]
+ØÜ›ÛØÛÛ[
+NÈ^[Ý]˜YÚYÙ]
+ØÜ›ÛJB‚ˆX\Ý\—Ø›ÞHQœ˜[YJ
+NÈX\Ý\—Ø›ÞœÙ]Øš™XÝ˜[YJ	Ü[™[	ÊNÈX\Ý\—Û^[Ý]HQÜšY^[Ý]
+X\Ý\—Ø›Þ
+BˆX\Ý\—Û^[Ý]˜YÚYÙ]
+X™[
+	ÓPTÕT‰Ë	ÚXY[™ÉÊK
+BˆÙ[‹›X\Ý\—Ý›Û[YHHQÝX›TÜ[›Þ
+
+NÈÙ[‹›X\Ý\—Ý›Û[YKœÙ]˜[™ÙJŒ
+NÈÙ[‹›X\Ý\—Ý›Û[YKœÙ]XÚ[X[Ê
+NÈÙ[‹›X\Ý\—Ý›Û[YKœÙ]ÝY™š^
+	È	IÊBˆÙ[‹›X\Ý\—Ý›Û[YKœÙ]˜[YJ›Ø]
+Y]Ü‹›X\Ý\—ÛZ^\‹™Ù]
+	Ý›Û[YIËJJJŒL
+BˆÙ[‹›X\Ý\—Ü[ˆHQÝX›TÜ[›Þ
+
+NÈÙ[‹›X\Ý\—Ü[‹œÙ]˜[™ÙJLLL
+NÈÙ[‹›X\Ý\—Ü[‹œÙ]XÚ[X[Ê
+NÈÙ[‹›X\Ý\—Ü[‹œÙ]ÝY™š^
+	È	IÊBˆÙ[‹›X\Ý\—Ü[‹œÙ]˜[YJ›Ø]
+Y]Ü‹›X\Ý\—ÛZ^\‹™Ù]
+	Ü[‰Ë
+JJŒL
+BˆÙ[‹›ÝY™\Ü×Ø›ÞHPÚXÚÐ›Þ
+	ÓÝY™\ÜËS›Ü›X[\ÚY\[™ÉÊNÈÙ[‹›ÝY™\Ü×Ø›ÞœÙ]ÚXÚÙY
+›ÛÛ
+Y]Ü‹›X\Ý\—ÛZ^\‹™Ù]
+	ÛÝY™\Ü×Û›Ü›X[^˜][Û‰Ë˜[ÙJJJBˆÙ[‹›ÝY™\Ü×Ý\™Ù]HQÝX›TÜ[›Þ
+
+NÈÙ[‹›ÝY™\Ü×Ý\™Ù]œÙ]˜[™ÙJLÌMJNÈÙ[‹›ÝY™\Ü×Ý\™Ù]œÙ]XÚ[X[ÊJNÈÙ[‹›ÝY™\Ü×Ý\™Ù]œÙ]ÝY™š^
+	ÈQ”ÉÊNÈÙ[‹›ÝY™\Ü×Ý\™Ù]œÙ]˜[YJ›Ø]
+Y]Ü‹›X\Ý\—ÛZ^\‹™Ù]
+	ÛÝY™\Ü×Ý\™Ù]	ËLMŠJJBˆX\Ý\—Û^[Ý]˜YÚYÙ]
+X™[
+	Ñ˜Y\‰Ë	Û]]Y	ÊKK
+NÈX\Ý\—Û^[Ý]˜YÚYÙ]
+Ù[‹›X\Ý\—Ý›Û[YKKJBˆX\Ý\—Û^[Ý]˜YÚYÙ]
+X™[
+	Ô[‰Ë	Û]]Y	ÊKKŠNÈX\Ý\—Û^[Ý]˜YÚYÙ]
+Ù[‹›X\Ý\—Ü[‹KÊBˆX\Ý\—Û^[Ý]˜YÚYÙ]
+Ù[‹›ÝY™\Ü×Ø›ÞK
+NÈX\Ý\—Û^[Ý]˜YÚYÙ]
+Ù[‹›ÝY™\Ü×Ý\™Ù]KJBˆÙ[‹›X\Ý\—ÛY]\ˆH]™[Y]\Š
+NÈX\Ý\—Û^[Ý]˜YÚYÙ]
+Ù[‹›X\Ý\—ÛY]\‹KŠBˆ^[Ý]˜YÚYÙ]
+X\Ý\—Ø›Þ
+BˆXÝ[ÛœÈHR›Þ^[Ý]
+
+NÈ›ÚXÙHHT\Ú]ÛŠ	Õ›ÚXÙK[Ý™\ˆ]Y›™ZY[¸ )‰ÊNÈ›ÚXÙK˜ÛXÚÙY˜ÛÛ›™XÝ
+Y]Ü‹œÝ\Ý›ÚXÙ[Ý™\—Ü™XÛÜ™[™ÊNÈXÝ[ÛœË˜YÚYÙ]
+›ÚXÙJBˆXÝ[ÛœË˜YÚYÙ]
+X™[
+	Ð]Y›˜ZYHÚ\™[ÈÐUˆ]YˆZ[™Hœ™ZYH]Y[ÜÜ\ˆÙ[YÝ‰Ë	Û]]Y	ÊJNÈXÝ[ÛœË˜YÝ™]Ú
+
+BˆÛÜÙHHT\Ú]ÛŠ	ÔØÚYpçÙ[‰ÊNÈÛÜÙK˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜XØÙ\
+NÈXÝ[ÛœË˜YÚYÙ]
+ÛÜÙJNÈ^[Ý]˜Y^[Ý]
+XÝ[ÛœÊBˆÙ[‹›X\Ý\—Ý›Û[YK˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+[X™H˜[YNœÙ[‹œÙ]ÛX\Ý\Š›Û[YO]˜[YKÌLŒ
+JBˆÙ[‹›X\Ý\—Ü[‹˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+[X™H˜[YNœÙ[‹œÙ]ÛX\Ý\Š[]˜[YKÌLŒ
+JBˆÙ[‹›ÝY™\Ü×Ø›ÞÙÙÛY˜ÛÛ›™XÝ
+[X™H˜[YNœÙ[‹œÙ]ÛX\Ý\ŠÝY™\Ü×Û›Ü›X[^˜][Û]˜[YJJBˆÙ[‹›ÝY™\Ü×Ý\™Ù]˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+[X™H˜[YNœÙ[‹œÙ]ÛX\Ý\ŠÝY™\Ü×Ý\™Ù]]˜[YJJBˆÙ[‹›Y]\—Ý[Y\ˆHU[Y\ŠÙ[ŠNÈÙ[‹›Y]\—Ý[Y\‹œÙ][\˜[
+L
+NÈÙ[‹›Y]\—Ý[Y\‹[Y[Ý]˜ÛÛ›™XÝ
+Ù[‹\]WÛY]\œÊNÈÙ[‹›Y]\—Ý[Y\‹œÝ\
+
+BˆÙ[‹—ÛØY[™ÈH˜[ÙBˆÙ[‹\]WÛY]\œÊ
+B‚ˆYˆØÚXÚÜÚ[
+Ù[ŠN‚ˆYˆ›ÝÙ[‹—ØÚXÚÜÚ[Y‚ˆÙ[‹™Y]Ü‹˜ÚXÚÜÚ[
+
+NÈÙ[‹—ØÚXÚÜÚ[YHYB‚ˆYˆÙ]Ý˜XÚÊÙ[‹˜XÚË
+Š˜[Y\ÊN‚ˆYˆÙ[‹—ÛØY[™ÈÜˆÙ[‹™Y]Ü‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆÙ[‹—ØÚXÚÜÚ[
+
+BˆÝ]HHÙ[‹™Y]Ü‹˜XÚ×ÜÝ]\ËœÙ]Y˜][
+˜XÚËÉÛ]]Y	Î‘˜[ÙK	ÛØÚÙY	Î‘˜[ÙK	ÜÛÛÉÎ‘˜[ÙK	Ý›Û[YIÎŒKŒ	Ü[‰ÎŒŒJBˆÝ]K\]J˜[Y\ÊBˆÙ[‹™Y]Ü‹˜XÚ×ÜÝ]\ÈH›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹™Y]Ü‹˜XÚ×ÜÝ]\ËÙ[‹™Y]Ü‹˜XÚÜÊBˆÙ[‹™Y]Ü‹˜Ú[™ÙY
+
+B‚ˆYˆÙ]ÛX\Ý\ŠÙ[‹
+Š˜[Y\ÊN‚ˆYˆÙ[‹—ÛØY[™ÈÜˆÙ[‹™Y]Ü‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆÙ[‹—ØÚXÚÜÚ[
+
+Bˆ\]YHXÝ
+Ù[‹™Y]Ü‹›X\Ý\—ÛZ^\ŠNÈ\]Y\]J˜[Y\ÊBˆÙ[‹™Y]Ü‹›X\Ý\—ÛZ^\ˆH›Ü›X[^™WÛX\Ý\—ÛZ^\Š\]Y
+BˆÙ[‹™Y]Ü‹˜Ú[™ÙY
+
+B‚ˆYˆ\]WÛY]\œÊÙ[ŠN‚ˆ^ZXYH›Ø]
+Ù[‹™Y]Ü‹œ^ZXY
+BˆÛÛ×Ý˜XÚÜÈHÝ˜XÚÈ›Üˆ˜XÚËÝ]H[ˆÙ[‹™Y]Ü‹˜XÚ×ÜÝ]\Ëš][\Ê
+HYˆÝ]K™Ù]
+	ÜÛÛÉË˜[ÙJ_Bˆ]™[ÈH×Bˆ›Üˆ˜XÚËÛÛ›ÛÈ[ˆÙ[‹˜XÚ×ØÛÛ›ÛËš][\Ê
+N‚ˆÝ]HHÙ[‹™Y]Ü‹˜XÚ×ÜÝ]\Ë™Ù]
+˜XÚËßJBˆ[ÝÙYH›ÝÝ]K™Ù]
+	Û]]Y	Ë˜[ÙJH[™
+›ÝÛÛ×Ý˜XÚÜÈÜˆ˜XÚÈ[ˆÛÛ×Ý˜XÚÜÊBˆXÝ]™HHØÛ\›ÜˆÛ\[ˆÙ[‹™Y]Ü‹˜Û\ÈYˆÛ\˜XÚÈOH˜XÚÈ[™Û\šÚ[™[ˆ
+	Ø]Y[ÉË	ÝšY[ÉÊBˆ[™Û\œÜÚ][ÛˆH^ZXYÛ\™š[š\Ú[™Ù]]ŠÛ\	Ú\×Ø]Y[ÉË˜[ÙJH[™Û\›Û[YHˆBˆ]™[HŒˆYˆ[ÝÙY[™XÝ]™N‚ˆÛ\HXÝ]™VËLWBˆ[ÙHHH
+ÈŒÍH
+ˆ
+H
+ÈH
+ˆX]œÚ[Š^ZXY
+ˆŒ
+ÈXœÊ˜XÚÊJJBˆ]™[HZ[ŠKŒ[ÙH
+ˆZ[ŠKŒÛ\›Û[YH
+ˆ›Ø]
+Ý]K™Ù]
+	Ý›Û[YIËKŒ
+JJJBˆÛÛ›ÛÖÉÛY]\‰×KœÙ]Û]™[
+]™[
+NÈ]™[Ë˜\[™
+]™[
+BˆX\Ý\ˆHX^
+]™[ËY˜][LŒ
+H
+ˆZ[ŠKŒ›Ø]
+Ù[‹™Y]Ü‹›X\Ý\—ÛZ^\‹™Ù]
+	Ý›Û[YIËKŒ
+JJBˆÙ[‹›X\Ý\—ÛY]\‹œÙ]Û]™[
+X\Ý\ŠB‚ˆYˆ™Yœ™\ÚÙœ›ÛWÙY]ÜŠÙ[ŠN‚ˆˆˆ’ÙY\[ˆ[™XYHÜ[ˆZ^\ˆ[YÛ™YY\ˆ[™Ë™YÈÜˆ›Ú™XÝØYˆˆˆ‚ˆÙ[‹—ÛØY[™ÈHYBˆ›Üˆ˜XÚËÛÛ›ÛÈ[ˆÙ[‹˜XÚ×ØÛÛ›ÛËš][\Ê
+N‚ˆÝ]HHÙ[‹™Y]Ü‹˜XÚ×ÜÝ]\Ë™Ù]
+˜XÚËßJBˆ›ÜˆÚYÙ]˜[YH[ˆ
+
+ÛÛ›ÛÖÉÝ›Û[YWÜÛY\‰×K›Ý[™
+›Ø]
+Ý]K™Ù]
+	Ý›Û[YIËJJJŒL
+JKˆ
+ÛÛ›ÛÖÉÝ›Û[YWÜÜ[‰×K›Ø]
+Ý]K™Ù]
+	Ý›Û[YIËJJJŒL
+Kˆ
+ÛÛ›ÛÖÉÜ[—ÜÛY\‰×K›Ý[™
+›Ø]
+Ý]K™Ù]
+	Ü[‰Ë
+JJŒL
+JKˆ
+ÛÛ›ÛÖÉÜ[—ÜÜ[‰×K›Ø]
+Ý]K™Ù]
+	Ü[‰Ë
+JJŒL
+Kˆ
+ÛÛ›ÛÖÉÛ]]I×K›ÛÛ
+Ý]K™Ù]
+	Û]]Y	Ë˜[ÙJJJKˆ
+ÛÛ›ÛÖÉÜÛÛÉ×K›ÛÛ
+Ý]K™Ù]
+	ÜÛÛÉË˜[ÙJJJJN‚ˆÚYÙ]˜›ØÚÔÚYÛ˜[ÊYJBˆ
+ÚYÙ]œÙ]ÚXÚÙY
+˜[YJHYˆ\Ú[œÝ[˜ÙJÚYÙ]PÚXÚÐ›Þ
+H[ÙHÚYÙ]œÙ]˜[YJ˜[YJJBˆÚYÙ]˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆ›ÜˆÚYÙ]˜[YH[ˆ
+
+Ù[‹›X\Ý\—Ý›Û[YK›Ø]
+Ù[‹™Y]Ü‹›X\Ý\—ÛZ^\‹™Ù]
+	Ý›Û[YIËJJJŒL
+Kˆ
+Ù[‹›X\Ý\—Ü[‹›Ø]
+Ù[‹™Y]Ü‹›X\Ý\—ÛZ^\‹™Ù]
+	Ü[‰Ë
+JJŒL
+Kˆ
+Ù[‹›ÝY™\Ü×Ø›Þ›ÛÛ
+Ù[‹™Y]Ü‹›X\Ý\—ÛZ^\‹™Ù]
+	ÛÝY™\Ü×Û›Ü›X[^˜][Û‰Ë˜[ÙJJJKˆ
+Ù[‹›ÝY™\Ü×Ý\™Ù]›Ø]
+Ù[‹™Y]Ü‹›X\Ý\—ÛZ^\‹™Ù]
+	ÛÝY™\Ü×Ý\™Ù]	ËLMŠJJJN‚ˆÚYÙ]˜›ØÚÔÚYÛ˜[ÊYJBˆ
+ÚYÙ]œÙ]ÚXÚÙY
+˜[YJHYˆ\Ú[œÝ[˜ÙJÚYÙ]PÚXÚÐ›Þ
+H[ÙHÚYÙ]œÙ]˜[YJ˜[YJJBˆÚYÙ]˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆÙ[‹—ÛØY[™ÈH˜[ÙBˆÙ[‹\]WÛY]\œÊ
+B‚ˆYˆÛÜÙQ]™[
+Ù[‹]™[
+N‚ˆÙ[‹›Y]\—Ý[Y\‹œÝÜ
+
+BˆYˆÙ[‹™Y]Ü‹›Z^\—ÙX[ÙÈ\ÈÙ[Ž‚ˆÙ[‹™Y]Ü‹›Z^\—ÙX[ÙÈH›Û™BˆÝ\\Š
+K˜ÛÜÙQ]™[
+]™[
+B‚‚˜Û\ÜÈ›ØŠU™XY
+N‚ˆ›ÙÜ™\ÜÏTÚYÛ˜[
+[
+Bˆ™\Ý[TÚYÛ˜[
+Øš™XÝ
+B‚ˆYˆ×Ú[š]×ÊÙ[‹Ü\˜][ÛŠN‚ˆÝ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›Ü\˜][Û[Ü\˜][ÛŽÈÙ[‹˜Ø[˜Ù[]™XY[™Ë‘]™[
+
+B‚ˆYˆ[ŠÙ[ŠN‚ˆžN‚ˆ™\Ý[\Ù[‹›Ü\˜][ÛŠÙ[‹œ›ÙÜ™\ÜË™[Z]Ù[‹˜Ø[˜Ù[
+BˆÙ[‹œ™\Ý[™[Z]
+ÉÛÚÉÎ•YK	Ý˜[YIÎœ™\Ý[JBˆ^Ù\^ÜØ[˜Ù[Y‚ˆÙ[‹œ™\Ý[™[Z]
+ÉÛÚÉÎ‘˜[ÙK	ØØ[˜Ù[Y	Î•YK	Ù\œ›Ü‰Î‰Õ›Ü™Ø[™ÈX™ÙXœ›ØÚ[‹‰ßJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹œ™\Ý[™[Z]
+ÉÛÚÉÎ‘˜[ÙK	ØØ[˜Ù[Y	Î‘˜[ÙK	Ù\œ›Ü‰ÎœÝŠ^Ê_JB‚‚˜Û\ÜÈ\]PÚXÚÒ›ØŠU™XY
+N‚ˆ™\Ý[TÚYÛ˜[
+Øš™XÝ
+B‚ˆYˆ×Ú[š]×ÊÙ[‹X[šY™\ÝÝ\›Ý\œ™[Ý™\œÚ[ÛŠN‚ˆÝ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹›X[šY™\ÝÝ\›[X[šY™\ÝÝ\›ÈÙ[‹˜Ý\œ™[Ý™\œÚ[ÛXÝ\œ™[Ý™\œÚ[Û‚‚ˆYˆ[ŠÙ[ŠN‚ˆžN‚ˆX[šY™\ÝY™]ÚÛX[šY™\Ý
+Ù[‹›X[šY™\ÝÝ\›
+Bˆ\Y˜XÝ\Ù[XÝØ\Y˜XÝ
+X[šY™\ÝÙ[‹˜Ý\œ™[Ý™\œÚ[Û‹™Y™\œ™YÚÚ[™Ê
+JBˆÙ[‹œ™\Ý[™[Z]
+ÉÛÚÉÎ•YK	Ø\Y˜XÝ	Î˜\Y˜XÝJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹œ™\Ý[™[Z]
+ÉÛÚÉÎ‘˜[ÙK	Ù\œ›Ü‰ÎœÝŠ^Ê_JB‚‚˜Û\ÜÈ\]QÝÛ›ØY›ØŠU™XY
+N‚ˆ™\Ý[TÚYÛ˜[
+Øš™XÝ
+B‚ˆYˆ×Ú[š]×ÊÙ[‹\Y˜XÝ[œÝ[Q˜[ÙKÝ\œ™[Ü]S›Û™JN‚ˆÝ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹˜\Y˜XÝX\Y˜XÝÈÙ[‹š[œÝ[Z[œÝ[ÈÙ[‹˜Ý\œ™[Ü]XÝ\œ™[Ü]‚ˆYˆ[ŠÙ[ŠN‚ˆžN‚ˆ\™Ù]]\]WØØXÚWÙ\™XÝÜžJ
+KÜÙ[‹˜\Y˜XÝÉÙš[[˜[YI×BˆÝÛ›ØYYYÝÛ›ØYÝ™\šYšYY
+Ù[‹˜\Y˜XÝÉÝ\›	×KÙ[‹˜\Y˜XÝÉÜÚLM‰×K\™Ù]
+BˆY\ÜØYÙOIÕ\]H™\šYš^šY\\[\™Ù[Y[Žˆ	ÊÜÝŠÝÛ›ØYY
+Bˆ[œÝ[YQ˜[ÙBˆYˆÙ[‹š[œÝ[[™Ù[‹˜\Y˜XÝÉÚÚ[™	×OOIØ\[XYÙIÈ[™Ù[‹˜Ý\œ™[Ü]‚ˆY\ÜØYÙOZ[œÝ[ÙÝÛ›ØYY
+ÝÛ›ØYY	Ø\[XYÙIËÙ[‹˜Ý\œ™[Ü]
+Bˆ[œÝ[YUYBˆÙ[‹œ™\Ý[™[Z]
+ÉÛÚÉÎ•YK	Ü]	ÎœÝŠÝÛ›ØYY
+K	ÛY\ÜØYÙIÎ›Y\ÜØYÙK	Ú[œÝ[Y	Îš[œÝ[YJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹œ™\Ý[™[Z]
+ÉÛÚÉÎ‘˜[ÙK	Ù\œ›Ü‰ÎœÝŠ^Ê_JB‚‚˜Û\ÜÈY]ÜŠÛ[ÛÝÛÜšØ™[˜ÚSXZ[•Ú[™ÝÊN‚ˆYˆ×Ú[š]×ÊÙ[‹Ý]WÙ\S›Û™K™XÛÝ™\žOUYJN‚ˆÝ\\Š
+K—×Ú[š]×Ê
+BˆÙ[‹œÝ]WÙ\T]
+Ý]WÙ\ŠHYˆÝ]WÙ\ˆ[ÙHÝ]WÙ\™XÝÜžJ
+BˆÙ[‹œÝ]WÙ\‹›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆÙ[‹š[š]ÜÛ[ÛÝÜÝ]J
+NÈÙ[‹š›Ø—Ý\OR›Ø‚ˆÙ[‹œ™XÛÝ™\žWÜ]\Ù[‹œÝ]WÙ\‹ÉÜ™XÛÝ™\žK™œ˜[YXÝ]	ÂˆÙ[‹˜ØXÚWÜ›ÛÝ\Ù[‹œÝ]WÙ\‹ÉØØXÚIÎÈÙ[‹˜ØXÚWÜ›ÛÝ›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆÙ[‹˜ØXÚWÛ[Z]Øž]\ÏMÍŽ
+ŒL
+ŒLˆ[™WØØXÚJÙ[‹˜ØXÚWÜ›ÛÝÙ[‹˜ØXÚWÛ[Z]Øž]\ÊBˆÙ\ÜÚ[ÛœÏ\Ù[‹˜ØXÚWÜ›ÛÝÉÜÙ\ÜÚ[ÛœÉÎÈÙ\ÜÚ[ÛœË›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆÙ[‹˜ØXÚO][\š[K•[\Ü˜\žQ\™XÝÜžJ™Yš^IÙœ˜[YXÝ]\™]šY]ËIË\\ÝŠÙ\ÜÚ[ÛœÊJBˆÙ[‹[X›˜Z[ØØXÚO\Ù[‹˜ØXÚWÜ›ÛÝÉÝ[X›˜Z[ÉÎÈÙ[‹[X›˜Z[ØØXÚK›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆÙ[‹[X›˜Z[Ï^ßBˆÙ[‹Ø]™Y›Ü›\Ï^ßBˆÙ[‹˜Û\ÏV×NÈÙ[‹˜\ÜÙ]ÏV×NÈÙ[‹˜XÚÜÏVÌ‹KLKL—BˆÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\Ê›Û™KÙ[‹˜XÚÜÊNÈÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\Ê›Û™KÙ[‹˜XÚÜÊBˆÙ[‹›X\Ý\—ÛZ^\[›Ü›X[^™WÛX\Ý\—ÛZ^\Š›Û™JNÈÙ[‹›Z^\—ÙX[ÙÏS›Û™BˆÙ[‹˜Ý\œ™[S›Û™NÈÙ[‹œÙ[XÝ[ÛV×NÈÙ[‹˜Û\›Ø\™V×NÈÙ[‹˜]šX]WØÛ\›Ø\™S›Û™NÈÙ[‹šÙ^Yœ˜[YWØÛ\›Ø\™S›Û™NÈÙ[‹›X\šÙ\œÏV×BˆÈ\ÙH\™HRH™Y™\™[˜Ù\Ë›Ý›Ú™XÝYYXKˆ^HÙY\HY]Ü‚ˆÈØ[H›Üˆ™YÚ[›™\œÈÚ[HX]š[™ÈH[›Ù™\ÜÚ[Û˜[Ý\™˜XÙHÛ™BˆÈÛXÚÈ]Ø^K‚ˆÙ[‹™Y]Û[ÙOIÜÚ[\IÂˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]IÔØÚš]	ÂˆÙ[‹™›ØÝ\×Û[ÙOQ˜[ÙBˆÙ[‹™˜]›Üš]WØ\ÜÙ]Ï\Ù]
+
+BˆÙ[‹š[œÜXÝÜ—ÜÙXÝ[ÛœÏV×BˆÙ[‹œ›Ú™XÝÜ]S›Û™NÈÙ[‹œÝYÙÙ\ÝYÛ˜[YOIÓYZ[‹Qš[K™œ˜[YXÝ]	ÂˆÙ[‹š\ÝÜžOV×NÈÙ[‹™]\™OV×NÈÙ[‹™\OQ˜[ÙNÈÙ[‹œ™]š\Ú[ÛLˆÙ[‹œ™]šY]×Ü™]š\Ú[ÛKLNÈÙ[‹œ™]šY]×ÜÚYÛ˜]\™OS›Û™NÈÙ[‹œ™]šY]×Ü]S›Û™BˆÙ[‹œ™]šY]×ÝÛÜšÙ\S›Û™NÈÙ[‹œ™]šY]×Ü]Y]YYQ˜[ÙNÈÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYQ˜[ÙBˆÈHZ[‹ÛÛYÝ[Ý\ÈšY[È[Y[[™HÙ\È›Ý™YY[ˆ‘›\YÂˆÈÛÛ\ÜÚ][Ûˆ™[™\ˆ\ÝÈÝ][™^H]ˆH\™XÝ˜XÚÙ[™ˆÈÙY\ÈHÛÝ\˜ÙH[ˆSYYXT^Y\ˆ[™ÝÚ]Ú\ÈÛ›HÚ[ˆH^ZXYˆÈÜ›ÜÜÙ\ÈHÝ]ˆÛÛ\^[Y[[™\ÈÝ[\ÙHH™[™\™Y˜XÚÙ[™‚ˆÙ[‹™\™XÝÜ™]šY]ÏQ˜[ÙNÈÙ[‹™\™XÝÜ™]šY]×Ü™]š\Ú[ÛKLBˆÙ[‹™\™XÝÜ™]šY]×ÜÚYÛ˜]\™OS›Û™NÈÙ[‹™\™XÝØÛ\ÝZYS›Û™BˆÙ[‹›Z\ÜÚ[™×ÛYYXOV×NÈÙ[‹œ›ÞWÙ[˜X›YQ˜[ÙNÈÙ[‹œ›ÞWÛX\^ßNÈÙ[‹œ›ÞWÙ\™XÝÜžOS›Û™NÈÙ[‹œ›ÞWÜ›Ùš[OIÌÍŒ	ÂˆÙ[‹˜]]×Ü›ÞWÜÛÝ\˜Ù\Ï\Ù]
+
+BˆÙ[‹™ÜWÜ™]šY]×Ú[™›Ï\™]šY]×ØXØÙ[\˜][Û—Ú[™›Ê
+BˆÙ[‹œ™[™\—Ü]Y]YOV×NÈÙ[‹œ™[™\—ØÝ\œ™[S›Û™NÈÙ[‹œ™[™\—Ü]Y]YWÜ]\ÙYQ˜[ÙBˆÙ[‹›[ÙOIÝ[Y[[™IÎÈÙ[‹œ^ZXYLŒˆÙ[‹ÛÜš×Ú[S›Û™NÈÙ[‹ÛÜš×ÛÝ]S›Û™BˆÈÛÝ\˜ÙK[[Ûš]ÜˆÝ]H\È[[[Û˜[H˜[œÚY[ˆ]\È›Ý\Ù‚ˆÈH›Ú™XÝš[Nˆ[‹ÓÝ]X\šÜÈ\ØÜšX™HHÝ\œ™[ÛÝ\˜ÙKYY][™ÂˆÈÙ\ÜÚ[Ûˆ[™\™HÛX\™YÚ[™]™\ˆH[Y[[™HÚ[™Ù\Ë‚ˆÙ[‹œÛÝ\˜ÙWØÛ\ÝZYS›Û™NÈÙ[‹œÛÝ\˜ÙWÚ[S›Û™NÈÙ[‹œÛÝ\˜ÙWÛÝ]S›Û™BˆÙ[‹˜[œÜÜÜ˜]OLŒÈÙ[‹˜[œÜÜÜ˜]WÜ[™[™ÏS›Û™BˆÙ[‹›ÚXÙ[Ý™\—ØØ\\™OS›Û™NÈÙ[‹›ÚXÙ[Ý™\—Ú[œ]S›Û™NÈÙ[‹›ÚXÙ[Ý™\—Ü™XÛÜ™\S›Û™BˆÙ[‹›ÚXÙ[Ý™\—ÙX[ÙÏS›Û™NÈÙ[‹›ÚXÙ[Ý™\—Ý\™Ù]S›Û™BˆÙ[‹˜Ú[™[XWÙX[ÙÏS›Û™BˆÙ[‹˜[œÜÜÝ[Y\TU[Y\ŠÙ[ŠNÈÙ[‹˜[œÜÜÝ[Y\‹œÙ][\˜[
+
+NÈÙ[‹˜[œÜÜÝ[Y\‹[Y[Ý]˜ÛÛ›™XÝ
+Ù[‹˜[œÜÜÝXÚÊBˆÙ[‹œ[™[™×ÜÙYZÏS›Û™NÈÙ[‹ÛÜšÙ\S›Û™NÈÙ[‹œ™XÛÝ™\žWÙ[˜X›Y\™XÛÝ™\žBˆÙ[‹—ØÛÜÚ[™ÏQ˜[ÙBˆÙ[‹\]WÚ›ØS›Û™NÈÙ[‹\]WÙÝÛ›ØYÚ›ØS›Û™NÈÙ[‹\]WØ\Y˜XÝS›Û™BˆÙ[‹œÙ]Ú[™ÝÕ]J‰Ñœ˜[YXÝ]ÐTÕ‘T”ÒSÓŸH0­È™]Y\È›Ú™ZÝ	ÊBˆÙ[‹œ™\Ú^™JMŒN
+NÈÙ[‹œÙ]Z[š[][TÚ^™JLLŒÍ
+BˆÙ[‹œ^Y\TSYYXT^Y\ŠÙ[ŠNÈÙ[‹˜]Y[ÏTP]Y[ÓÝ]]
+Ù[ŠNÈÙ[‹œ^Y\‹œÙ]]Y[ÓÝ]]
+Ù[‹˜]Y[ÊBˆÈXœ˜\žH™]šY]ÜÈ\ÙHHÙ\\˜]H^Y\ˆÛÈ^H™]™\ˆ\Ý\˜ˆBˆÈ[Y[[™KÜÛÝ\˜ÙH[Ûš]ÜˆÝ]K‚ˆÙ[‹›Xœ˜\žWÜ^Y\TSYYXT^Y\ŠÙ[ŠNÈÙ[‹›Xœ˜\žWØ]Y[ÏTP]Y[ÓÝ]]
+Ù[ŠBˆÙ[‹›Xœ˜\žWØ]Y[ËœÙ]›Û[YJŽ
+NÈÙ[‹›Xœ˜\žWÜ^Y\‹œÙ]]Y[ÓÝ]]
+Ù[‹›Xœ˜\žWØ]Y[ÊBˆÙ[‹œ^Y\‹œÜÚ][ÛÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹œÜÚ][Û—ØÚ[™ÙY
+BˆÙ[‹œ^Y\‹›YYXTÝ]\ÐÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹›YYXWÜ™XYJBˆÙ[‹œ^Y\‹™\œ›Ü“ØØÝ\œ™Y˜ÛÛ›™XÝ
+[X™H
+—ÎœÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Õ›ÜœØÚ]Nˆ	ÊÜÙ[‹œ^Y\‹™\œ›Ü”Ýš[™Ê
+JJBˆÙ[‹œ^Y\‹œ^X˜XÚÔÝ]PÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹œ^WÜÝ]JBˆÙ[‹˜]]ÜØ]™WÝ[Y\TU[Y\ŠÙ[ŠNÈÙ[‹˜]]ÜØ]™WÝ[Y\‹œÙ]Ú[™ÛTÚÝ
+YJBˆÙ[‹˜]]ÜØ]™WÝ[Y\‹œÙ][\˜[
+Œ
+NÈÙ[‹˜]]ÜØ]™WÝ[Y\‹[Y[Ý]˜ÛÛ›™XÝ
+Ù[‹˜]]ÜØ]™JBˆÈX›Ý[˜ÙHY]ÈÛÈH\œÝÙˆš[KÜ›Ü\HÚ[™Ù\È›ÙXÙ\ÈÛ™BˆÈ™]šY]È™[™\ˆY\ˆH\Ù\ˆ]\Ù\Ë›ÝÛ™H™[™\ˆ\ˆÙ^\Ý›ÚÙK‚ˆÙ[‹›]™WÜ™]šY]×Ý[Y\TU[Y\ŠÙ[ŠNÈÙ[‹›]™WÜ™]šY]×Ý[Y\‹œÙ]Ú[™ÛTÚÝ
+YJNÈÙ[‹›]™WÜ™]šY]×Ý[Y\‹œÙ][\˜[
+Ì
+NÈÙ[‹›]™WÜ™]šY]×Ý[Y\‹[Y[Ý]˜ÛÛ›™XÝ
+Ù[‹˜]]×Ü™]šY]ÊBˆÙ[‹˜Z[ÝZJ
+NÈÙ[‹š[š]ÜÛ[ÛÝÝZJ
+NÈÙ[‹\]WÜ›Ú™XÝÚY[]J
+NÈÙ[‹œÙ]XØÙ\›ÜÊYJNÈÙ[‹\]WØØXÚWÜÝ]\Ê
+BˆÚÜÝ]ÏVÊ	ÐÝ›
+ÒIËÙ[‹š[\ÜÙX[ÙÊK
+	ÐÝ›
+ÔÉËÙ[‹œØ]™JK
+	ÐÝ›
+ÔÚY
+ÔÉË[X™NœÙ[‹œØ]™JYJJKˆ
+	ÐÝ›
+ÓÉËÙ[‹›Ü[—Ü›Ú™XÝ
+K
+	ÐÝ›
+Ó‰ËÙ[‹›™]×Ü›Ú™XÝ
+K
+	ÐÝ›
+Ö‰ËÙ[‹[™ÊKˆ
+	ÐÝ›
+ÔÚY
+Ö‰ËÙ[‹œ™YÊK
+	ÐÝ›
+ÖIËÙ[‹œ™YÊK
+	ÐÝ›
+Ð‰ËÙ[‹œÜ]
+K
+	ÔÉËÙ[‹œÜ]
+Kˆ
+	ÐÝ›
+ÐÉËÙ[‹˜ÛÜWÜÙ[XÝ[ÛŠK
+	ÐÝ›
+Õ‰ËÙ[‹œ\ÝWÜÙ[XÝ[ÛŠK
+	ÐÝ›
+ÔÚY
+Õ‰ËÙ[‹œš\WÚ[œÙ\
+Kˆ
+	ÐÝ›
+Ð[
+ÐÉËÙ[‹˜ÛÜWØ]šX]\ÊK
+	ÐÝ›
+Ð[
+Õ‰ËÙ[‹œ\ÝWØ]šX]\ÊKˆ
+	ÐÝ›
+Ð[
+ÒÉËÙ[‹˜ÛÜWÚÙ^Yœ˜[Y\ÊK
+	ÐÝ›
+Ð[
+ÔÚY
+ÒÉËÙ[‹œ\ÝWÚÙ^Yœ˜[Y\ÊKˆ
+	ÐÝ›
+Ñ	ËÙ[‹™\XØ]WÜÙ[XÝ[ÛŠK
+	ÐÝ›
+ÑÉËÙ[‹™Ü›Ý\ÜÙ[XÝ[ÛŠK
+	ÐÝ›
+ÔÚY
+ÑÉËÙ[‹[™Ü›Ý\ÜÙ[XÝ[ÛŠKˆ
+	ÐÝ›
+ÔÚY
+Ñ[]IËÙ[‹œš\WÙ[]JK
+	ÔIËÙ[‹œš\WÝš[WÚ[ŠK
+	ÕÉËÙ[‹œš\WÝš[WÛÝ]
+Kˆ
+	ÒIËÙ[‹œÙ]ÜÛÝ\˜ÙWÚ[ŠK
+	ÓÉËÙ[‹œÙ]ÜÛÝ\˜ÙWÛÝ]
+Kˆ
+	ÐÝ›
+Ð[
+ÒIËÙ[‹œÙ]ÝÛÜš×Ú[ŠK
+	ÐÝ›
+Ð[
+ÓÉËÙ[‹œÙ]ÝÛÜš×ÛÝ]
+Kˆ
+	Ô‰ËÙ[‹œ›ÛÝ×Ü^ZXY
+K
+	Ð[
+ÓY	Ë[X™NœÙ[‹œÛYWÜÙ[XÝY
+LJJKˆ
+	Ð[
+ÔšYÚ	Ë[X™NœÙ[‹œÛYWÜÙ[XÝY
+JJKˆ
+	ÔÚY
+Ð[
+ÓY	Ë[X™NœÙ[‹œÛ\ÜÙ[XÝY
+LJJKˆ
+	ÔÚY
+Ð[
+ÔšYÚ	Ë[X™NœÙ[‹œÛ\ÜÙ[XÝY
+JJKˆ
+	ÐÝ›
+ÐIËÙ[‹œÙ[XÝØ[
+K
+	Ò‰ËÙ[‹˜[œÜÜÚŠK
+	ÒÉËÙ[‹˜[œÜÜÜÝÜ
+K
+	Ó	ËÙ[‹˜[œÜÜÛ
+Kˆ
+	ÐÝ›
+ÒÉËÙ[‹›Ü[—ØÛÛ[X[™Ü[]JK
+	ÐÝ›
+ÔÚY
+Ñ‰ËÙ[‹ÙÙÛWÙ›ØÝ\×Û[ÙJK
+	ÑŒLIËÙ[‹ÙÙÛWØÚ[™[XWÜ™]šY]ÊKˆ
+	ÐÝ›
+Ð[
+Ö‰ËÙ[‹œÚÝ×Ú\ÝÜžJK
+	Õ\	Ë[X™NœÙ[‹š[\ØÝ]
+LJJK
+	ÑÝÛ‰Ë[X™NœÙ[‹š[\ØÝ]
+JJKˆ
+	ÔÜXÙIËÙ[‹ÙÙÛWÜ^JK
+	Ñ[]IËÙ[‹œ™[[Ý™JK
+	Ð˜XÚÜÜXÙIËÙ[‹œ™[[Ý™JKˆ
+	ÓY	Ë[X™NœÙ[‹›YÙWÜ^ZXY
+LJJK
+	ÔšYÚ	Ë[X™NœÙ[‹›YÙWÜ^ZXY
+JJKˆ
+	ÔÚY
+ÓY	Ë[X™NœÙ[‹›YÙWÜ^ZXY
+MJJK
+	ÔÚY
+ÔšYÚ	Ë[X™NœÙ[‹›YÙWÜ^ZXY
+JJKˆ
+	ÒÛYIË[X™NœÙ[‹œÙ]Ü^ZXY
+
+JK
+	Ñ[™	Ë[X™NœÙ[‹œÙ]Ü^ZXY
+[™Ý
+Ù[‹˜Û\ÊJJWBˆ›ÜˆÚÜÝ]›ˆ[ˆÚÜÝ]Î‚ˆXÝ[ÛTPXÝ[ÛŠÙ[ŠNÈXÝ[Û‹œÙ]ÚÜÝ]
+ÚÜÝ]
+NÈXÝ[Û‹œÙ]ÚÜÝ]ÛÛ^
+]•Ú[™ÝÔÚÜÝ]
+NÈXÝ[Û‹šYÙÙ\™Y˜ÛÛ›™XÝ
+›ŠNÈÙ[‹˜YXÝ[ÛŠXÝ[ÛŠBˆÙ[‹œ™Yœ™\Ú
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ð™\™Z]0­ÈÚØ[]YˆZ[™[H™XÚ™\ˆ0­È]Y[]ZY[ˆ›ZX™[ˆ[™\°é™\	ÊBˆYˆ™XÛÝ™\žNˆU[Y\‹œÚ[™ÛTÚÝ
+Ù[‹›Ù™™\—Ü™XÛÝ™\žJBˆYˆÛÛ™šYÝ\™YÛX[šY™\ÝÝ\›
+
+NˆU[Y\‹œÚ[™ÛTÚÝ
+L[X™NœÙ[‹˜ÚXÚ×Ù›Ü—Ý\]\ÊYJJB‚ˆYˆZ[ÝZJÙ[ŠN‚ˆ›ÛÝTUÚYÙ]
+
+NÈ›ÛÝœÙ]Øš™XÝ˜[YJ	ÙY]Ü”›ÛÝ	ÊBˆÝ]\TU›Þ^[Ý]
+›ÛÝ
+NÈÝ]\‹œÙ]ÛÛ[ÓX\™Ú[œÊL‹LL‹
+NÈÝ]\‹œÙ]ÜXÚ[™Ê
+B‚ˆÈXY\Žˆ›Ú™XÝY[]H[™HXÝ[ÛœÈ]™[Û™ÈÈHÚÛBˆÈY]ˆÙY\[™È\ÈÙ\\˜]Hœ›ÛHHÛÜšÜÜXÙHXZÙ\ÈHY\˜\˜ÚBˆÈ™XYX›H]™[ˆÚ[ˆH[œÜXÝÜˆ\ÈØÜ›ÛYY\K‚ˆXY\TQœ˜[YJ
+NÈXY\‹œÙ]Øš™XÝ˜[YJ	ÝÜ˜\‰ÊBˆXYTR›Þ^[Ý]
+XY\ŠNÈXYœÙ]ÛÛ[ÓX\™Ú[œÊLËËLÊNÈXYœÙ]ÜXÚ[™ÊJBˆXY˜YÚYÙ]
+X™[
+	Ñ”SQPÕU	Ë	Øœ˜[™	ÊJBˆXY˜YÚYÙ]
+X™[
+‰ÝžÐTÕ‘T”ÒSÓŸIË	Ý™\œÚ[Û“X™[	ÊJBˆ]šY\TQœ˜[YJ
+NÈ]šY\‹œÙ]Øš™XÝ˜[YJ	ÚXY\‘]šY\‰ÊNÈ]šY\‹œÙ]œ˜[YTÚ\JQœ˜[YK•“[™JNÈ]šY\‹œÙ]š^YZYÚ
+ŒŠNÈXY˜YÚYÙ]
+]šY\ŠBˆ›Ú™XÝØ›ØÚÏTU›Þ^[Ý]
+
+NÈ›Ú™XÝØ›ØÚËœÙ]ÛÛ[ÓX\™Ú[œÊ‹
+NÈ›Ú™XÝØ›ØÚËœÙ]ÜXÚ[™Ê
+BˆÙ[‹œ›Ú™XÝÝ]WÛX™[[X™[
+	Ó™]Y\È›Ú™ZÝ	Ë	Ü›Ú™XÝ]IÊNÈ›Ú™XÝØ›ØÚË˜YÚYÙ]
+Ù[‹œ›Ú™XÝÝ]WÛX™[
+BˆÙ[‹œ›Ú™XÝÛY]WÛX™[[X™[
+	ÓÚØ[\È›Ú™ZÝ	Ë	Û]]Y	ÊNÈ›Ú™XÝØ›ØÚË˜YÚYÙ]
+Ù[‹œ›Ú™XÝÛY]WÛX™[
+Bˆ›Ú™XÝÝÚYÙ]TUÚYÙ]
+
+NÈ›Ú™XÝÝÚYÙ]œÙ]^[Ý]
+›Ú™XÝØ›ØÚÊNÈXY˜YÚYÙ]
+›Ú™XÝÝÚYÙ]
+BˆXY˜YÝ™]Ú
+JBˆÙ[‹˜]]ÜØ]™WÜ[[X™[
+	ø¥ãÈ]]ÜØ]™IË	ÜÝ]\Ô[	ÊNÈÙ[‹˜]]ÜØ]™WÜ[œÙ]ÛÛ\
+	Ð]]ÛX]\ØÚHÚXÚ\[™È\ÝZÝ]‰ÊNÈXY˜YÚYÙ]
+Ù[‹˜]]ÜØ]™WÜ[
+BˆÙ[‹›™]×Ø]ÛZXÛÛ—ØXÝ[ÛŠ	ÊÉË	Ó™]Y\È›Ú™ZÝ0­ÈÝ™ÊÓ‰ËÙ[‹›™]×Ü›Ú™XÝ	ÙØÝ[Y[[™]ÉÊNÈXY˜YÚYÙ]
+Ù[‹›™]×Ø]ÛŠBˆÙ[‹›Ü[—Ø]ÛZXÛÛ—ØXÝ[ÛŠ	ø¡©IË	Ô›Ú™ZÝ0í™™›™[ˆ0­ÈÝ™ÊÓÉËÙ[‹›Ü[—Ü›Ú™XÝ	ÙØÝ[Y[[Ü[‰ÊNÈXY˜YÚYÙ]
+Ù[‹›Ü[—Ø]ÛŠBˆÙ[‹œØ]™WØ]ÛZXÛÛ—ØXÝ[ÛŠ	ø¥¨ÉË	Ô›Ú™ZÝÜZXÚ\›ˆ0­ÈÝ™ÊÔÉËÙ[‹œØ]™K	ÙØÝ[Y[\Ø]™IÊNÈXY˜YÚYÙ]
+Ù[‹œØ]™WØ]ÛŠBˆÙ[‹\]WØ]ÛZXÛÛ—ØXÝ[ÛŠ	ø¡®ÉË	Ó˜XÚ\]\ÈÝXÚ[‰ËÙ[‹˜ÚXÚ×Ù›Ü—Ý\]\Ë	ÝšY]Ë\™Yœ™\Ú	ÊNÈXY˜YÚYÙ]
+Ù[‹\]WØ]ÛŠBˆÙ[‹œ™[[š×Ø]ÛZXÛÛ—ØXÝ[ÛŠ	ø¦äÉË	ÓYYY[ˆ™]H™\šÛ°ï™[‰ËÙ[‹œ™[[š×ÛYYXK	Ú[œÙ\[[šÉÊNÈXY˜YÚYÙ]
+Ù[‹œ™[[š×Ø]ÛŠBˆÙ[‹˜\˜Ú]™WØ]ÛZXÛÛ—ØXÝ[ÛŠ	ø¥©	Ë	Ô›Ú™ZÝ\˜Ú]šY\™[‰ËÙ[‹˜\˜Ú]™WÜ›Ú™XÝÙX[ÙË	ÜXÚØYÙK^YÙ[™\šXÉÊNÈXY˜YÚYÙ]
+Ù[‹˜\˜Ú]™WØ]ÛŠBˆÙ[‹œ™[™\—Ü]Y]YWØ]ÛZXÛÛ—ØXÝ[ÛŠ	ø¦-ÉË	Ô™[™\‹T]Y]YH0í™™›™[‰ËÙ[‹œÚÝ×Ü™[™\—Ü]Y]YK	ÝšY]Ë[\Ý	ÊNÈXY˜YÚYÙ]
+Ù[‹œ™[™\—Ü]Y]YWØ]ÛŠBˆÙ[‹›Z^\—Ø]ÛZXÛÛ—ØXÝ[ÛŠ	ø¦jÉË	Ð]Y[ËSZ^\ˆ0í™™›™[‰ËÙ[‹›Ü[—ÛZ^\‹	Ø]Y[Ë]›Û[YKZYÚ	ÊNÈXY˜YÚYÙ]
+Ù[‹›Z^\—Ø]ÛŠBˆÙ[‹˜ÛÛ[X[™Ø]ÛZXÛÛ—ØXÝ[ÛŠ	ø£&	Ë	Ð™Y™ZÜ[]H0í™™›™[ˆ0­ÈÝ™ÊÒÉËÙ[‹›Ü[—ØÛÛ[X[™Ü[]K	ÜÞ\Ý[K\ÙX\˜Ú	ÊNÈXY˜YÚYÙ]
+Ù[‹˜ÛÛ[X[™Ø]ÛŠBˆÙ[‹œ™\Ù]TPÛÛX›Ð›Þ
+
+NÈÙ[‹œ™\Ù]œÙ]Øš™XÝ˜[YJ	Ü›Ú™XÝ™\Ù]	ÊNÈÙ[‹œ™\Ù]˜Y][\Ê‘TÑUÊNÈÙ[‹œ™\Ù]˜Ý\œ™[^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹œ™\Ù]ØÚ[™ÙY
+NÈÙ[‹œ™\Ù]œÙ]ÛÛ\
+	Ô›Ú™ZÝ›Ü›X][™›ÜœØÚ]YÜ°í°çÙIÊNÈXY˜YÚYÙ]
+Ù[‹œ™\Ù]
+Bˆ^ÜØ]ÛX]ÛŠ	Ñ^ÜY\™[‰ËÙ[‹œÝ\Ù^ÜYJNÈ^ÜØ]Û‹œÙ]Øš™XÝ˜[YJ	Ù^Ü]Û‰ÊNÈ^ÜØ]Û‹œÙ]Z[š[][UÚY
+LŠNÈXY˜YÚYÙ]
+^ÜØ]ÛŠBˆÝ]\‹˜YÚYÙ]
+XY\ŠB‚ˆÈH™Y™\™[˜ÙH\Ù\ÈHYÚÙZYÚ[ÙHÝš\X›Ý™HH™YKXÛÛ[[‚ˆÈÛÜšÜÜXÙKˆ\ÙHÚÜÝ]È^ÜÙH^\Ý[™ÈXÝ[ÛœÈÚ]Ý]Y[™ÂˆÈ[žHÙˆHY]Ü‰ÜÈÝ\œ™[ÛÛ›ÛË‚ˆ[ÙX˜\TQœ˜[YJ
+NÈÙ[‹›[ÙX˜\[[ÙX˜\ŽÈ[ÙX˜\‹œÙ]Øš™XÝ˜[YJ	Û[ÙX˜\‰ÊBˆ[ÙWÛ^[Ý]TR›Þ^[Ý]
+[ÙX˜\ŠNÈ[ÙWÛ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊËËËÊNÈ[ÙWÛ^[Ý]œÙ]ÜXÚ[™ÊÊBˆ[ÙWÛ^[Ý]˜YÚYÙ]
+X™[
+	ÐT‘RUÐ‘T‘RPÒ	Ë	Ù^YXœ›ÝÉÊJBˆ[ÙWÛ^[Ý]˜YÚYÙ]
+[Y[[™WÜÙ\\˜]ÜŠ
+JBˆÙ[‹›[ÙWØ]ÛœÏV×BˆYˆ[ÙWÝXŠ^Ø[˜XÚÏS›Û™KXÝ]™OQ˜[ÙKÛÛ\IÉÊN‚ˆXTT\Ú]ÛŠ^
+NÈX‹œÙ]Øš™XÝ˜[YJ	Û[ÙUXXÝ]™IÈYˆXÝ]™H[ÙH	Û[ÙUX‰ÊBˆYˆÛÛ\ˆX‹œÙ]ÛÛ\
+ÛÛ\
+BˆÙ[‹›[ÙWØ]ÛœË˜\[™
+XŠBˆYˆXÝ]˜]JÚXÚÙYQ˜[ÙJN‚ˆ›ÜˆÝ\ˆ[ˆÙ[‹›[ÙWØ]ÛœÎ‚ˆÝ\‹œÙ]Øš™XÝ˜[YJ	Û[ÙUX‰ÊBˆÝ\‹œÝ[J
+K[œÛ\Ú
+Ý\ŠNÈÝ\‹œÝ[J
+KœÛ\Ú
+Ý\ŠNÈÝ\‹\]J
+BˆX‹œÙ]Øš™XÝ˜[YJ	Û[ÙUXXÝ]™IÊNÈX‹œÝ[J
+K[œÛ\Ú
+XŠNÈX‹œÝ[J
+KœÛ\Ú
+XŠNÈX‹\]J
+BˆYˆØ[˜XÚÎˆØ[˜XÚÊ
+BˆX‹˜ÛXÚÙY˜ÛÛ›™XÝ
+XÝ]˜]JNÈ[ÙWÛ^[Ý]˜YÚYÙ]
+XŠBˆ™]\›ˆX‚ˆ[ÙWÝXŠ	ÓYYY[‰ËÙ[‹›Ü[—ÛYYXWÜ[™[YK	ÓYYY[˜X›YÙH0í™™›™[‰ÊBˆ[ÙWÝXŠ	ÐšX›[ÝZÉËÙ[‹›Ü[—ÛXœ˜\žWÜ[™[ÛÛ\IÔÝ\\‹PšX›[ÝZÈZ]ÛÝ[™ËY™™ZÝ[ˆ[™[š[X][Û™[ˆ0í™™›™[‰ÊBˆ[ÙWÝXŠ	Ð]Y[ÉËÙ[‹›Ü[—ÛZ^\‹ÛÛ\IÐ]Y[ËSZ^\ˆ0í™™›™[‰ÊBˆ[ÙWÝXŠ	Õ^	ËÙ[‹›Ü[—Ý^Ü[™[ÛÛ\IÕ^\ÚYÛˆ]\Ýðé[ˆ[™^Û\[›YÙ[‰ÊBˆ[ÙWÝXŠ	ÔÝXÚÙ\‰ËÙ[‹›Ü[—ÜÝXÚÙ\—Ü[™[ÛÛ\IÓÙ™›[™KTÝXÚÙ\˜šX›[ÝZÈ0í™™›™[‰ÊBˆ[ÙWÝXŠ	ÑY™™ZÝIËÙ[‹›Ü[—ÙY™™XÝ×Ü[™[ÛÛ\IÑY™™ZÝšX›[ÝZÈ0í™™›™[‰ÊBˆ[ÙWÝXŠ	ðç™\™ðé™ÙIËÙ[‹›Ü[—Ý˜[œÚ][Ûœ×Ü[™[ÛÛ\Iðç™\™Ø[™ÜØšX›[ÝZÈ0í™™›™[‰ÊBˆ[ÙWÝXŠ	Ñš[\‰ËÙ[‹›Ü[—Ùš[\œ×Ü[™[ÛÛ\IÑš[\˜šX›[ÝZÈ0í™™›™[‰ÊBˆ[ÙWÛ^[Ý]˜YÝ™]Ú
+
+Bˆ[ÙWÛ^[Ý]˜YÚYÙ]
+X™[
+	ÓVSÕU	Ë	Ù^YXœ›ÝÉÊJBˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›ÏTPÛÛX›Ð›Þ
+
+NÈÙ[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›ËœÙ]Øš™XÝ˜[YJ	ÝÛÜšÜÜXÙT™\Ù]	ÊBˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›Ë˜Y][J	ÔØÚš]	Ë	ÙY]	ÊBˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›Ë˜Y][J	ÔÚÜÈÈ™Y[ÉË	ÜÚÜÉÊBˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›Ë˜Y][J	Ð]Y[ÉË	Ø]Y[ÉÊBˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›Ë˜Y][J	Ñ˜\˜™IË	ØÛÛÜ‰ÊBˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›Ë˜Y][J	Õ[\][	Ë	ØØ\[ÛœÉÊBˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›ËœÙ]ÛÛ\
+	Ð\˜™Z]Ø™\™ZXÚ°ïˆYHZÝY[H]Y™ØX™Hðé[‰ÊBˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›Ë˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÝÛÜšÜÜXÙWÜ™\Ù]
+Bˆ[ÙWÛ^[Ý]˜YÚYÙ]
+Ù[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›ÊBˆ[ÙWÛ^[Ý]˜YÚYÙ]
+X™[
+	ÓSÑTÉË	Ù^YXœ›ÝÉÊJBˆÙ[‹™Y]Û[ÙWØÛÛX›ÏTPÛÛX›Ð›Þ
+
+NÈÙ[‹™Y]Û[ÙWØÛÛX›ËœÙ]Øš™XÝ˜[YJ	ÙY][ÙPÛÛX›ÉÊBˆÙ[‹™Y]Û[ÙWØÛÛX›Ë˜Y][J	ÑZ[™˜XÚ	Ë	ÜÚ[\IÊNÈÙ[‹™Y]Û[ÙWØÛÛX›Ë˜Y][J	Ô›ÉË	Ü›ÉÊBˆÙ[‹™Y]Û[ÙWØÛÛX›ËœÙ]ÛÛ\
+	ÑZ[™˜XÚ™ZYÝ\ˆYH0éYšYÜÝ[ˆZ[œÝ[[™Ù[ˆ0­È›È™ZYÝ[HÙ\šÞ™]YÙIÊBˆÙ[‹™Y]Û[ÙWØÛÛX›Ë˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹œÙ]ÙY]Û[ÙJBˆ[ÙWÛ^[Ý]˜YÚYÙ]
+Ù[‹™Y]Û[ÙWØÛÛX›ÊBˆÙ[‹™›ØÝ\×Ø]ÛTT\Ú]ÛŠ	Ñ›ÚÝ\ÉÊNÈÙ[‹™›ØÝ\×Ø]Û‹œÙ]Øš™XÝ˜[YJ	Û[ÙUX‰ÊNÈÙ[‹™›ØÝ\×Ø]Û‹œÙ]ÛÛ\
+	Õ›ÜœØÚ]H[™[Y[[™H™\™Ü°í°çÙ\›ˆ0­ÈÝ™ÊÔÚY
+Ñ‰ÊBˆÙ[‹™›ØÝ\×Ø]Û‹˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹ÙÙÛWÙ›ØÝ\×Û[ÙJNÈ[ÙWÛ^[Ý]˜YÚYÙ]
+Ù[‹™›ØÝ\×Ø]ÛŠBˆÝ]\‹˜YÚYÙ]
+[ÙX˜\ŠB‚ˆ™\XØ[TTÜ]\Š]•™\XØ[
+NÈÙ[‹™\XØ[]™\XØ[ÈÜTTÜ]\Š]’Üš^›Û[
+NÈÙ[‹Ü]ÜÈÜœÙ]Ú[™[ÛÛ\ÚX›J˜[ÙJBˆÈ]H™\XØ[Ü]\ˆXÚYHHZYÚˆHY˜][™Y™\œ™YˆÈÛXÞH[š\š]ÈH[YYXK\[™[Ú^™H[[™›ØÚÜÈH[™K‚ˆÜœÙ]Ú^™TÛXÞJTÚ^™TÛXÞK‘^[™[™ËTÚ^™TÛXÞK’YÛ›Ü™Y
+BˆYYXK[\[™[
+
+NÈÙ[‹›YYXWÜ[™[[YYXNÈYYXKœÙ]Øš™XÝ˜[YJ	ÛYYXT[™[	ÊNÈYYXKœÙ]Z[š[][UÚY
+L
+BˆYYXWÚXY\TR›Þ^[Ý]
+
+NÈYYXWÚXY\‹œÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈYYXWÚXY\‹œÙ]ÜXÚ[™ÊŠBˆÙ[‹›YYXWÚXY[™Ï[X™[
+	ÓQQQS‰Ë	ÚXY[™ÉÊNÈYYXWÚXY\‹˜YÚYÙ]
+Ù[‹›YYXWÚXY[™ÊNÈYYXWÚXY\‹˜YÝ™]Ú
+
+BˆÙ[‹›YYXWØÛÝ[[X™[
+	ÌYYY[‰Ë	Û]]Y	ÊNÈYYXWÚXY\‹˜YÚYÙ]
+Ù[‹›YYXWØÛÝ[
+NÈ[˜Y^[Ý]
+YYXWÚXY\ŠBˆ[\ÜÜ›ÝÏTR›Þ^[Ý]
+
+NÈ[\ÜÜ›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ[\ÜÜ›ÝËœÙ]ÜXÚ[™ÊJBˆ[\ÜÜ›ÝË˜YÚYÙ]
+]ÛŠ	ÊÈYYY[ˆ[\ÜY\™[‰ËÙ[‹š[\ÜÙX[ÙËYJKJBˆ[\ÜÛ[Ü™OTUÛÛ]ÛŠ
+NÈ[\ÜÛ[Ü™KœÙ]^
+	ø¢ëÉÊNÈ[\ÜÛ[Ü™KœÙ]Øš™XÝ˜[YJ	Ü[™[Y[P]Û‰ÊNÈ[\ÜÛ[Ü™KœÙ]ÛÛ\
+	ÕÙZ]\™H[\ÜÜ[Û™[‰ÊNÈ[\ÜÛ[Ü™KœÙ]XØÙ\ÜÚX›S˜[YJ	ÕÙZ]\™H[\ÜÜ[Û™[‰ÊBˆ[\ÜÛY[OTSY[JÙ[ŠNÈ[\ÜÛY[K˜YXÝ[ÛŠ	Ðš[Ù\]Y[žˆ[\ÜY\™[‰ËÙ[‹š[\ÜÜÙ\]Y[˜ÙWÙX[ÙÊNÈ[\ÜÛY[K˜YXÝ[ÛŠ	Õ[\][[\ÜY\™[ˆ
+Ô•Õ•
+IËÙ[‹š[\ÜÜÝX]WÙX[ÙÊNÈ[\ÜÛY[K˜YXÝ[ÛŠ	Ð]]ÛX]\ØÚH[\][	ËÙ[‹˜]]ÛX]X×ÜÝX]WÙX[ÙÊBˆ[\ÜÛ[Ü™KœÙ]Y[J[\ÜÛY[JNÈ[\ÜÛ[Ü™KœÙ]Ü\[ÙJUÛÛ]Û‹’[œÝ[Ü\
+NÈ[\ÜÜ›ÝË˜YÚYÙ]
+[\ÜÛ[Ü™JBˆÙ[‹›YYXWÚ[\ÜØÛÛZ[™\TUÚYÙ]
+
+NÈÙ[‹›YYXWÚ[\ÜØÛÛZ[™\‹œÙ]^[Ý]
+[\ÜÜ›ÝÊNÈ[˜YÚYÙ]
+Ù[‹›YYXWÚ[\ÜØÛÛZ[™\ŠBˆÙ[‹›YYXWÜÙX\˜ÚTS[™QY]
+
+NÈÙ[‹›YYXWÜÙX\˜ÚœÙ]XÙZÛ\•^
+	ÓYYY[ˆ\˜ÚÝXÚ[ˆ8 )‰ÊNÈÙ[‹›YYXWÜÙX\˜ÚœÙ]ÛX\]Û‘[˜X›Y
+YJBˆÙ[‹›YYXWÜÙX\˜ÚœÙ]ÛÛ\
+	ÔÝXÚH˜XÚ]Z[˜[YK˜YÙ\ˆYYY[\	ÊBˆ[˜YÚYÙ]
+Ù[‹›YYXWÜÙX\˜Ú
+BˆYYXWÙš[\—Ü›ÝÏTR›Þ^[Ý]
+
+NÈYYXWÙš[\—Ü›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈYYXWÙš[\—Ü›ÝËœÙ]ÜXÚ[™ÊŠBˆÙ[‹›YYXWÙš[\TPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YK]H[ˆ
+
+	Ø[	Ë	Ð[IÊK
+	ÝšY[ÉË	ÕšY[ÉÊK
+	Ø]Y[ÉË	Ð]Y[ÉÊK
+	Ú[XYÙIË	Ðš[\‰ÊK
+	ÜÙ\]Y[˜ÙIË	ÔÙ\]Y[ž™[‰ÊK
+	ÛÙ™›[™IË	ÓÙ™›[™IÊJN‚ˆÙ[‹›YYXWÙš[\‹˜Y][J]K˜[YJBˆÙ[‹›YYXWÙš[\‹œÙ]ÛÛ\
+	ÓYYY[ˆ˜XÚ\Ù\ˆÙ™›[™KTÝ]\Èš[\›‰ÊBˆÙ[‹›YYXWÜÛÜTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YK]H[ˆ
+
+	ÛÜ™\‰Ë	Ò[\ÜT™ZZ[™›ÛÙIÊK
+	Û˜[YIË	Ó˜[YIÊK
+	Ý\IË	Õ\	ÊK
+	Ù\˜][Û‰Ë	Ñ]Y\‰ÊJN‚ˆÙ[‹›YYXWÜÛÜ˜Y][J]K˜[YJBˆÙ[‹›YYXWÜÛÜœÙ]ÛÛ\
+	Ô™ZZ[™›ÛÙH\ˆYYY[˜X›YÙIÊBˆYYXWÙš[\—Ü›ÝË˜YÚYÙ]
+Ù[‹›YYXWÙš[\‹JNÈYYXWÙš[\—Ü›ÝË˜YÚYÙ]
+Ù[‹›YYXWÜÛÜJBˆÙ[‹›YYXWÙš[\—ØÛÛZ[™\TUÚYÙ]
+
+NÈÙ[‹›YYXWÙš[\—ØÛÛZ[™\‹œÙ]^[Ý]
+YYXWÙš[\—Ü›ÝÊNÈ[˜YÚYÙ]
+Ù[‹›YYXWÙš[\—ØÛÛZ[™\ŠBˆXœ˜\žWÝÛÛÏTR›Þ^[Ý]
+
+NÈXœ˜\žWÝÛÛËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈXœ˜\žWÝÛÛËœÙ]ÜXÚ[™ÊJBˆÙ[‹›YYXWÝšY]×ØÛÛX›ÏTPÛÛX›Ð›Þ
+
+NÈÙ[‹›YYXWÝšY]×ØÛÛX›ËœÙ]Øš™XÝ˜[YJ	ÛYYXUšY]ÐÛÛX›ÉÊBˆÙ[‹›YYXWÝšY]×ØÛÛX›Ë˜Y][J	ÒØ\[‰Ë	ØØ\™ÉÊNÈÙ[‹›YYXWÝšY]×ØÛÛX›Ë˜Y][J	Ó\ÝIË	Û\Ý	ÊBˆÙ[‹›YYXWÝšY]×ØÛÛX›ËœÙ]ÛÛ\
+	ÓYYY[˜X›YÙH[ÈØ\[ˆÙ\ˆÛÛ\ZÝH\ÝH[ž™ZYÙ[‰ÊBˆÙ[‹›YYXWÝšY]×ØÛÛX›Ë˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹œÙ]ÛYYXWÝšY]ÊBˆÙ[‹›YYXWÙ˜]›Üš]\×ÛÛ›OTPÚXÚÐ›Þ
+	ø¦!H˜]›Üš][‰ÊNÈÙ[‹›YYXWÙ˜]›Üš]\×ÛÛ›KœÙ]Øš™XÝ˜[YJ	ÛYYXQ˜]›Üš]\ÉÊBˆÙ[‹›YYXWÙ˜]›Üš]\×ÛÛ›KœÙ]ÛÛ\
+	Ó\ˆX\šÚY\HYYY[ˆ[ž™ZYÙ[‰ÊBˆÙ[‹›YYXWÙ˜]›Üš]\×ÛÛ›KÙÙÛY˜ÛÛ›™XÝ
+[X™H
+—ÎˆÙ[‹œ™Yœ™\ÚÛYYXJ
+JBˆÙ[‹›YYXWÙ˜]›Üš]WØ]ÛTUÛÛ]ÛŠ
+NÈÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹œÙ]Øš™XÝ˜[YJ	ÛYYXQ˜]›Üš]P]Û‰ÊNÈÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹œÙ]^
+	ø¦!‰ÊNÈÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹œÙ]ÛÛ\
+	Ð]\ÙÙ]ðé\ÈYY][H[È˜]›Üš]X\šÚY\™[‰ÊNÈÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹œÙ]XØÙ\ÜÚX›S˜[YJ	ÓYY][H[È˜]›Üš]X\šÚY\™[‰ÊNÈÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹ÙÙÛWØ\ÜÙ]Ù˜]›Üš]JBˆXœ˜\žWÝÛÛË˜YÚYÙ]
+Ù[‹›YYXWÝšY]×ØÛÛX›ÊNÈXœ˜\žWÝÛÛË˜YÚYÙ]
+Ù[‹›YYXWÙ˜]›Üš]\×ÛÛ›JNÈXœ˜\žWÝÛÛË˜YÝ™]Ú
+
+NÈXœ˜\žWÝÛÛË˜YÚYÙ]
+Ù[‹›YYXWÙ˜]›Üš]WØ]ÛŠBˆÙ[‹›YYXWÝÛÛ×ØÛÛZ[™\TUÚYÙ]
+
+NÈÙ[‹›YYXWÝÛÛ×ØÛÛZ[™\‹œÙ]^[Ý]
+Xœ˜\žWÝÛÛÊNÈ[˜YÚYÙ]
+Ù[‹›YYXWÝÛÛ×ØÛÛZ[™\ŠBˆÙ[‹›YYXWÚ[[X™[
+	ÖšYZ[ˆ[HZ[™°ïÙ[ˆ0­ÈÜ[ÛXÚÈ[H[š0é™Ù[‰Ë	ÜÝXIÊNÈÙ[‹›YYXWÚ[œÙ]ÛÜ™Ü˜\
+YJNÈ[˜YÚYÙ]
+Ù[‹›YYXWÚ[
+BˆÙ[‹›YYXWÙ[\WÚ[[X™[
+	Ó›ØÚÙZ[™HYYY[—’[\ÜY\™HZ[ˆšY[Ë]Y[ÈÙ\ˆš[[HHÝ\[‹‰Ë	Ù[\TÝ]IÊNÈÙ[‹›YYXWÙ[\WÚ[œÙ][YÛ›Y[
+][YÛÙ[\ŠNÈÙ[‹›YYXWÙ[\WÚ[œÙ]ÛÜ™Ü˜\
+YJNÈÙ[‹›YYXWÙ[\WÚ[œÙ]š\ÚX›J˜[ÙJNÈ[˜YÚYÙ]
+Ù[‹›YYXWÙ[\WÚ[
+BˆÙ[‹›YYXWÛ\ÝSYYXS\Ý
+
+NÈÙ[‹›YYXWÛ\ÝœÙ]Øš™XÝ˜[YJ	ÛYYXS\Ý	ÊNÈÙ[‹›YYXWÛ\ÝœÙ]šY]Ó[ÙJS\ÝÚYÙ]’XÛÛ“[ÙJBˆÙ[‹›YYXWÛ\ÝœÙ]™\Ú^™S[ÙJS\ÝÚYÙ]Y\Ý
+NÈÙ[‹›YYXWÛ\ÝœÙ]Ü˜\[™ÊYJNÈÙ[‹›YYXWÛ\ÝœÙ]ÜXÚ[™Ê
+BˆÙ[‹›YYXWÛ\ÝœÙ]XÛÛ”Ú^™JTÚ^™JLÌŠJNÈÙ[‹›YYXWÛ\ÝœÙ]ÜšYÚ^™JTÚ^™JMLL
+JNÈÙ[‹›YYXWÛ\ÝœÙ][šY›Ü›R][TÚ^™\ÊYJBˆÙ[‹›YYXWÛ\Ýš][QÝX›PÛXÚÙY˜ÛÛ›™XÝ
+[X™HÎœÙ[‹˜YÜÙ[XÝYØ\ÜÙ]
+
+JBˆÙ[‹›YYXWÛ\Ý˜Ý\œ™[][PÚ[™ÙY˜ÛÛ›™XÝ
+[X™H
+—ÎˆÙ[‹\]WÛYYXWÙ˜]›Üš]WØ]ÛŠ
+JBˆÙ[‹›YYXWÜÙX\˜Ú^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹œ™Yœ™\ÚÛYYXJNÈÙ[‹›YYXWÙš[\‹˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹œ™Yœ™\ÚÛYYXJNÈÙ[‹›YYXWÜÛÜ˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹œ™Yœ™\ÚÛYYXJBˆ[˜YÚYÙ]
+Ù[‹›YYXWÛ\ÝJBˆÙ[‹˜YÝ[Y[[™WØ]ÛX]ÛŠ	ûï"È\ˆ[Y[[™H[žY°ïÙ[‰ËÙ[‹˜YÜÙ[XÝYØ\ÜÙ]
+NÈ[˜YÚYÙ]
+Ù[‹˜YÝ[Y[[™WØ]ÛŠBˆÙ[‹›Xœ˜\žWÜÝXÚÏTTÝXÚÙYÚYÙ]
+
+NÈÙ[‹›Xœ˜\žWÜÝXÚËœÙ]Øš™XÝ˜[YJ	ÛXœ˜\žTÝXÚÉÊNÈÙ[‹›Xœ˜\žWÜÝXÚËšYJ
+BˆÙ[‹˜\ÜÙ]ÛXœ˜\žWÜ[™[P\ÜÙ]Xœ˜\žT[™[
+
+BˆÙ[‹˜\ÜÙ]ÛXœ˜\žWÜ[™[\ÙWÜ™\]Y\ÝY˜ÛÛ›™XÝ
+Ù[‹\ÙWÛXœ˜\žWÚ][JBˆÙ[‹˜\ÜÙ]ÛXœ˜\žWÜ[™[œ™]šY]×Ü™\]Y\ÝY˜ÛÛ›™XÝ
+Ù[‹œ™]šY]×ÛXœ˜\žWÚ][JBˆÙ[‹›Xœ˜\žWÜÝXÚË˜YÚYÙ]
+Ù[‹˜\ÜÙ]ÛXœ˜\žWÜ[™[
+BˆÙ[‹›Xœ˜\žWÜ[™[Ï^ßBˆYXØ]YÛXœ˜\šY\ÏJˆ
+	Ý^	ËXœ˜\žWÚ][\×Ù›ÜŠ	Ý^ÜÝ[\ÉÊK	ÕVQTÒQÓ‹P’P“SÕRÉËˆ	ÕðéHY\œÝZ[ˆ™\YÙ\È^\ÚYÛ‹ˆ[˜XÚÚXœÝH[ˆ^Z[ŽÈ[HÝ[Ù\HÚ[™™\™Z]È›Ü˜™\™Z]]‰Ëˆ	Õ^[›YÙ[‰Ë	Ý^ÜÝ[\ÉÊKˆ
+	ÜÝXÚÙ\‰ËXœ˜\žWÚ][\×Ù›ÜŠ	ÜÝXÚÙ\œÉÊK	ÔÕPÒÑT‹P’P“SÕRÉËˆ	ÓÙ™›[™KTÝXÚÙ\ˆ[ÈY]Y\˜˜\™H^Øš™ZÝHZ[™°ïÙ[‹ˆÜÚ][Û‹Ü°í°çÙH[™˜\˜™HÚ[™ÛÙ›Ü[œ\ÜØ˜\‹‰Ëˆ	ÑZ[™°ïÙ[‰Ë	ÜÝXÚÙ\œÉÊKˆ
+	ÙY™™XÝÉËXœ˜\žWÚ][\×Ù›ÜŠ	ÙY™™XÝÉÊK	ÑQ‘‘RÕP’P“SÕRÉËˆ	ÕšY[ËSÛÚÜÈ[™Y\ÝY[TÝ\Ù\H]Yˆ[ˆ]\ÙÙ]ðé[ˆÛ\[Ù[™[‹‰Ëˆ	Ð[Ù[™[‰Ë	ÙY™™XÝÉÊKˆ
+	Ý˜[œÚ][ÛœÉËXœ˜\žWÚ][\×Ù›ÜŠ	Ý˜[œÚ][ÛœÉÊK	ðç‘T‘ÐS‘ÔËP’P“SÕRÉËˆ	ÑZ[™[ˆ0ç™\™Ø[™È[ÈÝ\Ù\]Yˆ[ˆ]\ÙÙ]ðé[ˆšY[ËHÙ\ˆ]Y[ØÛ\[Ù[™[‹‰Ëˆ	Ð[Ù[™[‰Ë	Ý˜[œÚ][ÛœÉÊKˆ
+	Ùš[\œÉËXœ˜\žWÚ][\×Ù›ÜŠ	Ùš[\œÉÊK	Ñ’ST‹P’P“SÕRÉËˆ	Ñ˜\˜›ÛÚÜÈ]\Ýðé[ˆ[™\™ZÝ]Yˆ[ˆ]\ÙÙ]ðé[ˆšY[ØÛ\[Ù[™[‹‰Ëˆ	Ð[Ù[™[‰Ë	Ùš[\œÉÊKˆ
+Bˆ›ÜˆÙ^K][\Ë]K[XÝ[Û—ÛX™[Ø]YÛÜžH[ˆYXØ]YÛXœ˜\šY\Î‚ˆ[™[ÝÚYÙ]P\ÜÙ]Xœ˜\žT[™[
+][\ÏZ][\Ë]O]]K[Z[ˆš^YØØ]YÛÜžOXØ]YÛÜžKXÝ[Û—ÛX™[XXÝ[Û—ÛX™[
+Bˆ[™[ÝÚYÙ]\ÙWÜ™\]Y\ÝY˜ÛÛ›™XÝ
+Ù[‹\ÙWÛXœ˜\žWÚ][JBˆ[™[ÝÚYÙ]œ™]šY]×Ü™\]Y\ÝY˜ÛÛ›™XÝ
+Ù[‹œ™]šY]×ÛXœ˜\žWÚ][JBˆÙ[‹›Xœ˜\žWÜ[™[ÖÚÙ^WO\[™[ÝÚYÙ]ˆÙ[‹›Xœ˜\žWÜÝXÚË˜YÚYÙ]
+[™[ÝÚYÙ]
+Bˆ[˜YÚYÙ]
+Ù[‹›Xœ˜\žWÜÝXÚËJBˆÙ[‹—ÛYYXWØÛÛ›ÛÏJÙ[‹›YYXWÚ[\ÜØÛÛZ[™\‹Ù[‹›YYXWÜÙX\˜ÚÙ[‹›YYXWÙš[\—ØÛÛZ[™\‹ˆÙ[‹›YYXWÝÛÛ×ØÛÛZ[™\‹Ù[‹›YYXWÚ[Ù[‹›YYXWÙ[\WÚ[ˆÙ[‹›YYXWÛ\ÝÙ[‹˜YÝ[Y[[™WØ]ÛŠBˆÜ˜YÚYÙ]
+YYXJBˆ™]šY]Ë\[™[
+
+NÈÙ[‹œ™]šY]×Ü[™[\™]šY]ÎÈ™]šY]ËœÙ]Øš™XÝ˜[YJ	Ü™]šY]Ô[™[	ÊBˆ™]šY]×ÚXY\TR›Þ^[Ý]
+
+NÈ™]šY]×ÚXY\‹œÙ]ÛÛ[ÓX\™Ú[œÊ
+Bˆ™]šY]×ÚXY\‹˜YÚYÙ]
+X™[
+	Õ“Ô”ÐÒUIË	ÚXY[™ÉÊJNÈ™]šY]×ÚXY\‹˜YÝ™]Ú
+
+NÈ™]šY]×ÚXY\‹˜YÚYÙ]
+X™[
+	ÕSQSS‘HRV	Ë	ÜÝ]\Ô[	ÊJNÈ˜Y^[Ý]
+™]šY]×ÚXY\ŠBˆÙ[‹œ™]šY]×ÜÝ]\Ï[X™[
+	Õ[Y[[™KU›ÜœØÚ]HÚ\™™Z[H\œÝ[ˆXœÜY[[ˆ™\™XÚ™]‰Ë	Û]]Y	ÊNÈÙ[‹œ™]šY]×ÜÝ]\ËœÙ]ÛÜ™Ü˜\
+YJNÈ˜YÚYÙ]
+Ù[‹œ™]šY]×ÜÝ]\ÊBˆ™]šY]×ÛÜ[ÛœÏTR›Þ^[Ý]
+
+NÈÙ[‹›]™WÜ™]šY]×Ø›ÞTPÚXÚÐ›Þ
+	Ó]™KU›ÜœØÚ]IÊNÈÙ[‹›]™WÜ™]šY]×Ø›ÞœÙ]ÚXÚÙY
+YJNÈÙ[‹›]™WÜ™]šY]×Ø›ÞœÙ]ÛÛ\
+	Ó˜XÚZ[™\ˆ0á™\[™È]]ÛX]\ØÚZ[™H™]YH›ÜœØÚ]H™\™XÚ™[‰ÊBˆÙ[‹œ]ZXÚ×Ü™]šY]×Ø›ÞTPÚXÚÐ›Þ
+	ÔØÚ™[›ÜœØÚ]IÊNÈÙ[‹œ]ZXÚ×Ü™]šY]×Ø›ÞœÙ]ÚXÚÙY
+YJNÈÙ[‹œ]ZXÚ×Ü™]šY]×Ø›ÞœÙ]ÛÛ\
+	ÓšYYšYÙ\™H]Y›0íœÝ[™È[™ØÚ™[\™\È™[™\š[™È°ïˆYH›ÜœØÚ]IÊBˆÙ[‹™ÜWÜ™]šY]×Ø›ÞTPÚXÚÐ›Þ
+	ÑÔKQXÛÙ[™ÉÊNÈÙ[‹™ÜWÜ™]šY]×Ø›ÞœÙ]ÚXÚÙY
+Ù[‹™ÜWÜ™]šY]×Ú[™›ÖÉØ]˜Z[X›I×JNÈÙ[‹™ÜWÜ™]šY]×Ø›ÞœÙ][˜X›Y
+Ù[‹™ÜWÜ™]šY]×Ú[™›ÖÉØ]˜Z[X›I×JBˆÙ[‹™ÜWÜ™]šY]×Ø›ÞœÙ]ÛÛ\
+Ù[‹™ÜWÜ™]šY]×Ú[™›ÖÉÛX™[	×JÉÈ0­È°éÛÛœÝ]]ÛX]\ØÚ]YˆÔH\°ïÚÉÊBˆÙ[‹›]™WÜ™]šY]×Ø›ÞÙÙÛY˜ÛÛ›™XÝ
+Ù[‹œ™]šY]×ÛÜ[Û—ØÚ[™ÙY
+NÈÙ[‹œ]ZXÚ×Ü™]šY]×Ø›ÞÙÙÛY˜ÛÛ›™XÝ
+Ù[‹œ™]šY]×ÛÜ[Û—ØÚ[™ÙY
+NÈÙ[‹™ÜWÜ™]šY]×Ø›ÞÙÙÛY˜ÛÛ›™XÝ
+Ù[‹œ™]šY]×ÛÜ[Û—ØÚ[™ÙY
+Bˆ™]šY]×ÛÜ[ÛœË˜YÚYÙ]
+Ù[‹›]™WÜ™]šY]×Ø›Þ
+NÈ™]šY]×ÛÜ[ÛœË˜YÚYÙ]
+Ù[‹œ]ZXÚ×Ü™]šY]×Ø›Þ
+NÈ™]šY]×ÛÜ[ÛœË˜YÚYÙ]
+Ù[‹™ÜWÜ™]šY]×Ø›Þ
+NÈ™]šY]×ÛÜ[ÛœË˜YÝ™]Ú
+
+Bˆ\™›Ü›X[˜ÙWÛÜ[ÛœÏTR›Þ^[Ý]
+
+NÈÙ[‹œ›ÞWØ›ÞTPÚXÚÐ›Þ
+	Ô›ÞKU›ÜœØÚ]IÊNÈÙ[‹œ›ÞWØ›ÞœÙ][˜X›Y
+˜[ÙJBˆÙ[‹œ›ÞWØ›ÞœÙ]ÛÛ\
+	Ñ\ž™]YÝÚØ[KÛZ[™\™H›ÜœØÚ]KQ]ZY[‹ˆ™ZHÙZˆÜ›ðçÙ[ˆ]Y[[ˆÝ\]œ˜[YXÝ]YHØÚ™[›ÜœØÚ]H]]ÛX]\ØÚ[H[\™Ü[™ÈÜšYÚ[˜[H›ZX™[ˆ°ïˆ[ˆ^ÜZÝ]‹‰ÊBˆÙ[‹œ›ÞWÜ›Ùš[WØÛÛX›ÏTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YK[™›È[ˆ“ÖWÔ“Ñ’STËš][\Ê
+NˆÙ[‹œ›ÞWÜ›Ùš[WØÛÛX›Ë˜Y][J[™›ÖÉÛX™[	×K˜[YJBˆÙ[‹œ›ÞWÜ›Ùš[WØÛÛX›ËœÙ]Ý\œ™[[™^
+Ù[‹œ›ÞWÜ›Ùš[WØÛÛX›Ë™š[™]JÙ[‹œ›ÞWÜ›Ùš[JJNÈÙ[‹œ›ÞWÜ›Ùš[WØÛÛX›ËœÙ][˜X›Y
+˜[ÙJBˆÙ[‹œ›ÞWÜ›Ùš[WØÛÛX›ËœÙ]ÛÛ\
+	Ô]X[]0é\ˆ›ÞKQ]ZY[ŽˆÍŒ\ÝØÚ™[\‹ÌŒ]Z[™ZXÚ\‰ÊBˆÙ[‹˜ØXÚWÜÝ]\Ï[X™[
+	ÐØXÚHÚ\™]]ÛX]\ØÚ™YÜ™[ž	Ë	Û]]Y	ÊNÈÙ[‹˜ØXÚWØÛX\—Ø]ÛX]ÛŠ	ÐØXÚHY\™[‰ËÙ[‹˜ÛX\—ØØXÚJBˆÙ[‹œ›ÞWØ›ÞÙÙÛY˜ÛÛ›™XÝ
+Ù[‹œ›ÞWÝÙÙÛY
+NÈÙ[‹œ›ÞWÜ›Ùš[WØÛÛX›Ë˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹œ›ÞWÜ›Ùš[WØÚ[™ÙY
+Bˆ\™›Ü›X[˜ÙWÛÜ[ÛœË˜YÚYÙ]
+Ù[‹œ›ÞWØ›Þ
+NÈ\™›Ü›X[˜ÙWÛÜ[ÛœË˜YÚYÙ]
+X™[
+	Ô›Ùš[	Ë	Û]]Y	ÊJNÈ\™›Ü›X[˜ÙWÛÜ[ÛœË˜YÚYÙ]
+Ù[‹œ›ÞWÜ›Ùš[WØÛÛX›ÊNÈ\™›Ü›X[˜ÙWÛÜ[ÛœË˜YÝ™]Ú
+
+NÈ\™›Ü›X[˜ÙWÛÜ[ÛœË˜YÚYÙ]
+Ù[‹˜ØXÚWÜÝ]\ÊNÈ\™›Ü›X[˜ÙWÛÜ[ÛœË˜YÚYÙ]
+Ù[‹˜ØXÚWØÛX\—Ø]ÛŠBˆÙ[‹šY[×ÜÝXÚÏTTÝXÚÙYÚYÙ]
+
+NÈÙ[‹šY[×ÜÝXÚËœÙ]Øš™XÝ˜[YJ	Ü™]šY]ÐØ[˜\ÉÊNÈÙ[‹šY[×ÜÝXÚËœÙ]Z[š[][TÚ^™JÌÌNL
+BˆÙ[‹œXÙZÛ\[X™[
+	ÑZ[ˆš[H™YÚ[›Y\‹——“YYY[ˆ[\ÜY\™[ˆ8¡¤ˆ[ˆYH[Y[[™HšYZ[‰Ë	Û]]Y	ÊBˆÙ[‹œXÙZÛ\‹œÙ][YÛ›Y[
+][YÛÙ[\ŠNÈÙ[‹šY[×ÜÝXÚË˜YÚYÙ]
+Ù[‹œXÙZÛ\ŠBˆÙ[‹šY[ÏUšY[ÕšY]Ê
+NÈÙ[‹œ^Y\‹œÙ]šY[ÔÚ[šÊÙ[‹šY[ËœÚ[šÊNÈÙ[‹šY[×ÜÝXÚË˜YÚYÙ]
+Ù[‹šY[ÊBˆ˜YÚYÙ]
+Ù[‹šY[×ÜÝXÚËJBˆÙ[‹œÙYZÏTTÛY\Š]’Üš^›Û[
+NÈÙ[‹œÙYZËœÙ]˜[™ÙJL
+NÈÙ[‹œÙYZËœÛY\“[Ý™Y˜ÛÛ›™XÝ
+Ù[‹œÙYZ×ÜÛY\ŠNÈ˜YÚYÙ]
+Ù[‹œÙYZÊBˆÛÛ›ÛÏTR›Þ^[Ý]
+
+NÈÙ[‹œ^WØ]ÛX]ÛŠ	ø¥­ˆ[Y[[™IËÙ[‹ÙÙÛWÜ^JNÈÛÛ›ÛË˜YÚYÙ]
+Ù[‹œ^WØ]ÛŠBˆÛÛ›ÛË˜YÚYÙ]
+]ÛŠ	ÐÛ\[œÙZ[‰ËÙ[‹œÛÝ\˜ÙWÜ™]šY]ÊJNÈÛÛ›ÛË˜YÝ™]Ú
+
+BˆÙ[‹˜Ú[™[XWØ]ÛX]ÛŠ	Õ›Ûš[	ËÙ[‹ÙÙÛWØÚ[™[XWÜ™]šY]ÊNÈÙ[‹˜Ú[™[XWØ]Û‹œÙ]XÛÛŠ[™WÚXÛÛŠ	ÝšY]ËY[ØÜ™Y[‰ÊJNÈÙ[‹˜Ú[™[XWØ]Û‹œÙ]Øš™XÝ˜[YJ	ÚXÛÛ]Û‰ÊNÈÛÛ›ÛË˜YÚYÙ]
+Ù[‹˜Ú[™[XWØ]ÛŠBˆÙ[‹[YWÛX™[[X™[
+	ÌŒŒÈŒŒ	Ë	Û]]Y	ÊNÈÛÛ›ÛË˜YÚYÙ]
+Ù[‹[YWÛX™[
+NÈ˜Y^[Ý]
+ÛÛ›ÛÊBˆÛÝ\˜ÙWØÛÛ›ÛÏTR›Þ^[Ý]
+
+NÈÛÝ\˜ÙWØÛÛ›ÛËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈÛÝ\˜ÙWØÛÛ›ÛËœÙ]ÜXÚ[™Ê
+BˆÙ[‹œÛÝ\˜ÙWÜ˜[™ÙWÛX™[[X™[
+	Ô]Y[NˆÛ\[œÙZ[ˆ°ïˆ[‹ÓÝ]	Ë	Û]]Y	ÊNÈÙ[‹œÛÝ\˜ÙWÜ˜[™ÙWÛX™[œÙ]Øš™XÝ˜[YJ	ÜÛÝ\˜ÙT˜[™ÙSX™[	ÊNÈÛÝ\˜ÙWØÛÛ›ÛË˜YÚYÙ]
+Ù[‹œÛÝ\˜ÙWÜ˜[™ÙWÛX™[JBˆÙ[‹œÛÝ\˜ÙWÚ[—Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ÒIË	Ô]Y[R[ˆ[HZÝY[[ˆ]Y[š[Ù]™[ˆ0­ÈIËÙ[‹œÙ]ÜÛÝ\˜ÙWÚ[‹Øš™XÝÛ˜[YOIÜÛÝ\˜ÙUÛÛ]Û‰ÊBˆÙ[‹œÛÝ\˜ÙWÛÝ]Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ÓÉË	Ô]Y[SÝ][HZÝY[[ˆ]Y[š[Ù]™[ˆ0­ÈÉËÙ[‹œÙ]ÜÛÝ\˜ÙWÛÝ]Øš™XÝÛ˜[YOIÜÛÝ\˜ÙUÛÛ]Û‰ÊBˆÙ[‹œÛÝ\˜ÙWØÛX\—Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ðåÉË	Ô]Y[R[‹ÓÝ]]Yˆ[ˆÙ\Ø[][ˆÛ\\°ïÚÜÙ]™[‰ËÙ[‹˜ÛX\—ÜÛÝ\˜ÙWÛX\šÜËØš™XÝÛ˜[YOIÜÛÝ\˜ÙUÛÛ[™Ù\‰ÊBˆÙ[‹œÛÝ\˜ÙWÚ[œÙ\Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ø¡¬ÉË	ÓX\šÚY\[ˆ]Y[™\™ZXÚ[HXœÜY[ÛÜˆZ[™°ïÙ[ˆ[™Ü0é\™HÛ\È™\œØÚYX™[‰ËÙ[‹š[œÙ\ÜÛÝ\˜ÙWÜ˜[™ÙK	Ú[œÙ\[Øš™XÝ	ËØš™XÝÛ˜[YOIÜÛÝ\˜ÙUÛÛ]Û‰ÊBˆÙ[‹œÛÝ\˜ÙWÛÝ™\Üš]WØ]Û][Y[[™WÝÛÛØ]ÛŠ	ø¥¨ÉË	ÓX\šÚY\[ˆ]Y[™\™ZXÚ[HXœÜY[ÛÜˆ0ï™\œØÚ™ZX™[‰ËÙ[‹›Ý™\Üš]WÜÛÝ\˜ÙWÜ˜[™ÙK	ÙØÝ[Y[\Ø]™KX\ÉËØš™XÝÛ˜[YOIÜÛÝ\˜ÙUÛÛ]Û‰ÊBˆ›ÜˆÚYÙ][ˆ
+Ù[‹œÛÝ\˜ÙWÚ[—Ø]Û‹Ù[‹œÛÝ\˜ÙWÛÝ]Ø]Û‹Ù[‹œÛÝ\˜ÙWØÛX\—Ø]Û‹Ù[‹œÛÝ\˜ÙWÚ[œÙ\Ø]Û‹Ù[‹œÛÝ\˜ÙWÛÝ™\Üš]WØ]ÛŠNˆÛÝ\˜ÙWØÛÛ›ÛË˜YÚYÙ]
+ÚYÙ]
+BˆÛÝ\˜ÙWØ˜\TQœ˜[YJ
+NÈÛÝ\˜ÙWØ˜\‹œÙ]Øš™XÝ˜[YJ	Ü™]šY]ÔÝX˜˜\‰ÊNÈÛÝ\˜ÙWØ˜\‹œÙ]^[Ý]
+ÛÝ\˜ÙWØÛÛ›ÛÊNÈ˜YÚYÙ]
+ÛÝ\˜ÙWØ˜\ŠBˆÛÜš×ØÛÛ›ÛÏTR›Þ^[Ý]
+
+NÈÛÜš×ØÛÛ›ÛËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈÛÜš×ØÛÛ›ÛËœÙ]ÜXÚ[™Ê
+BˆÙ[‹ÛÜš×Ü˜[™ÙWÛX™[[X™[
+	Ð\˜™Z]Ø™\™ZXÚˆÙ\Ø[]H[Y[[™IË	Û]]Y	ÊNÈÙ[‹ÛÜš×Ü˜[™ÙWÛX™[œÙ]Øš™XÝ˜[YJ	ÜÛÝ\˜ÙT˜[™ÙSX™[	ÊNÈÛÜš×ØÛÛ›ÛË˜YÚYÙ]
+Ù[‹ÛÜš×Ü˜[™ÙWÛX™[JBˆÙ[‹ÛÜš×Ú[—Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ÒIË	Ð\˜™Z]Ø™\™ZXÚR[ˆ[HXœÜY[ÛÜˆÙ]™[ˆ0­ÈÝ™ÊÐ[
+ÒIËÙ[‹œÙ]ÝÛÜš×Ú[‹Øš™XÝÛ˜[YOIÜÛÝ\˜ÙUÛÛ]Û‰ÊBˆÙ[‹ÛÜš×ÛÝ]Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ÓÉË	Ð\˜™Z]Ø™\™ZXÚSÝ][HXœÜY[ÛÜˆÙ]™[ˆ0­ÈÝ™ÊÐ[
+ÓÉËÙ[‹œÙ]ÝÛÜš×ÛÝ]Øš™XÝÛ˜[YOIÜÛÝ\˜ÙUÛÛ]Û‰ÊBˆÙ[‹ÛÜš×ØÛX\—Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ðåÉË	Ð\˜™Z]Ø™\™ZXÚ0íœØÚ[‰ËÙ[‹˜ÛX\—ÝÛÜš×Ø\™XKØš™XÝÛ˜[YOIÜÛÝ\˜ÙUÛÛ[™Ù\‰ÊBˆ›ÜˆÚYÙ][ˆ
+Ù[‹ÛÜš×Ú[—Ø]Û‹Ù[‹ÛÜš×ÛÝ]Ø]Û‹Ù[‹ÛÜš×ØÛX\—Ø]ÛŠNˆÛÜš×ØÛÛ›ÛË˜YÚYÙ]
+ÚYÙ]
+BˆÛÜš×Ø˜\TQœ˜[YJ
+NÈÛÜš×Ø˜\‹œÙ]Øš™XÝ˜[YJ	Ü™]šY]ÔÝX˜˜\‰ÊNÈÛÜš×Ø˜\‹œÙ]^[Ý]
+ÛÜš×ØÛÛ›ÛÊNÈ˜YÚYÙ]
+ÛÜš×Ø˜\ŠBˆ™]šY]×ÝÛÛÏTQœ˜[YJ
+NÈÙ[‹œ™]šY]×ÝÛÛÏ\™]šY]×ÝÛÛÎÈ™]šY]×ÝÛÛËœÙ]Øš™XÝ˜[YJ	Ü™]šY]ÕÛÛ˜\‰ÊBˆ™]šY]×ÝÛÛ×Û^[Ý]TU›Þ^[Ý]
+™]šY]×ÝÛÛÊNÈ™]šY]×ÝÛÛ×Û^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ™]šY]×ÝÛÛ×Û^[Ý]œÙ]ÜXÚ[™ÊJBˆ™]šY]×ÝÛÛ×Û^[Ý]˜Y^[Ý]
+™]šY]×ÛÜ[ÛœÊNÈ™]šY]×ÝÛÛ×Û^[Ý]˜Y^[Ý]
+\™›Ü›X[˜ÙWÛÜ[ÛœÊNÈ˜YÚYÙ]
+™]šY]×ÝÛÛÊBˆÜ˜YÚYÙ]
+™]šY]ÊBˆ[œÜXÝÜ‹[œÜXÝÜ—ÛÝ]\\[™[
+
+NÈÙ[‹š[œÜXÝÜ—Ü[™[Z[œÜXÝÜŽÈ[œÜXÝÜ‹œÙ]Øš™XÝ˜[YJ	Ú[œÜXÝÜ”[™[	ÊNÈ[œÜXÝÜ‹œÙ]Z[š[][UÚY
+L
+NÈ[œÜXÝÜ‹œÙ]Z[š[][RZYÚ
+
+Bˆ[œÜXÝÜ—ÜØÜ›ÛTTØÜ›Û\™XJ
+NÈÙ[‹š[œÜXÝÜ—ÜØÜ›ÛZ[œÜXÝÜ—ÜØÜ›ÛÈ[œÜXÝÜ—ÜØÜ›ÛœÙ]ÚYÙ]™\Ú^˜X›JYJNÈ[œÜXÝÜ—ÜØÜ›ÛœÙ]Üš^›Û[ØÜ›Û˜\”ÛXÞJ]”ØÜ›Û˜\\Ó™YYY
+NÈ[œÜXÝÜ—ÜØÜ›ÛœÙ]™\XØ[ØÜ›Û˜\”ÛXÞJ]”ØÜ›Û˜\\Ó™YYY
+Bˆ[œÜXÝÜ—ØÛÛ[TUÚYÙ]
+
+NÈ[TU›Þ^[Ý]
+[œÜXÝÜ—ØÛÛ[
+NÈ[œÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ[œÙ]ÜXÚ[™Ê
+Bˆ[œÜXÝÜ—ÜØÜ›ÛœÙ]ÚYÙ]
+[œÜXÝÜ—ØÛÛ[
+NÈ[œÜXÝÜ—ÛÝ]\‹˜YÚYÙ]
+[œÜXÝÜ—ÜØÜ›Û
+Bˆ[œÜXÝÜ—ÚXY\TQœ˜[YJ
+NÈ[œÜXÝÜ—ÚXY\‹œÙ]Øš™XÝ˜[YJ	Ú[œÜXÝÜ’XY\‰ÊBˆ[œÜXÝÜ—ÚXY\—Û^[Ý]TU›Þ^[Ý]
+[œÜXÝÜ—ÚXY\ŠNÈ[œÜXÝÜ—ÚXY\—Û^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊLL
+NÈ[œÜXÝÜ—ÚXY\—Û^[Ý]œÙ]ÜXÚ[™ÊŠBˆ[œÜXÝÜ—ÚXY\—Û^[Ý]˜YÚYÙ]
+X™[
+	ÒS”ÔPÕÔ‰Ë	Ù^YXœ›ÝÉÊJBˆÙ[‹˜Û\Û˜[YO[X™[
+	ÒÙZ[ˆÛ\]\ÙÙ]ðé	Ë	Ü›Ú™XÝ]IÊNÈÙ[‹˜Û\Û˜[YKœÙ]ÛÜ™Ü˜\
+YJNÈ[œÜXÝÜ—ÚXY\—Û^[Ý]˜YÚYÙ]
+Ù[‹˜Û\Û˜[YJBˆ[˜YÚYÙ]
+[œÜXÝÜ—ÚXY\ŠB‚ˆÈÛÛ^XÝ[ÛœÈÙY\H[ÜÝÛÛ[[ÛˆÛ\Ü\˜][ÛœÈ™^ÈBˆÈÙ[XÝYØš™XÝˆH\›X[™[[Y[[™HÛÛ˜\ˆÝ^\ÈÛÛ\XÝÚ[BˆÈ\È›ÝÈÚ[™Ù\ÈÚ]HÝ\œ™[Ù[XÝ[Û‹‚ˆÙ[‹˜ÛÛ^ÝÛÛ˜\TQœ˜[YJ
+NÈÙ[‹˜ÛÛ^ÝÛÛ˜\‹œÙ]Øš™XÝ˜[YJ	ØÛÛ^ÛÛ˜\‰ÊBˆÛÛ^Û^[Ý]TR›Þ^[Ý]
+Ù[‹˜ÛÛ^ÝÛÛ˜\ŠNÈÛÛ^Û^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊKK
+NÈÛÛ^Û^[Ý]œÙ]ÜXÚ[™ÊŠBˆÙ[‹˜ÛÛ^ÜÜ]Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ø§ ‰Ë	Ð]\ÙÙ]ðé[ˆÛ\[HXœÜY[ÛÜˆZ[[ˆ0­ÈÉËÙ[‹œÜ]	ÙY]XÝ]	ËØš™XÝÛ˜[YOIØÛÛ^XÝ[Û‰ÊBˆÙ[‹˜ÛÛ^Ù\XØ]WØ]Û][Y[[™WÝÛÛØ]ÛŠ	ø©âIË	Ð]\ÝØZ\^šY\™[ˆ0­ÈÝ™ÊÑ	ËÙ[‹™\XØ]WÜÙ[XÝ[Û‹	ÙY]XÛÜIËØš™XÝÛ˜[YOIØÛÛ^XÝ[Û‰ÊBˆÙ[‹˜ÛÛ^Ü™\Ù]Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ø¡®‰Ë	Ðš[H[™Y™™ZÝZ[œÝ[[™Ù[ˆ\°ïÚÜÙ]™[‰ËÙ[‹œ™\Ù]Ý˜[œÙ›Ü›K	ÝšY]Ë\™Yœ™\Ú	ËØš™XÝÛ˜[YOIØÛÛ^XÝ[Û‰ÊBˆÙ[‹˜ÛÛ^Ù[]WØ]Û][Y[[™WÝÛÛØ]ÛŠ	ø£*ÉË	Ð]\ÝØZ[™\›™[ˆ0­È[‰ËÙ[‹œ™[[Ý™K	ÙY]Y[]IËØš™XÝÛ˜[YOIØÛÛ^XÝ[Û‰ÊBˆ›ÜˆXÝ[Ûˆ[ˆ
+Ù[‹˜ÛÛ^ÜÜ]Ø]Û‹Ù[‹˜ÛÛ^Ù\XØ]WØ]Û‹Ù[‹˜ÛÛ^Ü™\Ù]Ø]Û‹Ù[‹˜ÛÛ^Ù[]WØ]ÛŠNˆÛÛ^Û^[Ý]˜YÚYÙ]
+XÝ[ÛŠBˆÛÛ^Û^[Ý]˜YÝ™]Ú
+
+NÈ[˜YÚYÙ]
+Ù[‹˜ÛÛ^ÝÛÛ˜\ŠB‚ˆYˆ[œÜXÝÜ—ÜÙXÝ[ÛŠ]K^[™YUYKY˜[˜ÙYQ˜[ÙJN‚ˆÙXÝ[ÛTQœ˜[YJ
+NÈÙXÝ[Û‹œÙ]Øš™XÝ˜[YJ	Ú[œÜXÝÜ”ÙXÝ[Û‰ÊBˆÙXÝ[Û—Û^[Ý]TU›Þ^[Ý]
+ÙXÝ[ÛŠNÈÙXÝ[Û—Û^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈÙXÝ[Û—Û^[Ý]œÙ]ÜXÚ[™Ê
+BˆÙÙÛOTUÛÛ]ÛŠ
+NÈÙÙÛKœÙ]Øš™XÝ˜[YJ	Ú[œÜXÝÜ”ÙXÝ[Û’XY\‰ÊNÈÙÙÛKœÙ]^
+]JNÈÙÙÛKœÙ]ÚXÚØX›JYJNÈÙÙÛKœÙ]ÚXÚÙY
+^[™Y
+NÈÙÙÛKœÙ]\œ›ÝÕ\J]‘ÝÛ\œ›ÝÈYˆ^[™Y[ÙH]”šYÚ\œ›ÝÊNÈÙÙÛKœÙ]ÛÛ]Û”Ý[J]•ÛÛ]Û•^™\ÚYRXÛÛŠNÈÙÙÛKœÙ]Ú^™TÛXÞJTÚ^™TÛXÞK‘^[™[™ËTÚ^™TÛXÞK‘š^Y
+Bˆ›ÙOTQœ˜[YJ
+NÈ›ÙKœÙ]Øš™XÝ˜[YJ	Ú[œÜXÝÜ”ÙXÝ[Û›ÙIÊNÈ›ÙKœÙ]š\ÚX›J^[™Y
+Bˆ›ÙWÛ^[Ý]TU›Þ^[Ý]
+›ÙJNÈ›ÙWÛ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊLËLL
+NÈ›ÙWÛ^[Ý]œÙ]ÜXÚ[™ÊÊBˆÙÙÛKÙÙÛY˜ÛÛ›™XÝ
+[X™HÚXÚÙY›ÙOX›ÙKÙÙÛO]ÙÙÛNˆ
+›ÙKœÙ]š\ÚX›JÚXÚÙY
+KÙÙÛKœÙ]\œ›ÝÕ\J]‘ÝÛ\œ›ÝÈYˆÚXÚÙY[ÙH]”šYÚ\œ›ÝÊJJBˆÙXÝ[Û—Û^[Ý]˜YÚYÙ]
+ÙÙÛJNÈÙXÝ[Û—Û^[Ý]˜YÚYÙ]
+›ÙJNÈ[˜YÚYÙ]
+ÙXÝ[ÛŠBˆÙ[‹š[œÜXÝÜ—ÜÙXÝ[ÛœË˜\[™
+ÉÜÙXÝ[Û‰ÎœÙXÝ[Û‹	ØY˜[˜ÙY	Î˜Y˜[˜ÙY	ÝÙÙÛIÎÙÙÛK	Ø›ÙIÎ˜›Ù_JBˆ™]\›ˆ›ÙWÛ^[Ý]‚ˆÙ[‹œÜÚ][ÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹œÝ\TQÝX›TÜ[›Þ
+
+NÈÙ[‹™[™TQÝX›TÜ[›Þ
+
+Bˆ›ÜˆÜ[ˆ[ˆÜÙ[‹œÜÚ][Û‹Ù[‹œÝ\Ù[‹™[™NˆÜ[‹œÙ]˜[™ÙJ
+NÈÜ[‹œÙ]XÚ[X[ÊÊNÈÜ[‹œÙ]ÝY™š^
+	ÈÉÊNÈÜ[‹œÙ]Ú[™ÛTÝ\
+ŒJBˆÙ[‹˜XÚ×ØÛÛX›ÏTPÛÛX›Ð›Þ
+
+NÈÙ[‹›Û[YOTQÝX›TÜ[›Þ
+
+NÈÙ[‹›Û[YKœÙ]˜[™ÙJL
+NÈÙ[‹›Û[YKœÙ]XÚ[X[Ê
+NÈÙ[‹›Û[YKœÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜]Y[×Û›Ú\ÙWÜ™YXÝ[ÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜]Y[×Û›Ú\ÙWÜ™YXÝ[Û‹œÙ]˜[™ÙJÌ
+NÈÙ[‹˜]Y[×Û›Ú\ÙWÜ™YXÝ[Û‹œÙ]XÚ[X[ÊJNÈÙ[‹˜]Y[×Û›Ú\ÙWÜ™YXÝ[Û‹œÙ]Ú[™ÛTÝ\
+JNÈÙ[‹˜]Y[×Û›Ú\ÙWÜ™YXÝ[Û‹œÙ]ÝY™š^
+	È‰ÊBˆÙ[‹˜]Y[×Ù\WÛÝÏTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜]Y[×Ù\WÛZYTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜]Y[×Ù\WÚYÚTQÝX›TÜ[›Þ
+
+Bˆ›ÜˆÜ[ˆ[ˆ
+Ù[‹˜]Y[×Ù\WÛÝËÙ[‹˜]Y[×Ù\WÛZYÙ[‹˜]Y[×Ù\WÚYÚ
+NˆÜ[‹œÙ]˜[™ÙJLL‹LŠNÈÜ[‹œÙ]XÚ[X[ÊJNÈÜ[‹œÙ]Ú[™ÛTÝ\
+JNÈÜ[‹œÙ]ÝY™š^
+	È‰ÊBˆÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ù[˜X›YTPÚXÚÐ›Þ
+	ÒÛÛ\™\ÜÛÜˆZÝ]‰ÊBˆÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛœÙ]˜[™ÙJMŒ
+NÈÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛœÙ]XÚ[X[ÊJNÈÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛœÙ]Ú[™ÛTÝ\
+JNÈÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛœÙ]ÝY™š^
+	È‰ÊBˆÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ÏTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ËœÙ]˜[™ÙJKŒ
+NÈÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ËœÙ]XÚ[X[ÊJNÈÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ËœÙ]Ú[™ÛTÝ\
+JNÈÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ËœÙ]ÝY™š^
+	ðåÉÊBˆÙ[‹˜]Y[×ÙXÚÚ[™ÏTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜]Y[×ÙXÚÚ[™ËœÙ]˜[™ÙJL
+NÈÙ[‹˜]Y[×ÙXÚÚ[™ËœÙ]XÚ[X[Ê
+NÈÙ[‹˜]Y[×ÙXÚÚ[™ËœÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜]Y[×Ý›ÚXÙWÚ\ÛÛ][ÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‹œÙ]˜[™ÙJL
+NÈÙ[‹˜]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‹œÙ]XÚ[X[Ê
+NÈÙ[‹˜]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‹œÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‹œÙ]ÛÛ\
+	ÓÚØ[HÜ˜XÚ\ÛÛY\[™ÎˆX[ÙÈ\›ÜšX™[ˆ[™[\™Ü[™™Y^šY\™[‰ÊBˆÙ[‹˜]Y[×Û›Ü›X[^™OTPÚXÚÐ›Þ
+	ÓÝY™\ÜÈ›Ü›X[\ÚY\™[‰ÊBˆÙ[‹˜]Y[×Û›Ü›X[^™WÝ\™Ù]TQÝX›TÜ[›Þ
+
+NÈÙ[‹˜]Y[×Û›Ü›X[^™WÝ\™Ù]œÙ]˜[™ÙJLÌMJNÈÙ[‹˜]Y[×Û›Ü›X[^™WÝ\™Ù]œÙ]XÚ[X[ÊJNÈÙ[‹˜]Y[×Û›Ü›X[^™WÝ\™Ù]œÙ]Ú[™ÛTÝ\
+JNÈÙ[‹˜]Y[×Û›Ü›X[^™WÝ\™Ù]œÙ]ÝY™š^
+	ÈQ”ÉÊBˆÙ[‹˜]Y[×Û›Ü›X[^™WÝ\™Ù]œÙ]ÛÛ\
+	ÖšY[YÙ[°ïˆY\Ù[ˆÛ\ÈLMˆQ”È\ÝZ[ˆÝ]\ˆ[›Ý[™UÙ\‰ÊBˆÙ[‹˜]Y[×ØÚ[›™[Û[ÙOTPÛÛX›Ð›Þ
+
+BˆÚ[›™[Ý]\Ï^ÉÜÝ\™[ÉÎ‰ÔÝ\™[ÉË	Û[Û›ÉÎ‰Ó[Û›ÉË	ÛY	Î‰Ó[šÙ\ˆØ[˜[]YˆÝ\™[ÉË	ÜšYÚ	Î‰Ô™XÚ\ˆØ[˜[]YˆÝ\™[ÉßBˆ›Üˆ˜[YH[ˆUQS×ÐÒS“‘SÓSÑTÎˆÙ[‹˜]Y[×ØÚ[›™[Û[ÙK˜Y][JÚ[›™[Ý]\ÖÝ˜[YWK˜[YJBˆÙ[‹˜]Y[×Ü[TQÝX›TÜ[›Þ
+
+NÈÙ[‹˜]Y[×Ü[‹œÙ]˜[™ÙJLLL
+NÈÙ[‹˜]Y[×Ü[‹œÙ]XÚ[X[Ê
+NÈÙ[‹˜]Y[×Ü[‹œÙ]ÝY™š^
+	È	IÊBˆÙ[‹œÜYYTQÝX›TÜ[›Þ
+
+NÈÙ[‹œÜYYœÙ]˜[™ÙJŒK
+NÈÙ[‹œÜYYœÙ]XÚ[X[ÊŠNÈÙ[‹œÜYYœÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹œÜYYœÙ]ÝY™š^
+	ðåÉÊBˆÙ[‹™œ™Y^™WÙ[˜X›YTPÚXÚÐ›Þ
+	Ó]\Èš[[[‰ÊBˆÙ[‹™œ™Y^™WÙ\˜][ÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹™œ™Y^™WÙ\˜][Û‹œÙ]˜[™ÙJŒ
+NÈÙ[‹™œ™Y^™WÙ\˜][Û‹œÙ]XÚ[X[ÊŠNÈÙ[‹™œ™Y^™WÙ\˜][Û‹œÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹™œ™Y^™WÙ\˜][Û‹œÙ]ÝY™š^
+	ÈÉÊBˆÙ[‹œ™]™\œÙWØÛ\TPÚXÚÐ›Þ
+	Ô°ïÚÝðéÈXœÜY[[‰ÊBˆÙ[‹™˜YWÚ[TQÝX›TÜ[›Þ
+
+NÈÙ[‹™˜YWÚ[‹œÙ]˜[™ÙJŒ
+NÈÙ[‹™˜YWÚ[‹œÙ]XÚ[X[ÊŠNÈÙ[‹™˜YWÚ[‹œÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹™˜YWÚ[‹œÙ]ÝY™š^
+	ÈÉÊBˆÙ[‹™˜YWÛÝ]TQÝX›TÜ[›Þ
+
+NÈÙ[‹™˜YWÛÝ]œÙ]˜[™ÙJŒ
+NÈÙ[‹™˜YWÛÝ]œÙ]XÚ[X[ÊŠNÈÙ[‹™˜YWÛÝ]œÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹™˜YWÛÝ]œÙ]ÝY™š^
+	ÈÉÊBˆÙ[‹^Ý˜[YOTS[™QY]
+
+NÈÙ[‹^Ý˜[YKœÙ]XÙZÛ\•^
+	Õ^Z[™ÙX™[‰ÊBˆÙ[‹^ÜÚ^™OTTÜ[›Þ
+
+NÈÙ[‹^ÜÚ^™KœÙ]˜[™ÙJ
+NÈÙ[‹^ÜÚ^™KœÙ]˜[YJMŠNÈÙ[‹^ÜÚ^™KœÙ]ÝY™š^
+	È	ÊBˆÙ[‹^ØÛÛÜTS[™QY]
+	ÈÙ™™™™™‰ÊNÈÙ[‹^ØÛÛÜ‹œÙ]X^[™Ý
+ÊNÈÙ[‹^ØÛÛÜ‹œÙ]XÙZÛ\•^
+	ÈÙ™™™™™‰ÊBˆÙ[‹^Ü[]WØ]ÛTT\Ú]ÛŠ	Ô[]IÊNÈÙ[‹^Ü[]WØ]Û‹˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜ÚÛÜÙWÝ^ØÛÛÜŠBˆÙ[‹^Ù›ÛTQ›ÛÛÛX›Ð›Þ
+
+NÈÙ[‹^Ù›ÛœÙ]Ý\œ™[›Û
+Q›Û
+	ÑZ˜UHØ[œÉÊJBˆÙ[‹^Ù›ÛœÙ]ÛÛ\
+	ÔØÚšY˜[Z[YH°ïˆ[ˆ^Û\	ÊBˆÙ[‹^Ø›ÛTPÚXÚÐ›Þ
+	Ñ™]	ÊNÈÙ[‹^Ú][XÏTPÚXÚÐ›Þ
+	ÒÝ\œÚ]‰ÊBˆÙ[‹^ÛÝ][™WÝÚYTQÝX›TÜ[›Þ
+
+NÈÙ[‹^ÛÝ][™WÝÚYœÙ]˜[™ÙJŒ
+NÈÙ[‹^ÛÝ][™WÝÚYœÙ]XÚ[X[Ê
+NÈÙ[‹^ÛÝ][™WÝÚYœÙ]ÝY™š^
+	È	ÊBˆÙ[‹^ÛÝ][™WØÛÛÜTS[™QY]
+	ÈÌ	ÊNÈÙ[‹^ÛÝ][™WØÛÛÜ‹œÙ]X^[™Ý
+ÊNÈÙ[‹^ÛÝ][™WØÛÛÜ‹œÙ]XÙZÛ\•^
+	ÈÌ	ÊBˆÙ[‹^ÜÚYÝ×ÜÚ^™OTQÝX›TÜ[›Þ
+
+NÈÙ[‹^ÜÚYÝ×ÜÚ^™KœÙ]˜[™ÙJ
+NÈÙ[‹^ÜÚYÝ×ÜÚ^™KœÙ]XÚ[X[Ê
+NÈÙ[‹^ÜÚYÝ×ÜÚ^™KœÙ]ÝY™š^
+	È	ÊBˆÙ[‹^ÜÚYÝ×ØÛÛÜTS[™QY]
+	ÈÌ	ÊNÈÙ[‹^ÜÚYÝ×ØÛÛÜ‹œÙ]X^[™Ý
+ÊNÈÙ[‹^ÜÚYÝ×ØÛÛÜ‹œÙ]XÙZÛ\•^
+	ÈÌ	ÊBˆÙ[‹^Ø˜XÚÙÜ›Ý[™Ù[˜X›YTPÚXÚÐ›Þ
+	Ò[\™Ü[™[ž™ZYÙ[‰ÊNÈÙ[‹^Ø˜XÚÙÜ›Ý[™Ù[˜X›YœÙ]ÚXÚÙY
+YJBˆÙ[‹^Ø˜XÚÙÜ›Ý[™ØÛÛÜTS[™QY]
+	ÈÌ	ÊNÈÙ[‹^Ø˜XÚÙÜ›Ý[™ØÛÛÜ‹œÙ]X^[™Ý
+ÊNÈÙ[‹^Ø˜XÚÙÜ›Ý[™ØÛÛÜ‹œÙ]XÙZÛ\•^
+	ÈÌ	ÊBˆÙ[‹^Ø˜XÚÙÜ›Ý[™ÛÜXÚ]OTQÝX›TÜ[›Þ
+
+NÈÙ[‹^Ø˜XÚÙÜ›Ý[™ÛÜXÚ]KœÙ]˜[™ÙJL
+NÈÙ[‹^Ø˜XÚÙÜ›Ý[™ÛÜXÚ]KœÙ]XÚ[X[Ê
+NÈÙ[‹^Ø˜XÚÙÜ›Ý[™ÛÜXÚ]KœÙ]˜[YJÍJNÈÙ[‹^Ø˜XÚÙÜ›Ý[™ÛÜXÚ]KœÙ]ÝY™š^
+	È	IÊBˆÙ[‹^Ø˜XÚÙÜ›Ý[™ÜY[™ÏTTÜ[›Þ
+
+NÈÙ[‹^Ø˜XÚÙÜ›Ý[™ÜY[™ËœÙ]˜[™ÙJ
+NÈÙ[‹^Ø˜XÚÙÜ›Ý[™ÜY[™ËœÙ]˜[YJMŠNÈÙ[‹^Ø˜XÚÙÜ›Ý[™ÜY[™ËœÙ]ÝY™š^
+	È	ÊBˆÙ[‹^Ø[š[X][ÛTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ]K˜[YH[ˆÊ	ÒÙZ[™IË	Û›Û™IÊK
+	ÑZ[‹KÐ]\Ø›[™[‰Ë	Ù˜YIÊK
+	Õ›Ûˆ[šÜÉË	ÜÛYWÛY	ÊK
+	Õ›Ûˆ™XÚÉË	ÜÛYWÜšYÚ	ÊK
+	Õ›ÛˆØ™[‰Ë	ÜÛYWÝ\	ÊK
+	Õ›Ûˆ[[‰Ë	ÜÛYWÙÝÛ‰ÊWNˆÙ[‹^Ø[š[X][Û‹˜Y][J]K˜[YJBˆÙ[‹^Ø[š[X][Û—Ù\˜][ÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹^Ø[š[X][Û—Ù\˜][Û‹œÙ]˜[™ÙJŒKL
+NÈÙ[‹^Ø[š[X][Û—Ù\˜][Û‹œÙ]XÚ[X[ÊŠNÈÙ[‹^Ø[š[X][Û—Ù\˜][Û‹œÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹^Ø[š[X][Û—Ù\˜][Û‹œÙ]ÝY™š^
+	ÈÉÊBˆÙ[‹^ÜÝ[WÜ™\Ù]TPÛÛX›Ð›Þ
+
+Bˆ›Üˆ]K˜[YH[ˆÊ	Õ][	Ë	Ý]IÊK
+	Õ[\][	Ë	ÜÝX]IÊK
+	ÓÝÙ\ˆ\™	Ë	ÛÝÙ\—Ý\™	ÊWNˆÙ[‹^ÜÝ[WÜ™\Ù]˜Y][J]K˜[YJBˆÙ[‹^ÜÝ[WØ\WØ]ÛX]ÛŠ	ÔÝ[[Ù[™[‰ËÙ[‹˜\WÝ^ÜÝ[WÜ™\Ù]
+BˆÙ[‹^ÞTQÝX›TÜ[›Þ
+
+NÈÙ[‹^ÞœÙ]˜[™ÙJL
+NÈÙ[‹^ÞœÙ]XÚ[X[ÊJNÈÙ[‹^ÞœÙ]ÝY™š^
+	È	IÊBˆÙ[‹^ÞOTQÝX›TÜ[›Þ
+
+NÈÙ[‹^ÞKœÙ]˜[™ÙJL
+NÈÙ[‹^ÞKœÙ]XÚ[X[ÊJNÈÙ[‹^ÞKœÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜[œÙ›Ü›WÜØØ[OTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜[œÙ›Ü›WÜØØ[KœÙ]˜[™ÙJŒK
+NÈÙ[‹˜[œÙ›Ü›WÜØØ[KœÙ]XÚ[X[ÊŠNÈÙ[‹˜[œÙ›Ü›WÜØØ[KœÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹˜[œÙ›Ü›WÜØØ[KœÙ]ÝY™š^
+	ðåÉÊBˆÙ[‹˜[œÙ›Ü›WÞTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜[œÙ›Ü›WÞœÙ]˜[™ÙJL
+NÈÙ[‹˜[œÙ›Ü›WÞœÙ]XÚ[X[ÊJNÈÙ[‹˜[œÙ›Ü›WÞœÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜[œÙ›Ü›WÞOTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜[œÙ›Ü›WÞKœÙ]˜[™ÙJL
+NÈÙ[‹˜[œÙ›Ü›WÞKœÙ]XÚ[X[ÊJNÈÙ[‹˜[œÙ›Ü›WÞKœÙ]ÝY™š^
+	È	IÊBˆÙ[‹œ›Ý][ÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹œ›Ý][Û‹œÙ]˜[™ÙJLÍŒÍŒ
+NÈÙ[‹œ›Ý][Û‹œÙ]XÚ[X[ÊJNÈÙ[‹œ›Ý][Û‹œÙ]Ú[™ÛTÝ\
+JNÈÙ[‹œ›Ý][Û‹œÙ]ÝY™š^
+	ð¬	ÊBˆÙ[‹˜Ü›ÜÛYTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜Ü›ÜÝÜTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜Ü›ÜÜšYÚTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜Ü›ÜØ›ÝÛOTQÝX›TÜ[›Þ
+
+Bˆ›ÜˆÜ[ˆ[ˆ
+Ù[‹˜Ü›ÜÛYÙ[‹˜Ü›ÜÝÜÙ[‹˜Ü›ÜÜšYÚÙ[‹˜Ü›ÜØ›ÝÛJN‚ˆÜ[‹œÙ]˜[™ÙJMJNÈÜ[‹œÙ]XÚ[X[ÊJNÈÜ[‹œÙ]Ú[™ÛTÝ\
+JNÈÜ[‹œÙ]ÝY™š^
+	È	IÊBˆÙ[‹™›\ÚÜš^›Û[TPÚXÚÐ›Þ
+	ÒÜš^›Û[	ÊNÈÙ[‹™›\Ý™\XØ[TPÚXÚÐ›Þ
+	Õ™\ZØ[	ÊBˆÙ[‹˜œšYÚ™\ÜÏTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜œšYÚ™\ÜËœÙ]˜[™ÙJLKJNÈÙ[‹˜œšYÚ™\ÜËœÙ]XÚ[X[ÊŠNÈÙ[‹˜œšYÚ™\ÜËœÙ]Ú[™ÛTÝ\
+ŒJBˆÙ[‹˜ÛÛ˜\ÝTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜ÛÛ˜\ÝœÙ]˜[™ÙJÊNÈÙ[‹˜ÛÛ˜\ÝœÙ]XÚ[X[ÊŠNÈÙ[‹˜ÛÛ˜\ÝœÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹˜ÛÛ˜\ÝœÙ]ÝY™š^
+	ðåÉÊBˆÙ[‹œØ]\˜][ÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹œØ]\˜][Û‹œÙ]˜[™ÙJÊNÈÙ[‹œØ]\˜][Û‹œÙ]XÚ[X[ÊŠNÈÙ[‹œØ]\˜][Û‹œÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹œØ]\˜][Û‹œÙ]ÝY™š^
+	ðåÉÊBˆÙ[‹˜ÛÛÜ—Ù^ÜÝ\™OTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜ÛÛÜ—Ù^ÜÝ\™KœÙ]˜[™ÙJLËÊNÈÙ[‹˜ÛÛÜ—Ù^ÜÝ\™KœÙ]XÚ[X[ÊŠNÈÙ[‹˜ÛÛÜ—Ù^ÜÝ\™KœÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹˜ÛÛÜ—Ù^ÜÝ\™KœÙ]ÝY™š^
+	ÈU‰ÊBˆÙ[‹˜ÛÛÜ—Ý[\\˜]\™OTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜ÛÛÜ—Ý[\\˜]\™KœÙ]˜[™ÙJLLL
+NÈÙ[‹˜ÛÛÜ—Ý[\\˜]\™KœÙ]XÚ[X[Ê
+NÈÙ[‹˜ÛÛÜ—Ý[\\˜]\™KœÙ]Ú[™ÛTÝ\
+JNÈÙ[‹˜ÛÛÜ—Ý[\\˜]\™KœÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜ÛÛÜ—Ý[TQÝX›TÜ[›Þ
+
+NÈÙ[‹˜ÛÛÜ—Ý[œÙ]˜[™ÙJLLL
+NÈÙ[‹˜ÛÛÜ—Ý[œÙ]XÚ[X[Ê
+NÈÙ[‹˜ÛÛÜ—Ý[œÙ]Ú[™ÛTÝ\
+JNÈÙ[‹˜ÛÛÜ—Ý[œÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜ÛÛÜ—ÝšXœ˜[˜ÙOTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜ÛÛÜ—ÝšXœ˜[˜ÙKœÙ]˜[™ÙJLLL
+NÈÙ[‹˜ÛÛÜ—ÝšXœ˜[˜ÙKœÙ]XÚ[X[Ê
+NÈÙ[‹˜ÛÛÜ—ÝšXœ˜[˜ÙKœÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜ÛÛÜ—ÝÚY[ÜÜ[œÏ^ßBˆ›ÜˆÚY[[ˆ
+	ÛY	Ë	ÙØ[[XIË	ÙØZ[‰ÊN‚ˆ›ÜˆÚ[›™[[ˆ
+	Ü‰Ë	ÙÉË	Ø‰ÊN‚ˆÜ[TQÝX›TÜ[›Þ
+
+NÈÜ[‹œÙ]˜[™ÙJLLL
+NÈÜ[‹œÙ]XÚ[X[Ê
+NÈÜ[‹œÙ]Ú[™ÛTÝ\
+JNÈÜ[‹œÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜ÛÛÜ—ÝÚY[ÜÜ[œÖÙ‰ØÛÛÜ—ÞÝÚY[WÞØÚ[›™[I×O\Ü[‚ˆÙ]]ŠÙ[‹‰ØÛÛÜ—ÞÝÚY[WÞØÚ[›™[IËÜ[ŠBˆÙ[‹™š[\—Ü™\Ù]TPÛÛX›Ð›Þ
+
+Bˆ›Üˆ]K˜[YH[ˆÊ	ÒÙZ[ˆš[\‰Ë	Û›Û™IÊK
+	Õš]šY	Ë	Ýš]šY	ÊK
+	ÕØ\›IË	ÝØ\›IÊK
+	ÐÛÛÛ	Ë	ØÛÛÛ	ÊK
+	ÐÚ[™[X]XÉË	ØÚ[™[X]XÉÊK
+	Õš[YÙIË	Ýš[YÙIÊK
+	Ó›Ú\‰Ë	Û›Ú\‰ÊWNˆÙ[‹™š[\—Ü™\Ù]˜Y][J]K˜[YJBˆÙ[‹›]Ü]TS[™QY]
+
+NÈÙ[‹›]Ü]œÙ]XÙZÛ\•^
+	ÓÜ[Û˜[ˆ˜ÝX™HÈŒÙU	ÊBˆÙ[‹›]Øœ›ÝÜÙWØ]ÛTT\Ú]ÛŠ	ÓU8 )‰ÊNÈÙ[‹›]Øœ›ÝÜÙWØ]Û‹˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜ÚÛÜÙWÛ]
+BˆÙ[‹›ÜXÚ]OTQÝX›TÜ[›Þ
+
+NÈÙ[‹›ÜXÚ]KœÙ]˜[™ÙJL
+NÈÙ[‹›ÜXÚ]KœÙ]XÚ[X[Ê
+NÈÙ[‹›ÜXÚ]KœÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜›\TQÝX›TÜ[›Þ
+
+NÈÙ[‹˜›\‹œÙ]˜[™ÙJŒ
+NÈÙ[‹˜›\‹œÙ]XÚ[X[ÊJNÈÙ[‹˜›\‹œÙ]Ú[™ÛTÝ\
+JNÈÙ[‹˜›\‹œÙ]ÝY™š^
+	È3àÉÊBˆÙ[‹œÚ\œ[TQÝX›TÜ[›Þ
+
+NÈÙ[‹œÚ\œ[‹œÙ]˜[™ÙJJNÈÙ[‹œÚ\œ[‹œÙ]XÚ[X[ÊJNÈÙ[‹œÚ\œ[‹œÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹œÚ\œ[‹œÙ]ÝY™š^
+	ðåÉÊBˆÙ[‹™Y™™XÝÜ™\Ù]TPÛÛX›Ð›Þ
+
+Bˆ›Üˆ]K˜[YH[ˆÊ	ÐÛX[ˆÈX[Y[	Ë	ØÛX[‰ÊK
+	ÐÚ[™[X]XÉË	ØÚ[™[X]XÉÊK
+	Ñ™X[IË	Ù™X[IÊK
+	Ó›Ú\‰Ë	Û›Ú\‰ÊK
+	Õš]šY	Ë	Ýš]šY	ÊK
+	ÔÛÙ›ØÝ\ÉË	ÜÛÙÙ›ØÝ\ÉÊWN‚ˆÙ[‹™Y™™XÝÜ™\Ù]˜Y][J]K˜[YJBˆÙ[‹™Y™™XÝÜ™\Ù]Ø\WØ]ÛX]ÛŠ	Ô™\Ù][Ù[™[‰ËÙ[‹˜\WÙY™™XÝÜ™\Ù]
+BˆÙ[‹œÝXš[^˜][ÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹œÝXš[^˜][Û‹œÙ]˜[™ÙJL
+NÈÙ[‹œÝXš[^˜][Û‹œÙ]XÚ[X[Ê
+NÈÙ[‹œÝXš[^˜][Û‹œÙ]ÝY™š^
+	È	IÊBˆÙ[‹œÝXš[^˜][Û‹œÙ]ÛÛ\
+	ÓÚØ[H\ÚZÙKTÝXš[\ÚY\[™Ëˆ0íš\™HÙ\HÝXÚ[ˆÝ0éšÙ\‹ðí››™[ˆX™\ˆš[˜[™™\°é™\›‹‰ÊBˆÙ[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý˜[Ù[˜X›YTPÚXÚÐ›Þ
+	Ñœ™Z\Ý[[™È™\Ù[™[‰ÊBˆÙ[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý™WØ]ÛX]ÛŠ	Ò[\™Ü[™[™\›™[‰ËÙ[‹œÝ\Ø˜XÚÙÜ›Ý[™Ü™[[Ý˜[
+BˆÙ[‹˜˜XÚÙÜ›Ý[™ØÛX\—Ø]ÛX]ÛŠ	Ñœ™Z\Ý[[™È\°ïÚÜÙ]™[‰ËÙ[‹˜ÛX\—Ø˜XÚÙÜ›Ý[™Ü™[[Ý˜[
+BˆÙ[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý™WÜÝ]\Ï[X™[
+	Ó›ØÚÙZ[™Hœ™Z\Ý[[™È\ž™]YÝ‰Ë	Û]]Y	ÊNÈÙ[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý™WÜÝ]\ËœÙ]ÛÜ™Ü˜\
+YJBˆÙ[‹˜XÚ×Û[Ý[Û—Ø]ÛX]ÛŠ	Ó[Ý[Û‹U˜XÚÚ[™ÈÝ\[‰ËÙ[‹œÝ\Û[Ý[Û—Ý˜XÚÚ[™ÊBˆÙ[‹›X\Ú×Ý˜XÚ×Ø]ÛX]ÛŠ	Ð™^šY\‹SX\ÚÙH™\™›ÛÙ[‰ËÙ[‹œÝ\ÛX\Ú×Ý˜XÚÚ[™ÊBˆÙ[‹˜ÛX\—Ý˜XÚÚ[™×Ø]ÛX]ÛŠ	Õ˜XÚÚ[™È0íœØÚ[‰ËÙ[‹˜ÛX\—Û[Ý[Û—Ý˜XÚÚ[™ÊBˆÙ[‹˜XÚÚ[™×ÜÝ]\Ï[X™[
+	ÒÙZ[ˆ˜XÚÚ[™È›Üš[™[‹‰Ë	Û]]Y	ÊNÈÙ[‹˜XÚÚ[™×ÜÝ]\ËœÙ]ÛÜ™Ü˜\
+YJBˆÙ[‹˜]]×Ü™Yœ˜[YWÙ[˜X›YTPÚXÚÐ›Þ
+	Ð]]ËT™Yœ˜[YH™\Ù[™[‰ÊBˆÙ[‹˜]]×Ü™Yœ˜[YWÙ›Ü›X]TPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YH[ˆUU×Ô‘Q”SQWÑ“Ô“PUÎ‚ˆÙ[‹˜]]×Ü™Yœ˜[YWÙ›Ü›X]˜Y][JUU×Ô‘Q”SQWÑ“Ô“PUÓP‘SÖÝ˜[YWK˜[YJBˆÙ[‹˜]]×Ü™Yœ˜[YWØ]ÛX]ÛŠ	Ð]]ËT™Yœ˜[YH[˜[\ÚY\™[‰ËÙ[‹œÝ\Ø]]×Ü™Yœ˜[YJBˆÙ[‹˜]]×Ü™Yœ˜[YWØÛX\—Ø]ÛX]ÛŠ	Ô™Yœ˜[YH0íœØÚ[‰ËÙ[‹˜ÛX\—Ø]]×Ü™Yœ˜[YJBˆÙ[‹˜]]×Ü™Yœ˜[YWÜÝ]\Ï[X™[
+	Ó›ØÚÙZ[™H]]ËT™Yœ˜[YKP[˜[\ÙK‰Ë	Û]]Y	ÊNÈÙ[‹˜]]×Ü™Yœ˜[YWÜÝ]\ËœÙ]ÛÜ™Ü˜\
+YJBˆÙ[‹›Øš™XÝÜ™[[Ý˜[Ù[˜X›YTPÚXÚÐ›Þ
+	ÓØš™ZÝ[H™\™ZXÚ[™\›™[‰ÊBˆÙ[‹˜Ú›ÛXWÚÙ^WÙ[˜X›YTPÚXÚÐ›Þ
+	ÑÜ™Y[œØÜ™Y[ˆZÝ]‰ÊBˆÙ[‹˜Ú›ÛXWÚÙ^WØÛÛÜTS[™QY]
+	ÈÌ™Œ	ÊNÈÙ[‹˜Ú›ÛXWÚÙ^WØÛÛÜ‹œÙ]X^[™Ý
+ÊNÈÙ[‹˜Ú›ÛXWÚÙ^WØÛÛÜ‹œÙ]XÙZÛ\•^
+	ÈÌ™Œ	ÊBˆÙ[‹˜Ú›ÛXWÚÙ^WÜÚ[Z[\š]OTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜Ú›ÛXWÚÙ^WÜÚ[Z[\š]KœÙ]˜[™ÙJL
+NÈÙ[‹˜Ú›ÛXWÚÙ^WÜÚ[Z[\š]KœÙ]XÚ[X[Ê
+NÈÙ[‹˜Ú›ÛXWÚÙ^WÜÚ[Z[\š]KœÙ]ÝY™š^
+	È	IÊBˆÙ[‹˜Ú›ÛXWÚÙ^WØ›[™TQÝX›TÜ[›Þ
+
+NÈÙ[‹˜Ú›ÛXWÚÙ^WØ›[™œÙ]˜[™ÙJL
+NÈÙ[‹˜Ú›ÛXWÚÙ^WØ›[™œÙ]XÚ[X[Ê
+NÈÙ[‹˜Ú›ÛXWÚÙ^WØ›[™œÙ]ÝY™š^
+	È	IÊBˆÙ[‹›X\Ú×Ý\OTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ]K˜[YH[ˆÊ	ÒÙZ[™HX\ÚÙIË	Û›Û™IÊK
+	Ô™XÚXÚÉË	Ü™XÝ[™ÛIÊK
+	Ñ[\ÙIË	Ù[\ÙIÊK
+	Ð™^šY\ˆÈœ™ZY›Ü›IË	Ø™^šY\‰ÊWNˆÙ[‹›X\Ú×Ý\K˜Y][J]K˜[YJBˆÙ[‹›X\Ú×Ý\K˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+Ù[‹›X\Ú×Ý\WØÚ[™ÙY
+BˆÙ[‹›X\Ú×ÞTQÝX›TÜ[›Þ
+
+NÈÙ[‹›X\Ú×ÞOTQÝX›TÜ[›Þ
+
+NÈÙ[‹›X\Ú×ÝÚYTQÝX›TÜ[›Þ
+
+NÈÙ[‹›X\Ú×ÚZYÚTQÝX›TÜ[›Þ
+
+NÈÙ[‹›X\Ú×Ù™X]\TQÝX›TÜ[›Þ
+
+Bˆ›ÜˆÜ[ˆ[ˆ
+Ù[‹›X\Ú×ÞÙ[‹›X\Ú×ÞKÙ[‹›X\Ú×ÝÚYÙ[‹›X\Ú×ÚZYÚÙ[‹›X\Ú×Ù™X]\ŠNˆÜ[‹œÙ]˜[™ÙJL
+NÈÜ[‹œÙ]XÚ[X[ÊJNÈÜ[‹œÙ]ÝY™š^
+	È	IÊBˆÙ[‹›X\Ú×ÝÚYœÙ]˜[YJL
+NÈÙ[‹›X\Ú×ÚZYÚœÙ]˜[YJL
+BˆÙ[‹›X\Ú×ÜÚ[ÏTS[™QY]
+
+NÈÙ[‹›X\Ú×ÜÚ[ËœÙ]XÙZÛ\•^
+	ÌLLÈLLÈLLÈLL	ÊBˆÙ[‹›X\Ú×ÜÚ[ËœÙ]ÛÛ\
+	Ð™^šY\‹P[šÙ\ˆ[È›Þ™[Ù\HZ[™ÙX™[ŽˆNÈNÈ8 )‰ÊBˆÙ[‹›X\Ú×ÜÚ[×Ø\OX]ÛŠ	Ô[šÝH0ï™\›™ZY[‰ËÙ[‹˜\WÛX\Ú×ÜÚ[ÊBˆÙ[‹›X\Ú×Ü]Ý[YOTQÝX›TÜ[›Þ
+
+NÈÙ[‹›X\Ú×Ü]Ý[YKœÙ]˜[™ÙJ
+NÈÙ[‹›X\Ú×Ü]Ý[YKœÙ]XÚ[X[ÊŠNÈÙ[‹›X\Ú×Ü]Ý[YKœÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹›X\Ú×Ü]Ý[YKœÙ]ÝY™š^
+	ÈÉÊBˆÙ[‹›X\Ú×Ü]Û\ÝTS\ÝÚYÙ]
+
+NÈÙ[‹›X\Ú×Ü]Û\ÝœÙ]X^[][RZYÚ
+Í
+NÈÙ[‹›X\Ú×Ü]Û\ÝœÙ]Z[š[][RZYÚ
+ÍŠBˆÙ[‹›X\Ú×Ü]ÜÙ]Ø]ÛX]ÛŠ	Ô›ÝÜÚÛÜYKT[šÝÙ]™[‰ËÙ[‹œÙ]ÛX\Ú×Ü]ÚÙ^Yœ˜[YJBˆÙ[‹›X\Ú×Ü]Ü™[[Ý™WØ]ÛX]ÛŠ	Ô›ÝÜÚÛÜYKT[šÝ0íœØÚ[‰ËÙ[‹œ™[[Ý™WÛX\Ú×Ü]ÚÙ^Yœ˜[YJBˆÙ[‹›X\Ú×Ü]Û\Ý˜Ý\œ™[›ÝÐÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹›X\Ú×Ü]ÜÙ[XÝY
+BˆÙ[‹˜[œÚ][Û—Ý\OTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ]K˜[YH[ˆÊ	ÒÙZ[ˆ0ç™\™Ø[™ÉË	Û›Û™IÊK
+	ðç™\˜›[™[‰Ë	Ù\ÜÛÛ™IÊK
+	ÔÛYH[šÜÉË	ÜÛYWÛY	ÊK
+	ÔÛYH™XÚÉË	ÜÛYWÜšYÚ	ÊK
+	ÔÛYHØ™[‰Ë	ÜÛYWÝ\	ÊK
+	ÔÛYH[[‰Ë	ÜÛYWÙÝÛ‰ÊK
+	ÕÚ\H[šÜÉË	ÝÚ\WÛY	ÊK
+	ÕÚ\H™XÚÉË	ÝÚ\WÜšYÚ	ÊK
+	ÕÚ\HØ™[‰Ë	ÝÚ\WÝ\	ÊK
+	ÕÚ\H[[‰Ë	ÝÚ\WÙÝÛ‰ÊK
+	Ö›ÛÛIË	Þ›ÛÛIÊK
+	Ñ\È›XÚÉË	Ù\Ý×Ø›XÚÉÊK
+	Ñ˜YHÈÚ]IË	Ù˜YWÝÚ]IÊK
+	Ð›\ˆ[‰Ë	Ø›\—Ú[‰ÊK
+	ÐÚ\˜ÛHÜ[‰Ë	ØÚ\˜ÛWÛÜ[‰ÊK
+	ÐÚ\˜ÛHÛÜÙIË	ØÚ\˜ÛWØÛÜÙIÊK
+	Ô˜YX[	Ë	Ü˜YX[	ÊK
+	Ô^[^™IË	Ü^[^™IÊK
+	ÔÛ[ÛÝ[šÜÉË	ÜÛ[ÛÝÛY	ÊK
+	ÔÛ[ÛÝ™XÚÉË	ÜÛ[ÛÝÜšYÚ	ÊK
+	ÔÛ[ÛÝØ™[‰Ë	ÜÛ[ÛÝÝ\	ÊK
+	ÔÛ[ÛÝ[[‰Ë	ÜÛ[ÛÝÙÝÛ‰ÊK
+	ÐÛÝ™\ˆ[šÜÉË	ØÛÝ™\—ÛY	ÊK
+	ÐÛÝ™\ˆ™XÚÉË	ØÛÝ™\—ÜšYÚ	ÊK
+	ÐÛÝ™\ˆØ™[‰Ë	ØÛÝ™\—Ý\	ÊK
+	ÐÛÝ™\ˆ[[‰Ë	ØÛÝ™\—ÙÝÛ‰ÊWNˆÙ[‹˜[œÚ][Û—Ý\K˜Y][J]K˜[YJBˆÙ[‹˜[œÚ][Û—Ù\˜][ÛTQÝX›TÜ[›Þ
+
+NÈÙ[‹˜[œÚ][Û—Ù\˜][Û‹œÙ]˜[™ÙJÌ
+NÈÙ[‹˜[œÚ][Û—Ù\˜][Û‹œÙ]XÚ[X[ÊŠNÈÙ[‹˜[œÚ][Û—Ù\˜][Û‹œÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹˜[œÚ][Û—Ù\˜][Û‹œÙ]ÝY™š^
+	ÈÉÊBˆÙ[‹šÙ^Yœ˜[YWÝ[YOTQÝX›TÜ[›Þ
+
+NÈÙ[‹šÙ^Yœ˜[YWÝ[YKœÙ]˜[™ÙJ
+NÈÙ[‹šÙ^Yœ˜[YWÝ[YKœÙ]XÚ[X[ÊŠNÈÙ[‹šÙ^Yœ˜[YWÝ[YKœÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹šÙ^Yœ˜[YWÝ[YKœÙ]ÝY™š^
+	ÈÉÊBˆÙ[‹šÙ^Yœ˜[YWØÝ\™OTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YH[ˆÑVQ”SQWÐÕT•‘TÎˆÙ[‹šÙ^Yœ˜[YWØÝ\™K˜Y][JÑVQ”SQWÐÕT•‘WÓP‘SÖÝ˜[YWK˜[YJBˆÙ[‹šÙ^Yœ˜[YWÛ\ÝTS\ÝÚYÙ]
+
+NÈÙ[‹šÙ^Yœ˜[YWÛ\ÝœÙ]Øš™XÝ˜[YJ	ÚÙ^Yœ˜[YS\Ý	ÊNÈÙ[‹šÙ^Yœ˜[YWÛ\ÝœÙ]X^[][RZYÚ
+MŠNÈÙ[‹šÙ^Yœ˜[YWÛ\ÝœÙ]Z[š[][RZYÚ
+ŠBˆÙ[‹šÙ^Yœ˜[YWÜÙ]Ø]ÛX]ÛŠ	ÒÙ^Yœ˜[YHÙ]™[ˆÈZÝX[\ÚY\™[‰ËÙ[‹œÙ]ÚÙ^Yœ˜[YJBˆÙ[‹šÙ^Yœ˜[YWÜ™[[Ý™WØ]ÛX]ÛŠ	ÒÙ^Yœ˜[YH0íœØÚ[‰ËÙ[‹œ™[[Ý™WÚÙ^Yœ˜[YJBˆÙ[‹šÙ^Yœ˜[YWÛ\Ý˜Ý\œ™[›ÝÐÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹šÙ^Yœ˜[YWÜÙ[XÝY
+BˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\Ü›Ü\OTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ]K˜[YH[ˆÊ	Ö›ÛÛIË	ÜØØ[IÊK
+	Ðš[	Ë	Þ	ÊK
+	Ðš[IË	ÞIÊK
+	Ô›Ý][Û‰Ë	Ü›Ý][Û‰ÊK
+	ÑXÚÚÜ˜Y	Ë	ÛÜXÚ]IÊK
+	Õ[œØÚ0é™™IË	Ø›\‰ÊWN‚ˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\Ü›Ü\K˜Y][J]K˜[YJBˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\RÙ^Yœ˜[YQÜ˜\ÚYÙ]
+
+BˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\Ü›Ü\K˜Ý\œ™[[™^Ú[™ÙY˜ÛÛ›™XÝ
+[X™H
+—ÎˆÙ[‹œ™Yœ™\ÚÚÙ^Yœ˜[YWÙÜ˜\
+Ù[‹˜Ý\œ™[ØÛ\
+
+JJBˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\œÚ[Û[Ý™Y˜ÛÛ›™XÝ
+Ù[‹™Ü˜\ÚÙ^Yœ˜[YWÛ[Ý™Y
+BˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\œÚ[ØYY˜ÛÛ›™XÝ
+Ù[‹™Ü˜\ÚÙ^Yœ˜[YWØYY
+BˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\œÚ[ÜÙ[XÝY˜ÛÛ›™XÝ
+Ù[‹™Ü˜\ÚÙ^Yœ˜[YWÜÙ[XÝY
+BˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\™˜Y×ÜÝ\Y˜ÛÛ›™XÝ
+Ù[‹™Ü˜\ÚÙ^Yœ˜[YWÙ˜Y×ÜÝ\Y
+BˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\™˜Y×Ùš[š\ÚY˜ÛÛ›™XÝ
+Ù[‹™Ü˜\ÚÙ^Yœ˜[YWÙ˜Y×Ùš[š\ÚY
+BˆÙ[‹›Û[YWÚÙ^Yœ˜[YWÝ[YOTQÝX›TÜ[›Þ
+
+NÈÙ[‹›Û[YWÚÙ^Yœ˜[YWÝ[YKœÙ]˜[™ÙJ
+NÈÙ[‹›Û[YWÚÙ^Yœ˜[YWÝ[YKœÙ]XÚ[X[ÊŠNÈÙ[‹›Û[YWÚÙ^Yœ˜[YWÝ[YKœÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹›Û[YWÚÙ^Yœ˜[YWÝ[YKœÙ]ÝY™š^
+	ÈÉÊBˆÙ[‹›Û[YWÚÙ^Yœ˜[YWØÝ\™OTPÛÛX›Ð›Þ
+
+Bˆ›Üˆ˜[YH[ˆÑVQ”SQWÐÕT•‘TÎˆÙ[‹›Û[YWÚÙ^Yœ˜[YWØÝ\™K˜Y][JÑVQ”SQWÐÕT•‘WÓP‘SÖÝ˜[YWK˜[YJBˆÙ[‹›Û[YWÚÙ^Yœ˜[YWÛ\ÝTS\ÝÚYÙ]
+
+NÈÙ[‹›Û[YWÚÙ^Yœ˜[YWÛ\ÝœÙ]X^[][RZYÚ
+MŠNÈÙ[‹›Û[YWÚÙ^Yœ˜[YWÛ\ÝœÙ]Z[š[][RZYÚ
+ŠBˆÙ[‹›Û[YWÚÙ^Yœ˜[YWÜÙ]Ø]ÛX]ÛŠ	Ó]]Ý0éšÙHÙ]™[ˆÈZÝX[\ÚY\™[‰ËÙ[‹œÙ]Ý›Û[YWÚÙ^Yœ˜[YJBˆÙ[‹›Û[YWÚÙ^Yœ˜[YWÜ™[[Ý™WØ]ÛX]ÛŠ	Ó]]Ý0éšÙKRÙ^Yœ˜[YH0íœØÚ[‰ËÙ[‹œ™[[Ý™WÝ›Û[YWÚÙ^Yœ˜[YJBˆÙ[‹›Û[YWÚÙ^Yœ˜[YWÛ\Ý˜Ý\œ™[›ÝÐÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹›Û[YWÚÙ^Yœ˜[YWÜÙ[XÝY
+BˆÙ[‹œÜYYÜ˜[\Ý[YOTQÝX›TÜ[›Þ
+
+NÈÙ[‹œÜYYÜ˜[\Ý[YKœÙ]˜[™ÙJ
+NÈÙ[‹œÜYYÜ˜[\Ý[YKœÙ]XÚ[X[ÊŠNÈÙ[‹œÜYYÜ˜[\Ý[YKœÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹œÜYYÜ˜[\Ý[YKœÙ]ÝY™š^
+	ÈÉÊBˆÙ[‹œÜYYÜ˜[\Ý˜[YOTQÝX›TÜ[›Þ
+
+NÈÙ[‹œÜYYÜ˜[\Ý˜[YKœÙ]˜[™ÙJŒK
+NÈÙ[‹œÜYYÜ˜[\Ý˜[YKœÙ]XÚ[X[ÊŠNÈÙ[‹œÜYYÜ˜[\Ý˜[YKœÙ]Ú[™ÛTÝ\
+ŒJNÈÙ[‹œÜYYÜ˜[\Ý˜[YKœÙ]ÝY™š^
+	ðåÉÊBˆÙ[‹œÜYYÜ˜[\Û\ÝTS\ÝÚYÙ]
+
+NÈÙ[‹œÜYYÜ˜[\Û\ÝœÙ]X^[][RZYÚ
+MŠNÈÙ[‹œÜYYÜ˜[\Û\ÝœÙ]Z[š[][RZYÚ
+ŠBˆÙ[‹œÜYYÜ˜[\ÜÙ]Ø]ÛX]ÛŠ	ÔÜYYT[šÝÙ]™[ˆÈZÝX[\ÚY\™[‰ËÙ[‹œÙ]ÜÜYYÜ˜[\
+BˆÙ[‹œÜYYÜ˜[\Ü™[[Ý™WØ]ÛX]ÛŠ	ÔÜYYT[šÝ0íœØÚ[‰ËÙ[‹œ™[[Ý™WÜÜYYÜ˜[\
+BˆÙ[‹œÜYYÜ˜[\Û\Ý˜Ý\œ™[›ÝÐÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹œÜYYÜ˜[\ÜÙ[XÝY
+BˆÙ[‹˜™X]Ø[˜[^™WØ]ÛX]ÛŠ	Ð™X]È[˜[\ÚY\™[‰ËÙ[‹œÝ\Ø™X]Ø[˜[\Ú\ÊBˆÙ[‹˜™X]ØÛX\—Ø]ÛX]ÛŠ	Ð™X]È0íœØÚ[‰ËÙ[‹˜ÛX\—Ø™X]ÛX\šÙ\œÊBˆÙ[‹˜™X]ÜÝ]\Ï[X™[
+	ÒÙZ[™H™X]SX\šÙ\ˆ›Üš[™[‹‰Ë	Û]]Y	ÊNÈÙ[‹˜™X]ÜÝ]\ËœÙ]ÛÜ™Ü˜\
+YJBˆÙ[‹^ØÝ]Ø]ÛX]ÛŠ	Õ^ØÚš]Ý\[‰ËÙ[‹œÝ\Ý^Ø˜\ÙYØÝ]
+BˆÙ[‹^ØÝ]ÜÝ]\Ï[X™[
+	Ô]\Ù[ˆ[™°ïðíœ\ˆÙ\™[ˆÚØ[[™\›‰Ë	Û]]Y	ÊNÈÙ[‹^ØÝ]ÜÝ]\ËœÙ]ÛÜ™Ü˜\
+YJBˆÙ[‹˜]]×ØÝ]Ø]ÛX]ÛŠ	Ð™X]KÔÞ™[™[‹P]]ËPÝ]	ËÙ[‹œÝ\Ø]]×ØÝ]
+BˆÙ[‹˜]]×ØÝ]ÜÝ]\Ï[X™[
+	Ó›ØÚÙZ[ˆ]]ÛX]\ØÚ\ˆØÚš]‰Ë	Û]]Y	ÊNÈÙ[‹˜]]×ØÝ]ÜÝ]\ËœÙ]ÛÜ™Ü˜\
+YJBˆÙ[‹›][XØ[WÜÞ[˜×Ø]ÛX]ÛŠ	Ó][KRØ[Y\˜HÞ[˜Ú›Ûš\ÚY\™[‰ËÙ[‹œÞ[˜×Û][XØ[JBˆÙ[‹›][XØ[WÜÝÚ]ÚØ]ÛX]ÛŠ	Ð[ÈZÝ]™HØ[Y\˜H™\Ù[™[‰ËÙ[‹œÝÚ]ÚÛ][XØ[WØ[™ÛJBˆÙ[‹›][XØ[WÜÝ]\Ï[X™[
+	ÒÙZ[™H][KRØ[Y\˜KQÜ\K‰Ë	Û]]Y	ÊNÈÙ[‹›][XØ[WÜÝ]\ËœÙ]ÛÜ™Ü˜\
+YJBˆYˆÛÛ™šYÝ\™WÙ›Ü›J^[Ý]
+N‚ˆ^[Ý]œÙ]™\XØ[ÜXÚ[™ÊJNÈ^[Ý]œÙ]Üš^›Û[ÜXÚ[™ÊJBˆ^[Ý]œÙ]X™[[YÛ›Y[
+][YÛ“Y][YÛ•Ù[\ŠBˆ^[Ý]œÙ]šY[Ü›ÝÝÛXÞJQ›Ü›S^[Ý][›Û‘š^YšY[ÑÜ›ÝÊBˆ^[Ý]œÙ]›ÝÕÜ˜\ÛXÞJQ›Ü›S^[Ý]•Ü˜\Û™Ô›ÝÜÊBˆ™]\›ˆ^[Ý]‚ˆÛ\Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JBˆ›Üˆ˜[YKÚYÙ][ˆÊ	ÔÜ\‰ËÙ[‹˜XÚ×ØÛÛX›ÊK
+	ÔÜÚ][Û‰ËÙ[‹œÜÚ][ÛŠK
+	Ô]Y[Ý\	ËÙ[‹œÝ\
+K
+	Ô]Y[[™IËÙ[‹™[™
+WNˆÛ\Ù›Ü›K˜Y›ÝÊ˜[YKÚYÙ]
+Bˆ[Z[™×Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JBˆ›Üˆ˜[YKÚYÙ][ˆÊ	ÑÙ\ØÚÚ[™YÚÙZ]	ËÙ[‹œÜYY
+K
+	Ñœ™Y^™KQœ˜[YIËÙ[‹™œ™Y^™WÙ[˜X›Y
+K
+	Ñœ™Y^™KQ]Y\‰ËÙ[‹™œ™Y^™WÙ\˜][ÛŠK
+	Ô™]™\œÙIËÙ[‹œ™]™\œÙWØÛ\
+K
+	ÑZ[˜›[™[‰ËÙ[‹™˜YWÚ[ŠK
+	Ð]\Ø›[™[‰ËÙ[‹™˜YWÛÝ]
+K
+	Ó]]Ý0éšÙIËÙ[‹›Û[YJWNˆ[Z[™×Ù›Ü›K˜Y›ÝÊ˜[YKÚYÙ]
+Bˆ^Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JBˆÛÛÜ—Ü›ÝÏTR›Þ^[Ý]
+
+NÈÛÛÜ—Ü›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈÛÛÜ—Ü›ÝËœÙ]ÜXÚ[™ÊJNÈÛÛÜ—Ü›ÝË˜YÚYÙ]
+Ù[‹^ØÛÛÜ‹JNÈÛÛÜ—Ü›ÝË˜YÚYÙ]
+Ù[‹^Ü[]WØ]ÛŠBˆ›Üˆ˜[YKÚYÙ][ˆÊ	Õ^	ËÙ[‹^Ý˜[YJK
+	Õ^Ü°í°çÙIËÙ[‹^ÜÚ^™JK
+	ÔØÚšY	ËÙ[‹^Ù›Û
+WNˆ^Ù›Ü›K˜Y›ÝÊ˜[YKÚYÙ]
+Bˆ^Ù›Ü›K˜Y›ÝÊ	Õ^˜\˜™IËÛÛÜ—Ü›ÝÊBˆ›Üˆ˜[YKÚYÙ][ˆÊ	Õ^	ËÙ[‹^Þ
+K
+	Õ^IËÙ[‹^ÞJWNˆ^Ù›Ü›K˜Y›ÝÊ˜[YKÚYÙ]
+Bˆ^ÜÝ[WÙ›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JBˆÝ[WÜ›ÝÏTR›Þ^[Ý]
+
+NÈÝ[WÜ›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈÝ[WÜ›ÝË˜YÚYÙ]
+Ù[‹^Ø›Û
+NÈÝ[WÜ›ÝË˜YÚYÙ]
+Ù[‹^Ú][XÊNÈÝ[WÜ›ÝË˜YÝ™]Ú
+
+NÈ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	ÔØÚš]	ËÝ[WÜ›ÝÊBˆ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	ÒÛÛ\‰ËÙ[‹^ÛÝ][™WÝÚY
+NÈ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	ÒÛÛ\™˜\˜™IËÙ[‹^ÛÝ][™WØÛÛÜŠBˆ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	ÔØÚ][‰ËÙ[‹^ÜÚYÝ×ÜÚ^™JNÈ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	ÔØÚ][™˜\˜™IËÙ[‹^ÜÚYÝ×ØÛÛÜŠBˆ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	Ò[\™Ü[™	ËÙ[‹^Ø˜XÚÙÜ›Ý[™Ù[˜X›Y
+NÈ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	Ò[\™Ü[™˜\˜™IËÙ[‹^Ø˜XÚÙÜ›Ý[™ØÛÛÜŠBˆ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	Ò[\™Ü[™XÚÚÜ˜Y	ËÙ[‹^Ø˜XÚÙÜ›Ý[™ÛÜXÚ]JNÈ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	Ò[\™Ü[™˜[™	ËÙ[‹^Ø˜XÚÙÜ›Ý[™ÜY[™ÊBˆ™\Ù]Ü›ÝÏTR›Þ^[Ý]
+
+NÈ™\Ù]Ü›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ™\Ù]Ü›ÝË˜YÚYÙ]
+Ù[‹^ÜÝ[WÜ™\Ù]JNÈ™\Ù]Ü›ÝË˜YÚYÙ]
+Ù[‹^ÜÝ[WØ\WØ]ÛŠBˆ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	ÔÝ[›Ü›YÙIË™\Ù]Ü›ÝÊBˆ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	Ð[š[X][Û‰ËÙ[‹^Ø[š[X][ÛŠNÈ^ÜÝ[WÙ›Ü›K˜Y›ÝÊ	Ð[š[K‹Q]Y\‰ËÙ[‹^Ø[š[X][Û—Ù\˜][ÛŠBˆÛ\ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÐÓT0­ÈÔÒUSÓ‰ËYJNÈÛ\ÜÙXÝ[Û‹˜Y^[Ý]
+Û\Ù›Ü›JBˆ[Z[™×ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÕSRS‘È0­ÈUQSËPTÒTÉËYJNÈ[Z[™×ÜÙXÝ[Û‹˜Y^[Ý]
+[Z[™×Ù›Ü›JBˆ^ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÕV0­ÈS’SS‘ÔÒUSÓ‰ËYJNÈ^ÜÙXÝ[Û‹˜Y^[Ý]
+^Ù›Ü›JBˆ^ÜÝ[WÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÕV0­ÈÕSS‘S’SPUSÓ‰Ë˜[ÙJNÈ^ÜÝ[WÜÙXÝ[Û‹˜Y^[Ý]
+^ÜÝ[WÙ›Ü›JBˆ˜[œÙ›Ü›WÙ›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JBˆ˜[œÙ›Ü›WÙ›Ü›K˜Y›ÝÊ	Ö›ÛÛIËÙ[‹˜[œÙ›Ü›WÜØØ[JBˆ˜[œÙ›Ü›WÙ›Ü›K˜Y›ÝÊ	Ðš[	ËÙ[‹˜[œÙ›Ü›WÞ
+NÈ˜[œÙ›Ü›WÙ›Ü›K˜Y›ÝÊ	Ðš[IËÙ[‹˜[œÙ›Ü›WÞJBˆ˜[œÙ›Ü›WÙ›Ü›K˜Y›ÝÊ	Ô›Ý][Û‰ËÙ[‹œ›Ý][ÛŠBˆ˜[œÙ›Ü›WÙ›Ü›K˜Y›ÝÊ	ÐÜ›Ü[šÜÉËÙ[‹˜Ü›ÜÛY
+NÈ˜[œÙ›Ü›WÙ›Ü›K˜Y›ÝÊ	ÐÜ›ÜØ™[‰ËÙ[‹˜Ü›ÜÝÜ
+Bˆ˜[œÙ›Ü›WÙ›Ü›K˜Y›ÝÊ	ÐÜ›Ü™XÚÉËÙ[‹˜Ü›ÜÜšYÚ
+NÈ˜[œÙ›Ü›WÙ›Ü›K˜Y›ÝÊ	ÐÜ›Ü[[‰ËÙ[‹˜Ü›ÜØ›ÝÛJBˆ›\Ü›ÝÏTR›Þ^[Ý]
+
+NÈ›\Ü›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ›\Ü›ÝË˜YÚYÙ]
+Ù[‹™›\ÚÜš^›Û[
+NÈ›\Ü›ÝË˜YÚYÙ]
+Ù[‹™›\Ý™\XØ[
+NÈ›\Ü›ÝË˜YÝ™]Ú
+
+Bˆ˜[œÙ›Ü›WÙ›Ü›K˜Y›ÝÊ	ÔÜYYÙ[‰Ë›\Ü›ÝÊBˆ˜[œÙ›Ü›WÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	Ð’S0­ÈS”Ñ“Ô“PUSÓ‰ËYJNÈ˜[œÙ›Ü›WÜÙXÝ[Û‹˜Y^[Ý]
+˜[œÙ›Ü›WÙ›Ü›JBˆ]Y[×Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	Ô˜]\ØÚ[\™°ïÚÝ[™ÉËÙ[‹˜]Y[×Û›Ú\ÙWÜ™YXÝ[ÛŠBˆ]Y[×Ù›Ü›K˜Y›ÝÊ	ÑTHYY™[‰ËÙ[‹˜]Y[×Ù\WÛÝÊNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÑTHZ][‰ËÙ[‹˜]Y[×Ù\WÛZY
+NÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÑTH0íš[‰ËÙ[‹˜]Y[×Ù\WÚYÚ
+Bˆ]Y[×Ù›Ü›K˜Y›ÝÊ	ÒÛÛ\™\ÜÛÜ‰ËÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ù[˜X›Y
+NÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÒÛÛ\™\ÜÛÜ‹TØÚÙ[IËÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛ
+NÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÒÛÛ\™\ÜÛÜ‹T˜][ÉËÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ÊBˆ]Y[×Ù›Ü›K˜Y›ÝÊ	Ð]Y[ËQXÚÚ[™ÉËÙ[‹˜]Y[×ÙXÚÚ[™ÊNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÔÜ˜XÚ\ÛÛY\[™ÉËÙ[‹˜]Y[×Ý›ÚXÙWÚ\ÛÛ][ÛŠNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÒØ[°éIËÙ[‹˜]Y[×ØÚ[›™[Û[ÙJNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	Ô[›Ü˜[XIËÙ[‹˜]Y[×Ü[ŠBˆ]Y[×Ù›Ü›K˜Y›ÝÊ	ÐÛ\SÝY™\ÜÉËÙ[‹˜]Y[×Û›Ü›X[^™JNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÖšY[YÙ[	ËÙ[‹˜]Y[×Û›Ü›X[^™WÝ\™Ù]
+Bˆ™X]Ø]ÛœÏTR›Þ^[Ý]
+
+NÈ™X]Ø]ÛœËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ™X]Ø]ÛœË˜YÚYÙ]
+Ù[‹˜™X]Ø[˜[^™WØ]Û‹JNÈ™X]Ø]ÛœË˜YÚYÙ]
+Ù[‹˜™X]ØÛX\—Ø]Û‹JBˆ]Y[×Ù›Ü›K˜Y›ÝÊ	Ð™X]TÞ[˜ÉË™X]Ø]ÛœÊNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÉËÙ[‹˜™X]ÜÝ]\ÊBˆ]Y[×Ù›Ü›K˜Y›ÝÊ	Õ^ØÚš]	ËÙ[‹^ØÝ]Ø]ÛŠNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÉËÙ[‹^ØÝ]ÜÝ]\ÊBˆ]]×ØÝ]Ü›ÝÏTR›Þ^[Ý]
+
+NÈ]]×ØÝ]Ü›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ]]×ØÝ]Ü›ÝË˜YÚYÙ]
+Ù[‹˜]]×ØÝ]Ø]Û‹JBˆ]Y[×Ù›Ü›K˜Y›ÝÊ	Ð]]ËPÝ]	Ë]]×ØÝ]Ü›ÝÊNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÉËÙ[‹˜]]×ØÝ]ÜÝ]\ÊBˆ][XØ[WÜ›ÝÏTR›Þ^[Ý]
+
+NÈ][XØ[WÜ›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ][XØ[WÜ›ÝË˜YÚYÙ]
+Ù[‹›][XØ[WÜÞ[˜×Ø]Û‹JNÈ][XØ[WÜ›ÝË˜YÚYÙ]
+Ù[‹›][XØ[WÜÝÚ]ÚØ]Û‹JBˆ]Y[×Ù›Ü›K˜Y›ÝÊ	Ó][KRØ[Y\˜IË][XØ[WÜ›ÝÊNÈ]Y[×Ù›Ü›K˜Y›ÝÊ	ÉËÙ[‹›][XØ[WÜÝ]\ÊBˆ]Y[×ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÐUQSÈ0­ÈRVS‘ÓPT•ÓÓÉË˜[ÙKYJNÈ]Y[×ÜÙXÝ[Û‹˜Y^[Ý]
+]Y[×Ù›Ü›JBˆÛÛÜ—Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈÛÛÜ—Ù›Ü›K˜Y›ÝÊ	Ò[YÚÙZ]	ËÙ[‹˜œšYÚ™\ÜÊNÈÛÛÜ—Ù›Ü›K˜Y›ÝÊ	ÒÛÛ˜\Ý	ËÙ[‹˜ÛÛ˜\Ý
+NÈÛÛÜ—Ù›Ü›K˜Y›ÝÊ	ÔðéYÝ[™ÉËÙ[‹œØ]\˜][ÛŠNÈÛÛÜ—Ù›Ü›K˜Y›ÝÊ	Ñš[\‰ËÙ[‹™š[\—Ü™\Ù]
+BˆY™™XÝÜ™\Ù]Ü›ÝÏTR›Þ^[Ý]
+
+NÈY™™XÝÜ™\Ù]Ü›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈY™™XÝÜ™\Ù]Ü›ÝË˜YÚYÙ]
+Ù[‹™Y™™XÝÜ™\Ù]JNÈY™™XÝÜ™\Ù]Ü›ÝË˜YÚYÙ]
+Ù[‹™Y™™XÝÜ™\Ù]Ø\WØ]ÛŠNÈÛÛÜ—Ù›Ü›K˜Y›ÝÊ	ÑY™™ZÝT™\Ù]	ËY™™XÝÜ™\Ù]Ü›ÝÊBˆ]Ü›ÝÏTR›Þ^[Ý]
+
+NÈ]Ü›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ]Ü›ÝË˜YÚYÙ]
+Ù[‹›]Ü]JNÈ]Ü›ÝË˜YÚYÙ]
+Ù[‹›]Øœ›ÝÜÙWØ]ÛŠNÈÛÛÜ—Ù›Ü›K˜Y›ÝÊ	ÓU	Ë]Ü›ÝÊBˆÛÛÜ—ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÑT‘H0­ÈÓÔ”‘RÕT‰ËYJNÈÛÛÜ—ÜÙXÝ[Û‹˜Y^[Ý]
+ÛÛÜ—Ù›Ü›JBˆÜ˜Y[™×Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈÜ˜Y[™×Ù›Ü›K˜Y›ÝÊ	Ð™[XÚ[™ÉËÙ[‹˜ÛÛÜ—Ù^ÜÝ\™JNÈÜ˜Y[™×Ù›Ü›K˜Y›ÝÊ	Õ[\\˜]\‰ËÙ[‹˜ÛÛÜ—Ý[\\˜]\™JNÈÜ˜Y[™×Ù›Ü›K˜Y›ÝÊ	Õ0í›[™ÉËÙ[‹˜ÛÛÜ—Ý[
+NÈÜ˜Y[™×Ù›Ü›K˜Y›ÝÊ	ÕšXœ˜[˜ÙIËÙ[‹˜ÛÛÜ—ÝšXœ˜[˜ÙJBˆ›Üˆ]KÚY[[ˆ
+
+	ÓYÈØÚ][‰Ë	ÛY	ÊK
+	ÑØ[[XHÈZ][‰Ë	ÙØ[[XIÊK
+	ÑØZ[ˆÈXÚ\‰Ë	ÙØZ[‰ÊJN‚ˆ›ÝÏTR›Þ^[Ý]
+
+NÈ›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+Bˆ›ÜˆÚ[›™[]WØÚ[›™[[ˆ
+
+	Ü‰Ë	Ô‰ÊK
+	ÙÉË	ÑÉÊK
+	Ø‰Ë	Ð‰ÊJN‚ˆÜ[\Ù[‹˜ÛÛÜ—ÝÚY[ÜÜ[œÖÙ‰ØÛÛÜ—ÞÝÚY[WÞØÚ[›™[I×NÈÜ[‹œÙ]ÛÛ\
+‰ÞÝ]_H0­ÈÝ]WØÚ[›™[IÊBˆ›ÝË˜YÚYÙ]
+Ü[‹JBˆÜ˜Y[™×Ù›Ü›K˜Y›ÝÊ]K›ÝÊBˆÜ˜Y[™×ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÑT‘H0­ÈËUÑQÑKQÔQS‘ÉË˜[ÙKYJNÈÜ˜Y[™×ÜÙXÝ[Û‹˜Y^[Ý]
+Ü˜Y[™×Ù›Ü›JBˆY™™XÝ×Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈY™™XÝ×Ù›Ü›K˜Y›ÝÊ	ÑXÚÚÜ˜Y	ËÙ[‹›ÜXÚ]JNÈY™™XÝ×Ù›Ü›K˜Y›ÝÊ	Õ[œØÚ0é™™IËÙ[‹˜›\ŠNÈY™™XÝ×Ù›Ü›K˜Y›ÝÊ	ÔØÚ0é™™IËÙ[‹œÚ\œ[ŠNÈY™™XÝ×Ù›Ü›K˜Y›ÝÊ	ÔÝXš[\ÚY\[™ÉËÙ[‹œÝXš[^˜][ÛŠNÈY™™XÝ×Ù›Ü›K˜Y›ÝÊ	ÑÜ™Y[œØÜ™Y[‰ËÙ[‹˜Ú›ÛXWÚÙ^WÙ[˜X›Y
+NÈY™™XÝ×Ù›Ü›K˜Y›ÝÊ	ÒÙ^KQ˜\˜™IËÙ[‹˜Ú›ÛXWÚÙ^WØÛÛÜŠNÈY™™XÝ×Ù›Ü›K˜Y›ÝÊ	ðá›XÚÙZ]	ËÙ[‹˜Ú›ÛXWÚÙ^WÜÚ[Z[\š]JNÈY™™XÝ×Ù›Ü›K˜Y›ÝÊ	ÕÙZXÚZ]	ËÙ[‹˜Ú›ÛXWÚÙ^WØ›[™
+BˆY™™XÝ×ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÑQ‘‘RÕH0­È’QSÉËYJNÈY™™XÝ×ÜÙXÝ[Û‹˜Y^[Ý]
+Y™™XÝ×Ù›Ü›JBˆX\Ú×Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈX\Ú×Ù›Ü›K˜Y›ÝÊ	ÓX\ÚÙ[\	ËÙ[‹›X\Ú×Ý\JNÈX\Ú×Ù›Ü›K˜Y›ÝÊ	ÓX\ÚÙH	ËÙ[‹›X\Ú×Þ
+NÈX\Ú×Ù›Ü›K˜Y›ÝÊ	ÓX\ÚÙHIËÙ[‹›X\Ú×ÞJNÈX\Ú×Ù›Ü›K˜Y›ÝÊ	ÓX\ÚÙ[˜œ™Z]IËÙ[‹›X\Ú×ÝÚY
+NÈX\Ú×Ù›Ü›K˜Y›ÝÊ	ÓX\ÚÙ[š0íšIËÙ[‹›X\Ú×ÚZYÚ
+NÈX\Ú×Ù›Ü›K˜Y›ÝÊ	ÓX\ÚÙ[ÙZXÚZ]	ËÙ[‹›X\Ú×Ù™X]\ŠBˆX\Ú×ÜÚ[×Ü›ÝÏTR›Þ^[Ý]
+
+NÈX\Ú×ÜÚ[×Ü›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈX\Ú×ÜÚ[×Ü›ÝË˜YÚYÙ]
+Ù[‹›X\Ú×ÜÚ[ËJNÈX\Ú×ÜÚ[×Ü›ÝË˜YÚYÙ]
+Ù[‹›X\Ú×ÜÚ[×Ø\JNÈX\Ú×Ù›Ü›K˜Y›ÝÊ	Ð™^šY\‹T[šÝIËX\Ú×ÜÚ[×Ü›ÝÊBˆX\Ú×ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÓPTÒÑSˆ0­È“ÕÔÒÓÔQIË˜[ÙKYJNÈX\Ú×ÜÙXÝ[Û‹˜Y^[Ý]
+X\Ú×Ù›Ü›JBˆX\Ú×Ü]Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈX\Ú×Ü]Ù›Ü›K˜Y›ÝÊ	Ô›ÝÜÚÛÜYKV™Z]	ËÙ[‹›X\Ú×Ü]Ý[YJBˆX\Ú×Ü]Ø]ÛœÏTR›Þ^[Ý]
+
+NÈX\Ú×Ü]Ø]ÛœËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈX\Ú×Ü]Ø]ÛœË˜YÚYÙ]
+Ù[‹›X\Ú×Ü]ÜÙ]Ø]Û‹JNÈX\Ú×Ü]Ø]ÛœË˜YÚYÙ]
+Ù[‹›X\Ú×Ü]Ü™[[Ý™WØ]Û‹JBˆX\Ú×ÜÙXÝ[Û‹˜Y^[Ý]
+X\Ú×Ü]Ù›Ü›JNÈX\Ú×ÜÙXÝ[Û‹˜Y^[Ý]
+X\Ú×Ü]Ø]ÛœÊNÈX\Ú×ÜÙXÝ[Û‹˜YÚYÙ]
+Ù[‹›X\Ú×Ü]Û\Ý
+BˆZWÙ›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JBˆ˜XÚÙÜ›Ý[™Ø]ÛœÏTR›Þ^[Ý]
+
+NÈ˜XÚÙÜ›Ý[™Ø]ÛœËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ˜XÚÙÜ›Ý[™Ø]ÛœË˜YÚYÙ]
+Ù[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý™WØ]Û‹JNÈ˜XÚÙÜ›Ý[™Ø]ÛœË˜YÚYÙ]
+Ù[‹˜˜XÚÙÜ›Ý[™ØÛX\—Ø]Û‹JBˆ˜XÚÚ[™×Ø]ÛœÏTR›Þ^[Ý]
+
+NÈ˜XÚÚ[™×Ø]ÛœËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ˜XÚÚ[™×Ø]ÛœË˜YÚYÙ]
+Ù[‹˜XÚ×Û[Ý[Û—Ø]Û‹JNÈ˜XÚÚ[™×Ø]ÛœË˜YÚYÙ]
+Ù[‹˜ÛX\—Ý˜XÚÚ[™×Ø]Û‹JBˆ˜XÚÚ[™×Ø]ÛœË˜YÚYÙ]
+Ù[‹›X\Ú×Ý˜XÚ×Ø]Û‹JBˆ]]×Ü™Yœ˜[YWØ]ÛœÏTR›Þ^[Ý]
+
+NÈ]]×Ü™Yœ˜[YWØ]ÛœËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ]]×Ü™Yœ˜[YWØ]ÛœË˜YÚYÙ]
+Ù[‹˜]]×Ü™Yœ˜[YWØ]Û‹JNÈ]]×Ü™Yœ˜[YWØ]ÛœË˜YÚYÙ]
+Ù[‹˜]]×Ü™Yœ˜[YWØÛX\—Ø]Û‹JBˆZWÙ›Ü›K˜Y›ÝÊ	Ò[\™Ü[™	Ë˜XÚÙÜ›Ý[™Ø]ÛœÊNÈZWÙ›Ü›K˜Y›ÝÊ	ÉËÙ[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý˜[Ù[˜X›Y
+NÈZWÙ›Ü›K˜Y›ÝÊ	ÉËÙ[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý™WÜÝ]\ÊBˆZWÙ›Ü›K˜Y›ÝÊ	Õ˜XÚÚ[™ÉË˜XÚÚ[™×Ø]ÛœÊNÈZWÙ›Ü›K˜Y›ÝÊ	ÉËÙ[‹˜XÚÚ[™×ÜÝ]\ÊNÈZWÙ›Ü›K˜Y›ÝÊ	ÓØš™ZÝ[™\›™[‰ËÙ[‹›Øš™XÝÜ™[[Ý˜[Ù[˜X›Y
+BˆZWÙ›Ü›K˜Y›ÝÊ	Ð]]ËT™Yœ˜[YIËÙ[‹˜]]×Ü™Yœ˜[YWÙ›Ü›X]
+NÈZWÙ›Ü›K˜Y›ÝÊ	ÉËÙ[‹˜]]×Ü™Yœ˜[YWÙ[˜X›Y
+BˆZWÙ›Ü›K˜Y›ÝÊ	ÉË]]×Ü™Yœ˜[YWØ]ÛœÊNÈZWÙ›Ü›K˜Y›ÝÊ	ÉËÙ[‹˜]]×Ü™Yœ˜[YWÜÝ]\ÊBˆZWÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÒÒKUÑT’Ö‘UQÑH0­ÈÒÐS	Ë˜[ÙKYJNÈZWÜÙXÝ[Û‹˜Y^[Ý]
+ZWÙ›Ü›JBˆ˜[œÚ][Û—Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈ˜[œÚ][Û—Ù›Ü›K˜Y›ÝÊ	ðç™\™Ø[™ÉËÙ[‹˜[œÚ][Û—Ý\JNÈ˜[œÚ][Û—Ù›Ü›K˜Y›ÝÊ	Ñ]Y\‰ËÙ[‹˜[œÚ][Û—Ù\˜][ÛŠBˆ˜[œÚ][Û—ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ðç‘T‘ðá‘ÑIË˜[ÙJNÈ˜[œÚ][Û—ÜÙXÝ[Û‹˜Y^[Ý]
+˜[œÚ][Û—Ù›Ü›JBˆÙ^Yœ˜[YWÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÐS’SPUSÓˆ0­ÈÑVQ”SQTÈS‘ÔQQTSTS‘ÉË˜[ÙKYJBˆÙ^Yœ˜[YWÙ›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈÙ^Yœ˜[YWÙ›Ü›K˜Y›ÝÊ	Ö™Z][HÛ\	ËÙ[‹šÙ^Yœ˜[YWÝ[YJNÈÙ^Yœ˜[YWÙ›Ü›K˜Y›ÝÊ	ÒÝ\™IËÙ[‹šÙ^Yœ˜[YWØÝ\™JNÈÙ^Yœ˜[YWÜÙXÝ[Û‹˜Y^[Ý]
+Ù^Yœ˜[YWÙ›Ü›JBˆÙ^Yœ˜[YWØ]ÛœÏTR›Þ^[Ý]
+
+NÈÙ^Yœ˜[YWØ]ÛœËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈÙ^Yœ˜[YWØ]ÛœË˜YÚYÙ]
+Ù[‹šÙ^Yœ˜[YWÜÙ]Ø]Û‹JNÈÙ^Yœ˜[YWØ]ÛœË˜YÚYÙ]
+Ù[‹šÙ^Yœ˜[YWÜ™[[Ý™WØ]Û‹JBˆÙ^Yœ˜[YWÜÙXÝ[Û‹˜Y^[Ý]
+Ù^Yœ˜[YWØ]ÛœÊBˆÙ^Yœ˜[YWÜÙXÝ[Û‹˜YÚYÙ]
+Ù[‹šÙ^Yœ˜[YWÛ\Ý
+BˆÜ˜\Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈÜ˜\Ù›Ü›K˜Y›ÝÊ	ÒÝ\™H[ž™ZYÙ[‰ËÙ[‹šÙ^Yœ˜[YWÙÜ˜\Ü›Ü\JNÈÙ^Yœ˜[YWÜÙXÝ[Û‹˜Y^[Ý]
+Ü˜\Ù›Ü›JNÈÙ^Yœ˜[YWÜÙXÝ[Û‹˜YÚYÙ]
+Ù[‹šÙ^Yœ˜[YWÙÜ˜\
+Bˆ›Û[YWÚÙ^Yœ˜[YWÙ›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈ›Û[YWÚÙ^Yœ˜[YWÙ›Ü›K˜Y›ÝÊ	Ö™Z][HÛ\	ËÙ[‹›Û[YWÚÙ^Yœ˜[YWÝ[YJNÈ›Û[YWÚÙ^Yœ˜[YWÙ›Ü›K˜Y›ÝÊ	ÒÝ\™IËÙ[‹›Û[YWÚÙ^Yœ˜[YWØÝ\™JNÈÙ^Yœ˜[YWÜÙXÝ[Û‹˜Y^[Ý]
+›Û[YWÚÙ^Yœ˜[YWÙ›Ü›JBˆ›Û[YWÚÙ^Yœ˜[YWØ]ÛœÏTR›Þ^[Ý]
+
+NÈ›Û[YWÚÙ^Yœ˜[YWØ]ÛœËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈ›Û[YWÚÙ^Yœ˜[YWØ]ÛœË˜YÚYÙ]
+Ù[‹›Û[YWÚÙ^Yœ˜[YWÜÙ]Ø]Û‹JNÈ›Û[YWÚÙ^Yœ˜[YWØ]ÛœË˜YÚYÙ]
+Ù[‹›Û[YWÚÙ^Yœ˜[YWÜ™[[Ý™WØ]Û‹JBˆÙ^Yœ˜[YWÜÙXÝ[Û‹˜Y^[Ý]
+›Û[YWÚÙ^Yœ˜[YWØ]ÛœÊBˆÙ^Yœ˜[YWÜÙXÝ[Û‹˜YÚYÙ]
+Ù[‹›Û[YWÚÙ^Yœ˜[YWÛ\Ý
+BˆÜYYÜ˜[\Ù›Ü›OXÛÛ™šYÝ\™WÙ›Ü›JQ›Ü›S^[Ý]
+
+JNÈÜYYÜ˜[\Ù›Ü›K˜Y›ÝÊ	Ô]Y[™Z]	ËÙ[‹œÜYYÜ˜[\Ý[YJNÈÜYYÜ˜[\Ù›Ü›K˜Y›ÝÊ	ÑÙ\ØÚÚ[™YÚÙZ]	ËÙ[‹œÜYYÜ˜[\Ý˜[YJNÈÙ^Yœ˜[YWÜÙXÝ[Û‹˜Y^[Ý]
+ÜYYÜ˜[\Ù›Ü›JBˆÜYYÜ˜[\Ø]ÛœÏTR›Þ^[Ý]
+
+NÈÜYYÜ˜[\Ø]ÛœËœÙ]ÛÛ[ÓX\™Ú[œÊ
+NÈÜYYÜ˜[\Ø]ÛœË˜YÚYÙ]
+Ù[‹œÜYYÜ˜[\ÜÙ]Ø]Û‹JNÈÜYYÜ˜[\Ø]ÛœË˜YÚYÙ]
+Ù[‹œÜYYÜ˜[\Ü™[[Ý™WØ]Û‹JBˆÙ^Yœ˜[YWÜÙXÝ[Û‹˜Y^[Ý]
+ÜYYÜ˜[\Ø]ÛœÊBˆÙ^Yœ˜[YWÜÙXÝ[Û‹˜YÚYÙ]
+Ù[‹œÜYYÜ˜[\Û\Ý
+BˆXÝ[Ûœ×ÜÙXÝ[ÛZ[œÜXÝÜ—ÜÙXÝ[ÛŠ	ÐRÕSÓ‘S‰ËYJBˆXÝ[Ûœ×ÜÙXÝ[Û‹˜YÚYÙ]
+]ÛŠ	Ðš[\°ïÚÜÙ]™[‰ËÙ[‹œ™\Ù]Ý˜[œÙ›Ü›JJNÈXÝ[Ûœ×ÜÙXÝ[Û‹˜YÚYÙ]
+]ÛŠ	ðç™\›™ZY[‰ËÙ[‹˜\WÜ›Ü\Y\ËYJJNÈXÝ[Ûœ×ÜÙXÝ[Û‹˜YÚYÙ]
+]ÛŠ	Ð]Y[È]\ÈšY[È^˜ZY\™[‰ËÙ[‹™^˜XÝØ]Y[ÊJBˆ[[X™[
+	Ô™XÚÚÛXÚÈHZÝ[Û™[ˆ0­ÈZ]HšYZ[ˆH™\œØÚYX™[ˆ0­È°é™\ˆHðïž™[—”ÚYHÚ™HZ[œ˜\Ý[ˆ0­ÈÝ™ËRÛXÚÈHYZ™˜XÚ]\ÝØZ0­ÈY\\ÝHH^KÔ]\ÙIË	ÜÝXIÊNÈ[œÙ]ÛÜ™Ü˜\
+YJNÈ[˜YÚYÙ]
+[
+NÈ[˜YÝ™]Ú
+
+BˆÜ˜YÚYÙ]
+[œÜXÝÜŠNÈÜœÙ]Ú^™\ÊÌÌLÍŒÍŒJNÈÜœÙ]Ý™]Ú˜XÝÜŠ
+NÈÜœÙ]Ý™]Ú˜XÝÜŠKJNÈÜœÙ]Ý™]Ú˜XÝÜŠ‹
+NÈ™\XØ[˜YÚYÙ]
+Ü
+Bˆ›ÝÛK›\[™[
+
+NÈÙ[‹[Y[[™WÜ[™[X›ÝÛNÈ›ÝÛKœÙ]Øš™XÝ˜[YJ	Ý[Y[[™T[™[	ÊNÈ›ÝÛKœÙ]Ú^™TÛXÞJTÚ^™TÛXÞK‘^[™[™ËTÚ^™TÛXÞK’YÛ›Ü™Y
+Bˆ˜\TR›Þ^[Ý]
+
+NÈ˜\‹œÙ]ÛÛ[ÓX\™Ú[œÊLKLJNÈ˜\‹œÙ]ÜXÚ[™ÊŠBˆ˜\‹˜YÚYÙ]
+X™[
+	ÕSQSS‘IË	ÚXY[™ÉÊJNÈ˜\‹˜YÜXÚ[™ÊŠNÈ˜\‹˜YÚYÙ]
+[Y[[™WÜÙ\\˜]ÜŠ
+JB‚ˆÈÙY\Hš[X\žHY][™ÈXÝ[ÛœÈš\ÚX›K]Ú]™H[H[›ÝYÚˆÈY\˜\˜ÚH]HÛÛ˜\ˆ™XYÈ\ÈHÛÛÙ][œÝXYÙˆHÛ\ˆÈÛÝ\ˆ\ÜÈœ™\]Y[XÝ[ÛœÈ]™H[ˆHÛÈÜ\Ü›Ý\È™[ÝË‚ˆ[™×Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ø¡­‰Ë	Ô°ïÚÙðé™ÚYÈ0­ÈÝ™ÊÖ‰ËÙ[‹[™Ë	ÙY]][™ÉÊBˆ™Y×Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ø¡­ÉË	ÕÚYY\šÛ[ˆ0­ÈÝ™ÊÔÚY
+Ö‰ËÙ[‹œ™YË	ÙY]\™YÉÊBˆÜ]Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ø§ ‰Ë	Ð[HXœÜY[ÛÜˆZ[[ˆ0­ÈÝ™ÊÐ‰ËÙ[‹œÜ]	ÙY]XÝ]	ÊBˆ™[[Ý™WØ]Û][Y[[™WÝÛÛØ]ÛŠ	ø£*ÉË	Ð]\ÝØZ[™\›™[ˆ0­È[‰ËÙ[‹œ™[[Ý™K	ÙY]Y[]IËØš™XÝÛ˜[YOIÝ[Y[[™UÛÛ[™Ù\‰ÊBˆÛÜWØ]Û][Y[[™WÝÛÛØ]ÛŠ	ø©âIË	Ð]\ÝØZÛÜY\™[ˆ0­ÈÝ™ÊÐÉËÙ[‹˜ÛÜWÜÙ[XÝ[Û‹	ÙY]XÛÜIÊBˆ\ÝWØ]Û][Y[[™WÝÛÛØ]ÛŠ	ø£¦	Ë	ÑZ[™°ïÙ[ˆ0­ÈÝ™ÊÕ‰ËÙ[‹œ\ÝWÜÙ[XÝ[Û‹	ÙY]\\ÝIÊBˆ[œÙ\Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ø¡¬ÉË	Ò[œÙ\Z[™°ïÙ[ˆ0­ÈÝ™ÊÔÚY
+Õ‰ËÙ[‹š[œÙ\ÜÙ[XÝ[Û‹	Ú[œÙ\[Øš™XÝ	ÊBˆÝ™\Üš]WØ]Û][Y[[™WÝÛÛØ]ÛŠ	ø¥¨ÉË	ÓÝ™\Üš]HZ[™°ïÙ[‰ËÙ[‹›Ý™\Üš]WÜÙ[XÝ[Û‹	ÙØÝ[Y[\Ø]™KX\ÉÊB‚ˆš[WÛY[OTSY[JÙ[ŠNÈš[WÛY[KœÙ]]J	Ô›Ù™\ÜÚ[Û™[Hš[KUÙ\šÞ™]YÙIÊBˆš[WÛY[K˜YXÝ[ÛŠ	Ôš\KR[ˆ[HXœÜY[ÛÜˆ0­ÈIËÙ[‹œš\WÝš[WÚ[ŠBˆš[WÛY[K˜YXÝ[ÛŠ	Ôš\KSÝ][HXœÜY[ÛÜˆ0­ÈÉËÙ[‹œš\WÝš[WÛÝ]
+Bˆš[WÛY[K˜YÙ\\˜]ÜŠ
+Bˆš[WÛY[K˜YXÝ[ÛŠ	Ô›ÛTØÚš][HXœÜY[ÛÜˆ0­È‰ËÙ[‹œ›ÛÝ×Ü^ZXY
+Bˆš[WÛY[K˜YÙ\\˜]ÜŠ
+Bˆš[WÛY[K˜YXÝ[ÛŠ	ÔÛYH[šÜÈ0­È[
+ø¡¤	Ë[X™NœÙ[‹œÛYWÜÙ[XÝY
+LJJBˆš[WÛY[K˜YXÝ[ÛŠ	ÔÛYH™XÚÈ0­È[
+ø¡¤‰Ë[X™NœÙ[‹œÛYWÜÙ[XÝY
+JJBˆš[WÛY[K˜YXÝ[ÛŠ	ÔÛ\[šÜÈ0­È[\ØÚ[
+Ð[
+ø¡¤	Ë[X™NœÙ[‹œÛ\ÜÙ[XÝY
+LJJBˆš[WÛY[K˜YXÝ[ÛŠ	ÔÛ\™XÚÈ0­È[\ØÚ[
+Ð[
+ø¡¤‰Ë[X™NœÙ[‹œÛ\ÜÙ[XÝY
+JJBˆš[WØ]Û][Y[[™WÛY[WØ]ÛŠ	ø§íÉË	Ô›Ù™\ÜÚ[Û™[Hš[KUÙ\šÞ™]YÙIËš[WÛY[K	ÙY]XÝ]	ÊB‚ˆX\šÙ\—ÛY[OTSY[JÙ[ŠNÈX\šÙ\—ÛY[KœÙ]]J	ÓX\šÙ\‰ÊBˆX\šÙ\—ÛY[K˜YXÝ[ÛŠ	ÓX\šÙ\ˆ[žY°ïÙ[‰Ë[X™NœÙ[‹˜YÛX\šÙ\Š	ÛX\šÙ\‰ÊJBˆX\šÙ\—ÛY[K˜YXÝ[ÛŠ	ÒØ\][[žY°ïÙ[‰Ë[X™NœÙ[‹˜YÛX\šÙ\Š	ØÚ\\‰ÊJBˆX\šÙ\—ÛY[K˜YÙ\\˜]ÜŠ
+NÈX\šÙ\—ÛY[K˜YXÝ[ÛŠ	ÒØ\][^ÜY\™[ˆ8 )‰ËÙ[‹™^ÜØÚ\\œÊBˆX\šÙ\—Ø]Û][Y[[™WÛY[WØ]ÛŠ	ø¦¤IË	ÓX\šÙ\ˆÙ\ˆØ\][[žY°ïÙ[‰ËX\šÙ\—ÛY[K	Ø›ÛÚÛX\šË[™]ÉÊB‚ˆYÛY[OTSY[JÙ[ŠNÈYÛY[KœÙ]]J	Õ[Y[[™KQ[[Y[[žY°ïÙ[‰ÊBˆYÛY[K˜YXÝ[ÛŠ	Õ^[žY°ïÙ[‰ËÙ[‹˜YÝ^
+BˆYÛY[K˜YXÝ[ÛŠ	ÐY\ÝY[S^Y\ˆ[žY°ïÙ[‰ËÙ[‹˜YØY\ÝY[Û^Y\ŠBˆYÛY[K˜YÙ\\˜]ÜŠ
+BˆYÛY[K˜YXÝ[ÛŠ	Õ[\][[\ÜY\™[ˆ
+Ô•Õ•
+IËÙ[‹š[\ÜÜÝX]WÙX[ÙÊBˆYÛY[K˜YXÝ[ÛŠ	Ð]]ÛX]\ØÚH[\][8 )‰ËÙ[‹˜]]ÛX]X×ÜÝX]WÙX[ÙÊBˆYØ]Û][Y[[™WÛY[WØ]ÛŠ	ÊÉË	Ñ[[Y[[žY°ïÙ[‰ËYÛY[K	Û\ÝXY	ÊB‚ˆ[Ü™WÛY[OTSY[JÙ[ŠNÈ[Ü™WÛY[KœÙ]]J	ÕÙZ]\™H[Y[[™KPZÝ[Û™[‰ÊBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	Ñ\^šY\™[ˆ0­ÈÝ™ÊÑ	ËÙ[‹™\XØ]WÜÙ[XÝ[ÛŠBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	Ôš\H0íœØÚ[ˆ0­ÈÝ™ÊÔÚY
+Ñ[‰ËÙ[‹œš\WÙ[]JBˆ[Ü™WÛY[K˜YÙ\\˜]ÜŠ
+Bˆ[Ü™WÛY[K˜YXÝ[ÛŠ	ÑÜ\Y\™[ˆ0­ÈÝ™ÊÑÉËÙ[‹™Ü›Ý\ÜÙ[XÝ[ÛŠBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	ÑÜ\H0íœÙ[ˆ0­ÈÝ™ÊÔÚY
+ÑÉËÙ[‹[™Ü›Ý\ÜÙ[XÝ[ÛŠBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	ÐÛÛ\Ý[™PÛ\\œÝ[[‰ËÙ[‹˜Ü™X]WØÛÛ\Ý[™
+Bˆ[Ü™WÛY[K˜YXÝ[ÛŠ	ÐÛÛ\Ý[™PÛ\]Y›0íœÙ[‰ËÙ[‹™\ÜÛÛ™WØÛÛ\Ý[™
+Bˆ[Ü™WÛY[K˜YÙ\\˜]ÜŠ
+Bˆ[Ü™WÛY[K˜YXÝ[ÛŠ	Ó][KRØ[Y\˜HÞ[˜Ú›Ûš\ÚY\™[‰ËÙ[‹œÞ[˜×Û][XØ[JBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	Ð]Y[ËTÞ[˜È°ïˆ]\ÝØZ	ËÙ[‹œÞ[˜×Ø]Y[×ÜÙ[XÝ[ÛŠBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	ÐZÝ]™HØ[Y\˜HÙXÚÙ[‰ËÙ[‹œÝÚ]ÚÛ][XØ[WØ[™ÛJBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	Ð]šX]HÛÜY\™[ˆ0­ÈÝ›
+Ð[
+ÐÉËÙ[‹˜ÛÜWØ]šX]\ÊBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	Ð]šX]HZ[™°ïÙ[ˆ0­ÈÝ›
+Ð[
+Õ‰ËÙ[‹œ\ÝWØ]šX]\ÊBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	ÒÙ^Yœ˜[Y\ÈÛÜY\™[ˆ0­ÈÝ›
+Ð[
+ÒÉËÙ[‹˜ÛÜWÚÙ^Yœ˜[Y\ÊBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	ÒÙ^Yœ˜[Y\ÈZ[™°ïÙ[ˆ0­ÈÝ›
+Ð[
+ÔÚY
+ÒÉËÙ[‹œ\ÝWÚÙ^Yœ˜[Y\ÊBˆ[Ü™WÛY[K˜YÙ\\˜]ÜŠ
+Bˆ[Ü™WÛY[K˜YXÝ[ÛŠ	Ó0ïÚÙ[ˆ]YˆZÝY[\ˆÜ\ˆØÚYpçÙ[‰ËÙ[‹˜ÛÜÙWÜÙ[XÝYÝ˜XÚ×ÙØ\ÊBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	ÔÝ[™š[[HXœÜY[ÛÜˆZ[™°ïÙ[‰ËÙ[‹˜YÙœ™Y^™WÙœ˜[YJBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	ÐZÝY[\Èš[[È‘ÈÜZXÚ\›‰ËÙ[‹œÝ\Ùœ˜[YWØØ\\™JBˆ[Ü™WÛY[K˜YXÝ[ÛŠ	Õ^ØÚš]0­È]\Ù[‹Ñ°ïðíœ\‰ËÙ[‹œÝ\Ý^Ø˜\ÙYØÝ]
+Bˆ[Ü™WÛY[K˜YXÝ[ÛŠ	Ð™X]KÔÞ™[™[‹P]]ËPÝ]	ËÙ[‹œÝ\Ø]]×ØÝ]
+Bˆ[Ü™WØ]Û][Y[[™WÛY[WØ]ÛŠ	ø¢ëÉË	ÕÙZ]\™H[Y[[™KPZÝ[Û™[‰Ë[Ü™WÛY[K	ÝšY]Ë[[Ü™IÊB‚ˆ˜\‹˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	Õ‘T“UQ‰ËÝ[™×Ø]Û‹™Y×Ø]Û—JJBˆ˜\‹˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	Õ’SSQS‰ËÝš[WØ]Û—JJBˆ˜\‹˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	Ð‘PT‘RUS‰ËÜÜ]Ø]Û‹™[[Ý™WØ]Û‹ÛÜWØ]Û‹\ÝWØ]Û—JJBˆ˜\‹˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	ÑRS‘°çÑS‰ËÚ[œÙ\Ø]Û‹Ý™\Üš]WØ]Û—JJBˆ˜\‹˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	ÓPT’ÑT‰ËÛX\šÙ\—Ø]Û—JJBˆ˜\‹˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	ÐQ	ËØYØ]Û—JJBˆÙ[‹œÝX]WÙ^ÜØ]Û][Y[[™WÝÛÛØ]ÛŠ	ø¡êIË	Õ[\][^ÜY\™[‰Ë[YWÛ˜[YOIÙØÝ[Y[Y^Ü	ÊBˆÙ[‹œÝX]WÙ^ÜØ]Û‹˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹™^ÜÜÝX]\ÊBˆ˜\‹˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	ÑVÔ•	ËÜÙ[‹œÝX]WÙ^ÜØ]Û—JJBˆ˜\‹˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	ÓQR‰ËÛ[Ü™WØ]Û—JJBˆ˜\‹˜YÝ™]Ú
+
+BˆÙ[‹œÛ˜\Ø›Þ][Y[[™WÝÛÛØ]ÛŠ	ø£ IË	ÑZ[œ˜\Ý[ˆZ[‹Ø]\ÉËÙÙÛOUYK[YWÛ˜[YOIÜÛ˜\]ËYÜšY	ÊBˆÙ[‹œÛ˜\Ø›ÞœÙ]ÚXÚÙY
+YJNÈÙ[‹œÛ˜\Ø›ÞÙÙÛY˜ÛÛ›™XÝ
+[X™HŽœÙ]]ŠÙ[‹[Y[[™K	ÜÛ˜\	ËŠJBˆ˜\‹˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	ÐUTÔ’PÒS‰ËÜÙ[‹œÛ˜\Ø›ÞJJBˆÙ[‹Ý[[X™[
+	ÉË	Û]]Y	ÊNÈÙ[‹Ý[œÙ]Øš™XÝ˜[YJ	Ý[Y[[™UÝ[	ÊNÈ˜\‹˜YÚYÙ]
+Ù[‹Ý[
+NÈ›˜Y^[Ý]
+˜\ŠB‚ˆ›ÝÏTR›Þ^[Ý]
+
+NÈ›ÝËœÙ]ÛÛ[ÓX\™Ú[œÊLLŠNÈ›ÝËœÙ]ÜXÚ[™ÊŠBˆÙ[‹˜]]ÜØ]™WÛX™[[X™[
+	Ð]]ÜØ]™H™\™Z]	Ë	Û]]Y	ÊNÈ›ÝË˜YÚYÙ]
+Ù[‹˜]]ÜØ]™WÛX™[
+NÈ›ÝË˜YÝ™]Ú
+
+BˆÙ[‹šY[×Ý˜XÚÜÏTTÜ[›Þ
+
+NÈÙ[‹šY[×Ý˜XÚÜËœÙ]˜[™ÙJKL
+NÈÙ[‹šY[×Ý˜XÚÜËœÙ]˜[YJŠNÈÙ[‹šY[×Ý˜XÚÜËœÙ]ÛÛ\
+	Ð[ž˜Z\ˆšY[ËTÜ\™[‰ÊNÈÙ[‹šY[×Ý˜XÚÜË˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹˜XÚ×ØÛÝ[×ØÚ[™ÙY
+BˆÙ[‹˜]Y[×Ý˜XÚÜÏTTÜ[›Þ
+
+NÈÙ[‹˜]Y[×Ý˜XÚÜËœÙ]˜[™ÙJKL
+NÈÙ[‹˜]Y[×Ý˜XÚÜËœÙ]˜[YJŠNÈÙ[‹˜]Y[×Ý˜XÚÜËœÙ]ÛÛ\
+	Ð[ž˜Z\ˆ]Y[ËTÜ\™[‰ÊNÈÙ[‹˜]Y[×Ý˜XÚÜË˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹˜XÚ×ØÛÝ[×ØÚ[™ÙY
+Bˆ›ÝË˜YÚYÙ]
+[Y[[™WÝ˜XÚ×ÙÜ›Ý\
+Ù[‹šY[×Ý˜XÚÜËÙ[‹˜]Y[×Ý˜XÚÜÊJBˆš]Ø]Û][Y[[™WÝÛÛØ]ÛŠ	ø¦í‰Ë	Õ[Y[[™HZ[œ\ÜÙ[‰ËÙ[‹™š]Ý[Y[[™K	ÝšY]ËY[ØÜ™Y[‰ÊBˆ›ÛÛWÚXÛÛ][Y[[™WÚXÛÛ—ÛX™[
+	ø£%IË	Õ[Y[[™KV›ÛÛIÊBˆÙ[‹ž›ÛÛWÜÛY\TTÛY\Š]’Üš^›Û[
+NÈÙ[‹ž›ÛÛWÜÛY\‹œÙ]ÛÛ\
+	Õ[Y[[™KV›ÛÛIÊNÈÙ[‹ž›ÛÛWÜÛY\‹œÙ]˜[™ÙJ‹Œ
+NÈÙ[‹ž›ÛÛWÜÛY\‹œÙ]˜[YJŒ
+NÈÙ[‹ž›ÛÛWÜÛY\‹œÙ]š^YÚY
+LŒ
+NÈÙ[‹ž›ÛÛWÜÛY\‹˜[YPÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹ž›ÛÛJBˆ›ÝË˜YÚYÙ]
+[Y[[™WÝÛÛÙÜ›Ý\
+	ÐS”ÒPÒ	ËÙš]Ø]Û‹›ÛÛWÚXÛÛ‹Ù[‹ž›ÛÛWÜÛY\—JJNÈ›˜Y^[Ý]
+›ÝÊBˆÙ[‹[Y[[™OU[Y[[™J
+NÈÙ[‹[Y[[™K›Xœ˜\žWØØ][ÙÏ^Ú][Kš][WÚYš][H›Üˆ][H[ˆXœ˜\žWÚ][\Ê
+_BˆÙ[‹[Y[[™KœÙ[XÝ[Û—ØÚ[™ÙY˜ÛÛ›™XÝ
+Ù[‹[Y[[™WÜÙ[XÝ[Û—ØÚ[™ÙY
+NÈÙ[‹[Y[[™KœÙYZË˜ÛÛ›™XÝ
+Ù[‹œÙ]Ü^ZXY
+BˆÙ[‹[Y[[™K˜ÛÛ^Ü™\]Y\ÝY˜ÛÛ›™XÝ
+Ù[‹œÚÝ×ØÛÛ^ÛY[JBˆÙ[‹[Y[[™K˜XÚ×ØÛÛ^Ü™\]Y\ÝY˜ÛÛ›™XÝ
+Ù[‹œÚÝ×Ý˜XÚ×ØÛÛ^ÛY[JBˆÙ[‹[Y[[™K›X\šÙ\—ØÛÛ^Ü™\]Y\ÝY˜ÛÛ›™XÝ
+Ù[‹œÚÝ×ÛX\šÙ\—ØÛÛ^ÛY[JBˆÙ[‹[Y[[™K˜ÛÛ[Z]˜ÛÛ›™XÝ
+Ù[‹˜ÛÛ[Z]Ù˜YÊNÈÙ[‹[Y[[™K˜YØ\ÜÙ]˜ÛÛ›™XÝ
+Ù[‹™›ÜØ\ÜÙ]
+NÈÙ[‹[Y[[™K›Xœ˜\žWØXÝ[Û‹˜ÛÛ›™XÝ
+Ù[‹š[™WÛXœ˜\žWÙ›Ü
+NÈÙ[‹[Y[[™K™[]WÜÙ[XÝY˜ÛÛ›™XÝ
+Ù[‹œ™[[Ý™JBˆÙ[‹[Y[[™K˜XÚ×Û]]WÜ™\]Y\ÝY˜ÛÛ›™XÝ
+Ù[‹ÙÙÛWÝ˜XÚ×Û]]JNÈÙ[‹[Y[[™K˜XÚ×ÛØÚ×Ü™\]Y\ÝY˜ÛÛ›™XÝ
+Ù[‹ÙÙÛWÝ˜XÚ×ÛØÚÊBˆÙ[‹[Y[[™Kž›ÛÛWÜ™\]Y\Ý˜ÛÛ›™XÝ
+[X™HŽœÙ[‹ž›ÛÛWÜÛY\‹œÙ]˜[YJÙ[‹ž›ÛÛWÜÛY\‹˜[YJ
+JÛŠJJBˆÙ[‹[Y[[™K™Ù\Ý\™WÙÛ™K˜ÛÛ›™XÝ
+Ù[‹œ™\Ý[YWØ]]ÜØ]™JBˆÙ[‹œØÜ›ÛTTØÜ›Û\™XJ
+NÈÙ[‹œØÜ›ÛœÙ]ÚYÙ]™\Ú^˜X›JYJNÈÙ[‹œØÜ›ÛœÙ]ÚYÙ]
+Ù[‹[Y[[™JNÈ›˜YÚYÙ]
+Ù[‹œØÜ›Û
+BˆÙ[‹[Y[[™Kœ[—Ü™\]Y\Ý˜ÛÛ›™XÝ
+Ù[‹œ[—Ý[Y[[™JBˆÙ[‹^Ý˜[YK™Y][™Ñš[š\ÚY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹^ØÛÛÜ‹™Y][™Ñš[š\ÚY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆ›ÜˆšY[[ˆ
+Ù[‹œÜÚ][Û‹Ù[‹œÝ\Ù[‹™[™Ù[‹œÜYYÙ[‹™œ™Y^™WÙ\˜][Û‹Ù[‹™˜YWÚ[‹Ù[‹™˜YWÛÝ]Ù[‹›Û[YKˆÙ[‹˜]Y[×Û›Ú\ÙWÜ™YXÝ[Û‹Ù[‹˜]Y[×Ù\WÛÝËÙ[‹˜]Y[×Ù\WÛZYÙ[‹˜]Y[×Ù\WÚYÚÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛˆÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ËÙ[‹˜]Y[×ÙXÚÚ[™ËÙ[‹˜]Y[×Ü[‹Ù[‹˜]Y[×Û›Ü›X[^™WÝ\™Ù]Ù[‹^ÜÚ^™KÙ[‹^ÞÙ[‹^ÞKˆÙ[‹^ÛÝ][™WÝÚYÙ[‹^ÛÝ][™WØÛÛÜ‹Ù[‹^ÜÚYÝ×ÜÚ^™KÙ[‹^ÜÚYÝ×ØÛÛÜ‹Ù[‹^Ø˜XÚÙÜ›Ý[™ØÛÛÜ‹ˆÙ[‹^Ø˜XÚÙÜ›Ý[™ÛÜXÚ]KÙ[‹^Ø˜XÚÙÜ›Ý[™ÜY[™ËÙ[‹^Ø[š[X][Û—Ù\˜][Û‹ˆÙ[‹˜[œÙ›Ü›WÜØØ[KÙ[‹˜[œÙ›Ü›WÞÙ[‹˜[œÙ›Ü›WÞKÙ[‹œ›Ý][Û‹Ù[‹˜Ü›ÜÛYÙ[‹˜Ü›ÜÝÜÙ[‹˜Ü›ÜÜšYÚÙ[‹˜Ü›ÜØ›ÝÛKˆÙ[‹˜œšYÚ™\ÜËÙ[‹˜ÛÛ˜\ÝÙ[‹œØ]\˜][Û‹Ù[‹›]Ü]Ù[‹›ÜXÚ]KÙ[‹˜›\‹Ù[‹œÚ\œ[‹Ù[‹œÝXš[^˜][Û‹ˆÙ[‹˜]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‹ˆÙ[‹˜Ú›ÛXWÚÙ^WØÛÛÜ‹Ù[‹˜Ú›ÛXWÚÙ^WÜÚ[Z[\š]KÙ[‹˜Ú›ÛXWÚÙ^WØ›[™ˆÙ[‹›X\Ú×ÞÙ[‹›X\Ú×ÞKÙ[‹›X\Ú×ÝÚYÙ[‹›X\Ú×ÚZYÚÙ[‹›X\Ú×Ù™X]\ŠN‚ˆšY[™Y][™Ñš[š\ÚY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹™›\ÚÜš^›Û[˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊNÈÙ[‹™›\Ý™\XØ[˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹™œ™Y^™WÙ[˜X›Y˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊNÈÙ[‹œ™]™\œÙWØÛ\˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ù[˜X›Y˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹˜]Y[×Û›Ü›X[^™K˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹˜]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‹™Y][™Ñš[š\ÚY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý˜[Ù[˜X›Y˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹›Øš™XÝÜ™[[Ý˜[Ù[˜X›Y˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹˜]Y[×ØÚ[›™[Û[ÙK˜XÝ]˜]Y˜ÛÛ›™XÝ
+[X™H
+—ÎˆÙ[‹˜\WÜ›Ü\Y\Ê
+JBˆÙ[‹^Ø›Û˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊNÈÙ[‹^Ú][XË˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹^Ø˜XÚÙÜ›Ý[™Ù[˜X›Y˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹^Ù›Û˜XÝ]˜]Y˜ÛÛ›™XÝ
+[X™H
+—ÎˆÙ[‹˜\WÜ›Ü\Y\Ê
+JBˆÙ[‹^Ø[š[X][Û‹˜XÝ]˜]Y˜ÛÛ›™XÝ
+[X™H
+—ÎˆÙ[‹˜\WÜ›Ü\Y\Ê
+JBˆÙ[‹™š[\—Ü™\Ù]˜XÝ]˜]Y˜ÛÛ›™XÝ
+[X™H
+—ÎˆÙ[‹˜\WÜ›Ü\Y\Ê
+JNÈÙ[‹˜Ú›ÛXWÚÙ^WÙ[˜X›Y˜ÛXÚÙY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆÙ[‹›X\Ú×Ý\K˜XÝ]˜]Y˜ÛÛ›™XÝ
+[X™H
+—ÎˆÙ[‹˜\WÜ›Ü\Y\Ê
+JBˆÙ[‹˜[œÚ][Û—Ý\K˜XÝ]˜]Y˜ÛÛ›™XÝ
+[X™H
+—ÎˆÙ[‹˜\WÜ›Ü\Y\Ê
+JNÈÙ[‹˜[œÚ][Û—Ù\˜][Û‹™Y][™Ñš[š\ÚY˜ÛÛ›™XÝ
+Ù[‹˜\WÜ›Ü\Y\ÊBˆ™\XØ[˜YÚYÙ]
+›ÝÛJNÈ™\XØ[œÙ]Ý™]Ú˜XÝÜŠJNÈ™\XØ[œÙ]Ý™]Ú˜XÝÜŠKÊNÈ™\XØ[œÙ]Ú[™[ÛÛ\ÚX›J˜[ÙJNÈ™\XØ[œÙ]Ú^™\ÊÍMŒÍJNÈÝ]\‹˜YÚYÙ]
+™\XØ[JNÈÙ[‹œÙ]Ù[˜[ÚYÙ]
+›ÛÝ
+BˆÙ[‹œ™Yœ™\ÚÛYYXJ
+BˆÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆÙ[‹œÙ]ÙY]Û[ÙJ
+BˆÙ[‹˜\WÝÛÜšÜÜXÙWÜ™\Ù]
+
+B‚ˆYˆ\œ›ÜŠÙ[‹Y\ÜØYÙJNˆÙ[‹œ™\Ù[Ù\œ›ÜŠY\ÜØYÙJB‚ˆYˆ\]WÜ›Ú™XÝÚY[]JÙ[ŠN‚ˆˆˆ’ÙY\HÛÛ\XÝXY\ˆ[ˆÞ[˜ÈÚ]HXÝ]™H›Ú™XÝˆˆˆ‚ˆYˆ›Ý\Ø]ŠÙ[‹	Ü›Ú™XÝÝ]WÛX™[	ÊN‚ˆ™]\›‚ˆ˜[YOT]
+Ù[‹œ›Ú™XÝÜ]
+KœÝ[HYˆÙ[‹œ›Ú™XÝÜ][ÙH	Ó™]Y\È›Ú™ZÝ	ÂˆÙ[‹œ›Ú™XÝÝ]WÛX™[œÙ]^
+˜[YJBˆÙ[‹œ›Ú™XÝÛY]WÛX™[œÙ]^
+	ÑÙ\ÜZXÚ\	ÈYˆÙ[‹œ›Ú™XÝÜ][ÙH	ÓÚØ[\È›Ú™ZÝ	ÊBˆØ]™Y\Ù[‹˜]]ÜØ]™WÜ™]š\Ú[ÛO\Ù[‹œ™]š\Ú[Ûˆ[™Ù[‹›\ÝØ]]ÜØ]™H\È›Ý›Û™BˆÙ[‹˜]]ÜØ]™WÜ[œÙ]^
+	ø¥ãÈÚYY\š\œÝ[˜\‰ÈYˆÙ[‹™\H[™Ø]™Y[ÙH	ø¥ãÈÚXÚ\[™È›ÛÝ	ÈYˆÙ[‹™\H[ÙH	ø¥ãÈÙ\ÜZXÚ\	ÈYˆÙ[‹œ›Ú™XÝÜ][ÙH	ø¥ãÈ™\™Z]	ÊBˆÙ[‹˜]]ÜØ]™WÜ[œÙ]ÛÛ\
+	Ð]]ÜØ]™H\ÝZ[™HÚYY\š\œÝ[[™ÜÚÛÜYKˆÝ™ÊÔÈÜZXÚ\Z[™H›Ú™ZÝ]ZK‰ÊBˆÙ[‹˜]]ÜØ]™WÜ[œÙ]›Ü\J	Ù\IË›ÛÛ
+Ù[‹™\JJBˆÙ[‹˜]]ÜØ]™WÜ[œÝ[J
+K[œÛ\Ú
+Ù[‹˜]]ÜØ]™WÜ[
+NÈÙ[‹˜]]ÜØ]™WÜ[œÝ[J
+KœÛ\Ú
+Ù[‹˜]]ÜØ]™WÜ[
+NÈÙ[‹˜]]ÜØ]™WÜ[\]J
+B‚ˆYˆÙ]ÙY]Û[ÙJÙ[‹
+—ÊN‚ˆˆˆ”ÝÚ]Ú™]ÙY[ˆHØ[H™YÚ[›™\ˆ[œÜXÝÜˆ[™H[ÛÛÙ]ˆˆˆ‚ˆYˆ›Ý\Ø]ŠÙ[‹	ÙY]Û[ÙWØÛÛX›ÉÊN‚ˆ™]\›‚ˆ[ÙO\Ù[‹™Y]Û[ÙWØÛÛX›Ë˜Ý\œ™[]J
+HÜˆ	ÜÚ[\IÂˆÙ[‹™Y]Û[ÙO\ÝŠ[ÙJBˆ›Üˆ[žH[ˆÙ]]ŠÙ[‹	Ú[œÜXÝÜ—ÜÙXÝ[ÛœÉË×JN‚ˆ[žVÉÜÙXÝ[Û‰×KœÙ]š\ÚX›JÙ[‹™Y]Û[ÙHOH	Ü›ÉÈÜˆ›Ý[žVÉØY˜[˜ÙY	×JBˆYˆ\Ø]ŠÙ[‹	ÜÝ]\Ð˜\‰ÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJˆ	ÑZ[™˜XÚS[Ù\È0­È0éYšYÙHZ[œÝ[[™Ù[ˆÚXÚ˜\‰ÈYˆÙ[‹™Y]Û[ÙHOH	ÜÚ[\IÂˆ[ÙH	Ô›ËS[Ù\È0­È[H[œÜXÝÜ‹UÙ\šÞ™]YÙHÚXÚ˜\‰ËL
+B‚ˆYˆ\WÝÛÜšÜÜXÙWÜ™\Ù]
+Ù[‹
+—ÊN‚ˆˆˆ\HH\ÚË[ÜšY[Y^[Ý]Ú]Ý]Ü™X][™È[›Ý\ˆY]Üˆ[ÙKˆˆˆ‚ˆYˆ›Ý\Ø]ŠÙ[‹	ÝÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›ÉÊHÜˆ›Ý\Ø]ŠÙ[‹	ÝÜ	ÊN‚ˆ™]\›‚ˆ™\Ù]\Ù[‹ÛÜšÜÜXÙWÜ™\Ù]ØÛÛX›Ë˜Ý\œ™[]J
+HÜˆ	ÙY]	ÂˆÙ[‹ÛÜšÜÜXÙWÜ™\Ù]\ÝŠ™\Ù]
+BˆYˆÙ[‹™›ØÝ\×Û[ÙN‚ˆ™]\›‚ˆÚ^™\Ï^Âˆ	ÙY]	Î–ÌÌŒÍLKˆ	ÜÚÜÉÎ–ÌŒÌLÌŽLKˆ	Ø]Y[ÉÎ–ÌLLÌKˆ	ØÛÛÜ‰Î–ÌNLŒKˆ	ØØ\[ÛœÉÎ–ÌŽÌŒÌKˆK™Ù]
+™\Ù]ÌÌŒÍLJBˆÙ[‹ÜœÙ]Ú^™\ÊÚ^™\ÊBˆYˆ\Ø]ŠÙ[‹	Ý™\XØ[	ÊN‚ˆÙ[‹™\XØ[œÙ]Ú^™\ÊÍMŒÍHYˆ™\Ù]OH	Ø]Y[ÉÈ[ÙHÍLJBˆX™[Ï^ÉÙY]	Î‰ÔØÚš]S^[Ý]	Ë	ÜÚÜÉÎ‰ÔÚÜËS^[Ý]	Ë	Ø]Y[ÉÎ‰Ð]Y[ËS^[Ý]	Ë	ØÛÛÜ‰Î‰Ñ˜\˜‹S^[Ý]	Ë	ØØ\[ÛœÉÎ‰Õ[\][S^[Ý]	ßBˆYˆ\Ø]ŠÙ[‹	ÜÝ]\Ð˜\‰ÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÞÛX™[Ë™Ù]
+™\Ù]\˜™Z]Ø™\™ZXÚŠ_HZÝ]šY\‰ËL
+B‚ˆYˆÙÙÛWÙ›ØÝ\×Û[ÙJÙ[ŠN‚ˆˆˆ‘Ú]™HH™]šY]È[™[Y[[™HH[ÚYÚ]Û™HØY™HÙÙÛKˆˆˆ‚ˆYˆ›Ý\Ø]ŠÙ[‹	ÝÜ	ÊN‚ˆ™]\›‚ˆÙ[‹™›ØÝ\×Û[ÙO[›ÝÙ[‹™›ØÝ\×Û[ÙBˆYˆÙ[‹™›ØÝ\×Û[ÙNˆÙ[‹—Û›Ü›X[ÜÚ^™\Ï\Ù[‹ÜœÚ^™\Ê
+BˆÙ[‹›YYXWÜ[™[œÙ]š\ÚX›J›ÝÙ[‹™›ØÝ\×Û[ÙJBˆÙ[‹š[œÜXÝÜ—Ü[™[œÙ]š\ÚX›J›ÝÙ[‹™›ØÝ\×Û[ÙJBˆÙ[‹™›ØÝ\×Ø]Û‹œÙ]^
+	Ñ›ÚÝ\ÈØÚYpçÙ[‰ÈYˆÙ[‹™›ØÝ\×Û[ÙH[ÙH	Ñ›ÚÝ\ÉÊBˆÙ[‹™›ØÝ\×Ø]Û‹œÙ]ÛÛ\
+	ÔÙZ][˜™\™ZXÚHÚYY\ˆZ[˜›[™[ˆ0­ÈÝ™ÊÔÚY
+Ñ‰ÈYˆÙ[‹™›ØÝ\×Û[ÙH[ÙH	Õ›ÜœØÚ]H[™[Y[[™H™\™Ü°í°çÙ\›ˆ0­ÈÝ™ÊÔÚY
+Ñ‰ÊBˆYˆÙ[‹™›ØÝ\×Û[ÙN‚ˆÙ[‹ÜœÙ]Ú^™\ÊÌLŒJBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñ›ÚÝ\Û[Ù\È0­È›ÜœØÚ]H[™[Y[[™HX^[ZY\	ËÌ
+Bˆ[ÙN‚ˆYˆÙ[‹—Û›Ü›X[ÜÚ^™\ÎˆÙ[‹ÜœÙ]Ú^™\ÊÙ[‹—Û›Ü›X[ÜÚ^™\ÊBˆ[ÙNˆÙ[‹˜\WÝÛÜšÜÜXÙWÜ™\Ù]
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñ›ÚÝ\Û[Ù\È™Y[™]0­È\˜™Z]Ø™\™ZXÚÚYY\š\™Ù\Ý[	ËÌ
+B‚ˆYˆ\]WØÛÛ^ÝÛÛ˜\ŠÙ[ŠN‚ˆYˆ›Ý\Ø]ŠÙ[‹	ØÛÛ^ÝÛÛ˜\‰ÊN‚ˆ™]\›‚ˆÛ\\Ù[‹˜Ý\œ™[ØÛ\
+
+Bˆ]˜Z[X›OXÛ\\È›Ý›Û™H[™›ÝÙ[‹ÛÜšÙ\ˆ[™›ÝÙ[‹œÙ[XÝ[Û—ÛØÚÙY
+
+BˆÙ[‹˜ÛÛ^ÝÛÛ˜\‹œÙ]š\ÚX›J›ÛÛ
+Û\
+JBˆ›ÜˆXÝ[Ûˆ[ˆ
+Ù[‹˜ÛÛ^ÜÜ]Ø]Û‹Ù[‹˜ÛÛ^Ù\XØ]WØ]Û‹Ù[‹˜ÛÛ^Ü™\Ù]Ø]Û‹Ù[‹˜ÛÛ^Ù[]WØ]ÛŠN‚ˆXÝ[Û‹œÙ][˜X›Y
+]˜Z[X›JBˆÙ[‹˜ÛÛ^Ü™\Ù]Ø]Û‹œÙ][˜X›Y
+›ÛÛ
+]˜Z[X›H[™[ŠÙ[‹œÙ[XÝ[ÛŠOOLH[™Û\šÚ[™OIÝšY[ÉÊJBˆÙ[‹˜ÛÛ^Ü™\Ù]Ø]Û‹œÙ]›Ü\J	Ù\ØX›Y™X\ÛÛ‰Ë	ÕðéHÙ[˜]HZ[™[ˆ[Ü\œ[ˆšY[ØÛ\]\Ë‰ÊB‚ˆYˆÙ]ÛYYXWÝšY]ÊÙ[‹
+—ÊN‚ˆˆˆ”ÝÚ]ÚHYYXHœ›ÝÜÙ\ˆ™]ÙY[ˆš\ÝX[Ø\™È[™HÛÛ\XÝ\Ýˆˆˆ‚ˆYˆ›Ý\Ø]ŠÙ[‹	ÛYYXWÝšY]×ØÛÛX›ÉÊHÜˆ›Ý\Ø]ŠÙ[‹	ÛYYXWÛ\Ý	ÊN‚ˆ™]\›‚ˆ\ÝÝšY]Ï\Ù[‹›YYXWÝšY]×ØÛÛX›Ë˜Ý\œ™[]J
+HOH	Û\Ý	ÂˆÙ[‹›YYXWÛ\ÝœÙ]šY]Ó[ÙJS\ÝÚYÙ]“\Ý[ÙHYˆ\ÝÝšY]È[ÙHS\ÝÚYÙ]’XÛÛ“[ÙJBˆÙ[‹›YYXWÛ\ÝœÙ]Ü˜\[™Ê›Ý\ÝÝšY]ÊBˆÙ[‹›YYXWÛ\ÝœÙ]ÜXÚ[™ÊHYˆ\ÝÝšY]È[ÙH
+BˆÙ[‹›YYXWÛ\ÝœÙ][šY›Ü›R][TÚ^™\Ê\ÝÝšY]ÊBˆÙ[‹›YYXWÛ\ÝœÙ]XÛÛ”Ú^™JTÚ^™JÍŠHYˆ\ÝÝšY]È[ÙHTÚ^™JLÌŠJBˆÙ[‹›YYXWÛ\ÝœÙ]ÜšYÚ^™JTÚ^™J
+HYˆ\ÝÝšY]È[ÙHTÚ^™JMLL
+JBˆÙ[‹œ™Yœ™\ÚÛYYXJ
+B‚ˆYˆÙÙÛWØ\ÜÙ]Ù˜]›Üš]JÙ[ŠN‚ˆ][O\Ù[‹›YYXWÛ\Ý˜Ý\œ™[][J
+HYˆ\Ø]ŠÙ[‹	ÛYYXWÛ\Ý	ÊH[ÙH›Û™BˆYˆ][H\È›Û™N‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÕðéHY\œÝZ[ˆYY][H]\Ë‰ËL
+Bˆ[™^Z][K™]JYYXS\ÝTÔÑUÒS‘VÔ“ÓJBˆZY\ÝŠ]
+Ù[‹˜\ÜÙ]ÖÚ[™^Kœ]
+Kœ™\ÛÛ™J
+JBˆYˆZY[ˆÙ[‹™˜]›Üš]WØ\ÜÙ]Î‚ˆÙ[‹™˜]›Üš]WØ\ÜÙ]Ëœ™[[Ý™JZY
+NÈY\ÜØYÙOIÑ˜]›Üš][™\›‰Âˆ[ÙN‚ˆÙ[‹™˜]›Üš]WØ\ÜÙ]Ë˜Y
+ZY
+NÈY\ÜØYÙOIÓYY][H[È˜]›Üš]X\šÚY\‰ÂˆÙ[‹œ™Yœ™\ÚÛYYXJ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJY\ÜØYÙKL
+B‚ˆYˆ\]WÛYYXWÙ˜]›Üš]WØ]ÛŠÙ[ŠN‚ˆYˆ›Ý\Ø]ŠÙ[‹	ÛYYXWÙ˜]›Üš]WØ]Û‰ÊN‚ˆ™]\›‚ˆ][O\Ù[‹›YYXWÛ\Ý˜Ý\œ™[][J
+BˆZY\ÝŠ]
+Ù[‹˜\ÜÙ]ÖÚ][K™]JYYXS\ÝTÔÑUÒS‘VÔ“ÓJWKœ]
+Kœ™\ÛÛ™J
+JHYˆ][H\È›Ý›Û™H[ÙH›Û™Bˆ˜]›Üš]O]ZY[ˆÙ[‹™˜]›Üš]WØ\ÜÙ]ÈYˆZY\È›Ý›Û™H[ÙH˜[ÙBˆÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹œÙ][˜X›Y
+][H\È›Ý›Û™JBˆÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹œÙ]^
+	ø¦!IÈYˆ˜]›Üš]H[ÙH	ø¦!‰ÊBˆÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹œÙ]ÛÛ\
+	Ñ˜]›Üš][™\›™[‰ÈYˆ˜]›Üš]H[ÙH	Ð]\ÙÙ]ðé\ÈYY][H[È˜]›Üš]X\šÚY\™[‰ÊBˆÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹œÙ]XØÙ\ÜÚX›S˜[YJÙ[‹›YYXWÙ˜]›Üš]WØ]Û‹ÛÛ\
+
+JB‚ˆYˆ\]WØÛÛÜ—Ø]ÛŠÙ[‹ÛÛÜŠN‚ˆÙ[‹^Ü[]WØ]Û‹œÙ]Ý[TÚY]
+‰ÔT\Ú]ÛˆÞÈ˜XÚÙÜ›Ý[™ˆØÛÛÜŸNÈÛÛÜŽˆÌLLŒMŽÈ›Ü™\Žˆ\ÛÛYÙNYYŒŽÈ_HT\Ú]ÛŽšÝ™\ˆÞÈ˜XÚÙÜ›Ý[™ˆØÛÛÜŸNÈ_IÊB‚ˆYˆÚÛÜÙWÝ^ØÛÛÜŠÙ[ŠN‚ˆ[š]X[TPÛÛÜŠÙ[‹^ØÛÛÜ‹^
+
+KœÝš\
+
+JBˆYˆ›Ý[š]X[š\Õ˜[Y
+
+Nˆ[š]X[TPÛÛÜŠ	ÈÙ™™™™™‰ÊBˆÛÛÜTPÛÛÜ‘X[ÙË™Ù]ÛÛÜŠ[š]X[Ù[‹	Õ^˜\˜™H]\Ýðé[‰ÊBˆYˆÛÛÜ‹š\Õ˜[Y
+
+N‚ˆÙ[‹^ØÛÛÜ‹œÙ]^
+ÛÛÜ‹›˜[YJ
+JBˆÙ[‹\]WØÛÛÜ—Ø]ÛŠÛÛÜ‹›˜[YJ
+JBˆYˆÙ[‹˜Ý\œ™[ØÛ\
+
+H[™Ù[‹˜Ý\œ™[ØÛ\
+
+KšÚ[™OIÝ^	ÎˆÙ[‹˜\WÜ›Ü\Y\Ê
+B‚ˆYˆÚÛÜÙWÛ]
+Ù[ŠN‚ˆˆˆ”Ù[XÝHÜX›H˜ÝX™KËŒÙU›ÜˆHÝ\œ™[šY[ÈÛ\ˆˆˆ‚ˆ]ÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[YJÙ[‹	ÓU]\Ýðé[‰Ë	ÉËˆ	ÓU
+
+‹˜ÝX™H
+‹ŒÙ
+NÎÐ[H]ZY[ˆ
+
+ŠIÊBˆYˆ›Ý]‚ˆ™]\›‚ˆÙ[‹›]Ü]œÙ]^
+ÝŠ]
+]
+Kœ™\ÛÛ™J
+JJBˆYˆÙ[‹˜Ý\œ™[ØÛ\
+
+H[™Ù[‹˜Ý\œ™[ØÛ\
+
+KšÚ[™OIÝšY[ÉÎ‚ˆÙ[‹˜\WÜ›Ü\Y\Ê
+B‚ˆYˆ[—Ý[Y[[™JÙ[‹[JN‚ˆ˜\\Ù[‹œØÜ›ÛšÜš^›Û[ØÜ›Û˜\Š
+Bˆ˜\‹œÙ]˜[YJ˜\‹˜[YJ
+KZ[
+[JJB‚ˆYˆÛÜš×Ø\™XWØ›Ý[™ÊÙ[ŠN‚ˆˆˆ”™]\›ˆHY™™XÝ]™H^Ü˜[™ÙHÜˆHÛÛ\]H[Y[[™Kˆˆˆ‚ˆÝ[[[™Ý
+Ù[‹˜Û\ÊBˆÝ\LŒYˆÙ[‹ÛÜš×Ú[ˆ\È›Û™H[ÙHX^
+ŒZ[ŠÝ[›Ø]
+Ù[‹ÛÜš×Ú[ŠJJBˆ[™]Ý[YˆÙ[‹ÛÜš×ÛÝ]\È›Û™H[ÙHX^
+ŒZ[ŠÝ[›Ø]
+Ù[‹ÛÜš×ÛÝ]
+JJBˆYˆ[™\Ý\RS—ÐÓT‚ˆ™]\›ˆŒÝ[ˆ™]\›ˆÝ\[™‚ˆYˆ\]WÝÛÜš×Ø\™XWØÛÛ›ÛÊÙ[ŠN‚ˆYˆ›Ý\Ø]ŠÙ[‹	ÝÛÜš×Ü˜[™ÙWÛX™[	ÊN‚ˆ™]\›‚ˆÝ[[[™Ý
+Ù[‹˜Û\ÊBˆYˆÙ[‹ÛÜš×Ú[ˆ\È›Û™H[™Ù[‹ÛÜš×ÛÝ]\È›Û™N‚ˆÙ[‹ÛÜš×Ü˜[™ÙWÛX™[œÙ]^
+	Ð\˜™Z]Ø™\™ZXÚˆÙ\Ø[]H[Y[[™IÊBˆÙ[‹ÛÜš×Ü˜[™ÙWÛX™[œÙ]ÛÛ\
+	ÔÝ™ÊÐ[
+ÒKÓÈÙ]™[ˆ[ˆ^Ü™\™ZXÚ‰ÊBˆ™]\›‚ˆÝ\[™\Ù[‹ÛÜš×Ø\™XWØ›Ý[™Ê
+BˆÙ[‹ÛÜš×Ü˜[™ÙWÛX™[œÙ]^
+‰Ð\˜™Z]Ø™\™ZXÚˆÜÝ\‹Œ™Ÿx $ÞÙ[™‹Œ™ŸHÉÊBˆÙ[‹ÛÜš×Ü˜[™ÙWÛX™[œÙ]ÛÛ\
+‰ÞÙ[™\Ý\‹Œ™ŸHÈ›ÛˆÝÝ[‹Œ™ŸHÈ0­È^ÜX[ÙÈØ[›ˆY\Ù[ˆ™\™ZXÚ™\Ù[™[‹‰ÊB‚ˆYˆÙ]ÝÛÜš×Ú[ŠÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆÙ[‹ÛÜš×Ú[[X^
+ŒZ[Š[™Ý
+Ù[‹˜Û\ÊK›Ø]
+Ù[‹œ^ZXY
+JJBˆYˆÙ[‹ÛÜš×ÛÝ]\È›Ý›Û™H[™Ù[‹ÛÜš×ÛÝ]HÙ[‹ÛÜš×Ú[ŠÓRS—ÐÓT‚ˆÙ[‹ÛÜš×ÛÝ]S›Û™BˆÙ[‹\]WÝÛÜš×Ø\™XWØÛÛ›ÛÊ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Ð\˜™Z]Ø™\™ZXÚR[ŽˆÜÙ[‹ÛÜš×Ú[Ž‹Œ™ŸHÉËL
+B‚ˆYˆÙ]ÝÛÜš×ÛÝ]
+Ù[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆÙ[‹ÛÜš×ÛÝ][X^
+ŒZ[Š[™Ý
+Ù[‹˜Û\ÊK›Ø]
+Ù[‹œ^ZXY
+JJBˆYˆÙ[‹ÛÜš×Ú[ˆ\È›Ý›Û™H[™Ù[‹ÛÜš×ÛÝ]HÙ[‹ÛÜš×Ú[ŠÓRS—ÐÓT‚ˆÙ[‹ÛÜš×Ú[S›Û™BˆÙ[‹\]WÝÛÜš×Ø\™XWØÛÛ›ÛÊ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Ð\˜™Z]Ø™\™ZXÚSÝ]ˆÜÙ[‹ÛÜš×ÛÝ]‹Œ™ŸHÉËL
+B‚ˆYˆÛX\—ÝÛÜš×Ø\™XJÙ[ŠN‚ˆÙ[‹ÛÜš×Ú[S›Û™NÈÙ[‹ÛÜš×ÛÝ]S›Û™NÈÙ[‹\]WÝÛÜš×Ø\™XWØÛÛ›ÛÊ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ð\˜™Z]Ø™\™ZXÚÙ[0íœØÚ0­ÈÙ\Ø[]H[Y[[™HZÝ]‰ËL
+B‚ˆYˆ™]šY]×ÜÚ^™JÙ[ŠN‚ˆˆˆ”™]\›ˆHXÝX[™]šY]ÈÚ^™H\ÙY›ÜˆHÝ\œ™[RHÙ][™ÜËˆˆˆ‚ˆËT‘TÑUÖÜÙ[‹œ™\Ù]˜Ý\œ™[^
+
+WBˆX^ÝËX^ÚJÍŒ
+HYˆÙ[‹œ]ZXÚ×Ü™]šY]×Ø›Þš\ÐÚXÚÙY
+
+H[ÙH
+M
+Bˆ˜][Ï[Z[ŠX^ÝËÝËX^ÚÚ
+Bˆ™]\›ˆ
+X^
+‹[
+Êœ˜][ÊKËÌŠŒŠKX^
+‹[
+
+œ˜][ÊKËÌŠŒŠJB‚ˆYˆ\]WØØXÚWÜÝ]\ÊÙ[ŠN‚ˆYˆ›Ý\Ø]ŠÙ[‹	ØØXÚWÜÝ]\ÉÊN‚ˆ™]\›‚ˆ\ÙYXØXÚWÜÚ^™JÙ[‹˜ØXÚWÜ›ÛÝ
+BˆÙ[‹˜ØXÚWÜÝ]\ËœÙ]^
+‰ÐØXÚHÝ\ÙYÌLÌL‹ŒŸHÈÜÙ[‹˜ØXÚWÛ[Z]Øž]\ËÌLÌL‹ŒŸHP‰ÊBˆÙ[‹˜ØXÚWÜÝ]\ËœÙ]ÛÛ\
+ÝŠÙ[‹˜ØXÚWÜ›ÛÝ
+JB‚ˆYˆš[WØØXÚJÙ[‹ÙY\J
+JN‚ˆ™\Ý[\[™WØØXÚJÙ[‹˜ØXÚWÜ›ÛÝÙ[‹˜ØXÚWÛ[Z]Øž]\ËÙY\
+BˆÙ[‹\]WØØXÚWÜÝ]\Ê
+Bˆ™]\›ˆ™\Ý[‚ˆYˆÛX\—ØØXÚJÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆ[œÝÙ\TSY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	ÐØXÚHY\™[‰Ëˆ	Ó\ˆ\ž™]YÝH›ÜœØÚ]Y[‹ÜÝ\ˆ[™Ù[[™›Ü›Y[ˆÙ\™[ˆÙ[0íœØÚˆ›Ú™ZÝ]ZY[ˆ[™ÜšYÚ[˜[YYY[ˆ›ZX™[ˆ\š[[‹‰ËˆSY\ÜØYÙP›Þ–Y\ßSY\ÜØYÙP›Þ“›ËSY\ÜØYÙP›Þ“›ÊBˆYˆ[œÝÙ\ˆOTSY\ÜØYÙP›Þ–Y\Î‚ˆ™]\›‚ˆÙ[‹˜Ø[˜Ù[Ü™]šY]ÊØZ]UYJNÈÙ[‹œ^Y\‹œÝÜ
+
+NÈÙ[‹œ^Y\‹œÙ]ÛÝ\˜ÙJU\›
+
+JBˆÙ[‹œ™]šY]×Ü]S›Û™NÈÙ[‹œ™]šY]×ÜÚYÛ˜]\™OS›Û™NÈÙ[‹œ™]šY]×Ü™]š\Ú[ÛKLBˆÙ[‹[X›˜Z[Ë˜ÛX\Š
+NÈÙ[‹Ø]™Y›Ü›\Ë˜ÛX\Š
+Bˆ[™WØØXÚJÙ[‹˜ØXÚWÜ›ÛÝ
+BˆÙ[‹œ™\\™WÝš\ÝX[ÊÙ[‹˜\ÜÙ]ÊNÈÙ[‹œ™Yœ™\Ú
+
+NÈÙ[‹\]WØØXÚWÜÝ]\Ê
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÐØXÚHÙ[Y\0­È›Ú™ZÝ[™ÜšYÚ[˜[YYY[ˆ›ZX™[ˆ[™\°é™\	ËL
+B‚ˆYˆ›ÞWÜ›Ùš[WØÚ[™ÙY
+Ù[‹
+—ÊN‚ˆ›Ùš[O\Ù[‹œ›ÞWÜ›Ùš[WØÛÛX›Ë˜Ý\œ™[]J
+HÜˆ	ÌÍŒ	ÂˆYˆ›Ùš[H›Ý[ˆ“ÖWÔ“Ñ’STÎ‚ˆ›Ùš[OIÌÍŒ	ÂˆÙ[‹œ›ÞWÜ›Ùš[O\›Ùš[BˆYˆÙ[‹œ›ÞWÙ[˜X›Y[™›ÝÙ[‹ÛÜšÙ\Ž‚ˆÙ[‹œ›ÞWÛX\^ßNÈÙ[‹œ™]šY]×Ü]Y]YYUYBˆYˆÙ[‹—Ù\™XÝÜ™]šY]×ØÛ\Ê
+N‚ˆÙ[‹˜XÝ]˜]WÙ\™XÝÜ™]šY]Ê^O\Ù[‹œ^Y\‹œ^X˜XÚÔÝ]J
+OOTSYYXT^Y\‹”^Z[™ÔÝ]JBˆÙ[‹œÝ\Ü›ÞWÙÙ[™\˜][ÛŠ
+B‚ˆYˆ™]šY]×ÜÚYÛ˜]\™WÙ›Ü—ØÝ\œ™[
+Ù[ŠN‚ˆ™]\›ˆ
+Ù[‹œ™]š\Ú[Û‹Ù[‹œ™]šY]×ÜÚ^™J
+K›ÛÛ
+Ù[‹œ›ÞWÙ[˜X›Y
+KÙ[‹œ›ÞWÜ›Ùš[Kˆ›ÛÛ
+Ù[‹™ÜWÜ™]šY]×Ø›Þš\ÐÚXÚÙY
+
+JKˆ\JÛÜY
+Ù[‹œ›ÞWÛX\š][\Ê
+JJKˆ\JÛÜY
+
+˜XÚË\JÛÜY
+Ý]Kš][\Ê
+JJJH›Üˆ˜XÚËÝ]H[ˆÙ[‹˜XÚ×ÜÝ]\Ëš][\Ê
+JJKˆ\JÛÜY
+Ù[‹›X\Ý\—ÛZ^\‹š][\Ê
+JJJB‚ˆÝ]XÛY]ÙˆYˆÙ\™XÝÝ˜[YJ˜[YK^XÝYÛ\˜[˜ÙOLYKMÊN‚ˆžN‚ˆ™]\›ˆXœÊ›Ø]
+˜[YJKY›Ø]
+^XÝY
+JHHÛ\˜[˜ÙBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ˜[YHOH^XÝY‚ˆYˆÙ\™XÝØÛ\Ú\×ÜZ[ŠÙ[‹Û\
+N‚ˆˆˆ•Ú]\ˆHÛ\Ø[ˆ™HXÛÙY\™XÝHÚ]Ý]HÛÛ\ÜÚ][Ûˆ™[™\‹ˆˆˆ‚ˆYˆ
+›ÝÛ\™[˜X›YÜˆÛ\šÚ[™OH	ÝšY[ÉÈÜˆÛ\œÛÝ\˜ÙWÝ\HOH	ÝšY[ÉÂˆÜˆ›ÝÛ\œ]Üˆ›Ý]
+Û\œ]
+Kš\×Ùš[J
+JN‚ˆ™]\›ˆ˜[ÙBˆYˆ›Ý[
+
+Ù[‹—Ù\™XÝÝ˜[YJÙ]]ŠÛ\˜[YJK^XÝY
+Bˆ›Üˆ˜[YK^XÝY[ˆ
+ˆ
+	ÜÜYY	ËKŒ
+K
+	Ý›Û[YIËKŒ
+K
+	Ù˜YWÚ[‰ËŒ
+K
+	Ù˜YWÛÝ]	ËŒ
+Kˆ
+	ÝšY[×ÜØØ[IËKŒ
+K
+	ÝšY[×Þ	ËJK
+	ÝšY[×ÞIËJKˆ
+	ØÜ›ÜÛY	ËŒ
+K
+	ØÜ›ÜÝÜ	ËŒ
+K
+	ØÜ›ÜÜšYÚ	ËŒ
+K
+	ØÜ›ÜØ›ÝÛIËŒ
+Kˆ
+	Ü›Ý][Û‰ËŒ
+K
+	ØœšYÚ™\ÜÉËŒ
+K
+	ØÛÛ˜\Ý	ËKŒ
+K
+	ÜØ]\˜][Û‰ËKŒ
+Kˆ
+	ØÛÛÜ—Ù^ÜÝ\™IËŒ
+K
+	ØÛÛÜ—Ý[\\˜]\™IËŒ
+K
+	ØÛÛÜ—Ý[	ËŒ
+Kˆ
+	ØÛÛÜ—ÝšXœ˜[˜ÙIËŒ
+K
+	ØÛÛÜ—ÛYÜ‰ËŒ
+K
+	ØÛÛÜ—ÛYÙÉËŒ
+Kˆ
+	ØÛÛÜ—ÛYØ‰ËŒ
+K
+	ØÛÛÜ—ÙØ[[XWÜ‰ËŒ
+K
+	ØÛÛÜ—ÙØ[[XWÙÉËŒ
+Kˆ
+	ØÛÛÜ—ÙØ[[XWØ‰ËŒ
+K
+	ØÛÛÜ—ÙØZ[—Ü‰ËŒ
+K
+	ØÛÛÜ—ÙØZ[—ÙÉËŒ
+Kˆ
+	ØÛÛÜ—ÙØZ[—Ø‰ËŒ
+K
+	ÛÜXÚ]IËKŒ
+K
+	Ø›\‰ËŒ
+K
+	ÜÚ\œ[‰ËŒ
+Kˆ
+	ÜÝXš[^˜][Û‰ËŒ
+K
+	ØÚ›ÛXWÚÙ^WÜÚ[Z[\š]IËŒJKˆ
+	ØÚ›ÛXWÚÙ^WØ›[™	ËŒJK
+	ÛX\Ú×Þ	ËŒ
+K
+	ÛX\Ú×ÞIËŒ
+Kˆ
+	ÛX\Ú×ÝÚY	ËKŒ
+K
+	ÛX\Ú×ÚZYÚ	ËKŒ
+K
+	ÛX\Ú×Ù™X]\‰ËŒ
+Kˆ
+	Ø]Y[×Û›Ú\ÙWÜ™YXÝ[Û‰ËŒ
+K
+	Ø]Y[×Ù\WÛÝÉËŒ
+Kˆ
+	Ø]Y[×Ù\WÛZY	ËŒ
+K
+	Ø]Y[×Ù\WÚYÚ	ËŒ
+Kˆ
+	Ø]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛ	ËLNŒ
+K
+	Ø]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][ÉËŒ
+Kˆ
+	Ø]Y[×ÙXÚÚ[™ÉËŒ
+K
+	Ø]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‰ËŒ
+Kˆ
+	Ø]Y[×Ü[‰ËŒ
+K
+	Ø]Y[×Û›Ü›X[^™WÝ\™Ù]	ËLM‹Œ
+JBˆ
+JN‚ˆ™]\›ˆ˜[ÙBˆYˆ
+Û\™œ™Y^™WÙœ˜[YHÜˆÛ\œ™]™\œÙHÜˆÛ\™›\ÚÜš^›Û[ÜˆÛ\™›\Ý™\XØ[ˆÜˆÛ\˜Ú›ÛXWÚÙ^WÙ[˜X›YÜˆÛ\˜˜XÚÙÜ›Ý[™Ü™[[Ý˜[Ù[˜X›YˆÜˆÛ\›Øš™XÝÜ™[[Ý˜[Ù[˜X›YÜˆÛ\˜]]×Ü™Yœ˜[YWÙ[˜X›YˆÜˆÛ\›X\Ú×Ý\HOH	Û›Û™IÈÜˆÛ\™Y™™XÝÜ™\Ù]OH	ØÛX[‰ÂˆÜˆÛ\™š[\—Ü™\Ù]OH	Û›Û™IÈÜˆÛ\›]Ü]ˆÜˆÛ\˜[œÚ][Û—Ý\HOH	Û›Û™IÈÜˆÛ\˜[œÚ][Û—Ù\˜][ÛˆˆYKMÂˆÜˆÛ\˜]Y[×ØÛÛ\™\ÜÛÜ—Ù[˜X›YÜˆÛ\˜]Y[×Û›Ü›X[^™BˆÜˆÛ\˜]Y[×ØÚ[›™[Û[ÙHOH	ÜÝ\™[ÉÂˆÜˆÛ\œÜYYÚÙ^Yœ˜[Y\ÈÜˆÛ\šÙ^Yœ˜[Y\ÈÜˆÛ\›Û[YWÚÙ^Yœ˜[Y\ÂˆÜˆÛ\˜XÚÚ[™×ÚÙ^Yœ˜[Y\ÈÜˆÛ\˜]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\ÂˆÜˆÛ\›X\Ú×ÜÚ[ÈÜˆÛ\›X\Ú×Ü]ÚÙ^Yœ˜[Y\ÊN‚ˆ™]\›ˆ˜[ÙBˆ™]\›ˆYB‚ˆYˆÙ\™XÝÜ™]šY]×ØÛ\ÊÙ[ŠN‚ˆˆˆ”™]\›ˆHÛÛYÝ[Ý\ËÚ[™ÛK]˜XÚÈ[Y[[™HÝZ]X›H›Üˆ\™XÝ^Kˆˆˆ‚ˆYˆ›ÝÙ[‹˜Û\Î‚ˆ™]\›ˆ
+
+Bˆ˜XÚÜÏ^ØÛ\˜XÚÈ›ÜˆÛ\[ˆÙ[‹˜Û\ßBˆYˆ[Š˜XÚÜÊHOHN‚ˆ™]\›ˆ
+
+Bˆ˜XÚÏ[™^
+]\Š˜XÚÜÊJBˆYˆ˜XÚÈH‚ˆ™]\›ˆ
+
+BˆÝ]O\Ù[‹˜XÚ×ÜÝ]\Ë™Ù]
+˜XÚËßJBˆYˆ
+Ý]K™Ù]
+	Û]]Y	ÊHÜˆÝ]K™Ù]
+	ÜÛÛÉÊBˆÜˆ›ÝÙ[‹—Ù\™XÝÝ˜[YJÝ]K™Ù]
+	Ý›Û[YIËKŒ
+KKŒ
+BˆÜˆ›ÝÙ[‹—Ù\™XÝÝ˜[YJÝ]K™Ù]
+	Ü[‰ËŒ
+KŒ
+JN‚ˆ™]\›ˆ
+
+BˆYˆ
+›ÝÙ[‹—Ù\™XÝÝ˜[YJÙ[‹›X\Ý\—ÛZ^\‹™Ù]
+	Ý›Û[YIËKŒ
+KKŒ
+BˆÜˆ›ÝÙ[‹—Ù\™XÝÝ˜[YJÙ[‹›X\Ý\—ÛZ^\‹™Ù]
+	Ü[‰ËŒ
+KŒ
+BˆÜˆÙ[‹›X\Ý\—ÛZ^\‹™Ù]
+	ÛÝY™\Ü×Û›Ü›X[^˜][Û‰Ë˜[ÙJJN‚ˆ™]\›ˆ
+
+BˆÜ™\™Y]\JÛÜY
+Ù[‹˜Û\ËÙ^O[[X™HÛ\ŠÛ\œÜÚ][Û‹Û\ZY
+JJBˆ^XÝYLŒˆ›ÜˆÛ\[ˆÜ™\™Y‚ˆYˆXœÊ›Ø]
+Û\œÜÚ][ÛŠKY^XÝY
+HˆYKMHÜˆ›ÝÙ[‹—Ù\™XÝØÛ\Ú\×ÜZ[ŠÛ\
+N‚ˆ™]\›ˆ
+
+Bˆ^XÝYXÛ\™š[š\Úˆ™]\›ˆÜ™\™Y‚ˆYˆ\™XÝÜ™]šY]×ÜÚYÛ˜]\™WÙ›Ü—ØÝ\œ™[
+Ù[ŠN‚ˆ™]\›ˆ
+Ù[‹œ™]š\Ú[Û‹›ÛÛ
+Ù[‹œ›ÞWÙ[˜X›Y
+KÙ[‹œ›ÞWÜ›Ùš[Kˆ\JÛÜY
+Ù[‹œ›ÞWÛX\š][\Ê
+JJJB‚ˆYˆ\™XÝÜ™]šY]×Ú\×ØÝ\œ™[
+Ù[ŠN‚ˆ™]\›ˆ›ÛÛ
+Ù[‹™\™XÝÜ™]šY]È[™Ù[‹™\™XÝÜ™]šY]×Ü™]š\Ú[ÛˆOHÙ[‹œ™]š\Ú[Û‚ˆ[™Ù[‹™\™XÝÜ™]šY]×ÜÚYÛ˜]\™HOHÙ[‹™\™XÝÜ™]šY]×ÜÚYÛ˜]\™WÙ›Ü—ØÝ\œ™[
+
+JB‚ˆYˆÙ\™XÝØÛ\Ø]
+Ù[‹ÜÚ][Û‹Û\ÏS›Û™JN‚ˆÛ\ÏXÛ\ÈÜˆÙ[‹—Ù\™XÝÜ™]šY]×ØÛ\Ê
+BˆYˆ›ÝÛ\Î‚ˆ™]\›ˆ›Û™BˆÜÚ][ÛY›Ø]
+ÜÚ][ÛŠBˆ›Üˆ[™^Û\[ˆ[[Y\˜]JÛ\ÊN‚ˆYˆÛ\œÜÚ][Û‹LYKMˆHÜÚ][ÛˆÛ\™š[š\ÚLYKMŽ‚ˆ™]\›ˆ[™^Û\ˆYˆ[™^OH[ŠÛ\ÊKLH[™Û\œÜÚ][Û‹LYKMˆHÜÚ][ÛˆHÛ\™š[š\Ú
+ÌYKMŽ‚ˆ™]\›ˆ[™^Û\ˆ™]\›ˆ›Û™B‚ˆYˆÙ\™XÝÜÛÝ\˜ÙWÜ]
+Ù[‹Û\
+N‚ˆYˆÙ[‹œ›ÞWÙ[˜X›Y[™Û\œ]‚ˆ™]\›ˆÙ[‹œ›ÞWÛX\™Ù]
+ÝŠ]
+Û\œ]
+Kœ™\ÛÛ™J
+JKÛ\œ]
+Bˆ™]\›ˆÛ\œ]‚ˆYˆÛØYÙ\™XÝØÛ\Ø]Ü^ZXY
+Ù[‹^OQ˜[ÙJN‚ˆÛ\Ï\Ù[‹—Ù\™XÝÜ™]šY]×ØÛ\Ê
+BˆÙ[XÝY\Ù[‹—Ù\™XÝØÛ\Ø]
+Ù[‹œ^ZXYÛ\ÊBˆYˆÙ[XÝY\È›Û™N‚ˆÙ[‹™\™XÝØÛ\ÝZYS›Û™BˆÙ[‹œ^Y\‹œ]\ÙJ
+Bˆ™]\›‚ˆËÛ\\Ù[XÝYˆÙ[‹™\™XÝØÛ\ÝZYXÛ\ZYˆÛÝ\˜ÙO\Ù[‹—Ù\™XÝÜÛÝ\˜ÙWÜ]
+Û\
+BˆÛÝ\˜ÙWÝ[YOXÛ\œÝ\
+ÛX^
+ŒZ[ŠÛ\›[™ÝÙ[‹œ^ZXYXÛ\œÜÚ][ÛŠJBˆÙ[‹›[ÙOIÝ[Y[[™IÎÈÙ[‹šY[×ÜÝXÚËœÙ]Ý\œ™[[™^
+JBˆÙ[‹œ[™[™×ÜÙYZÏJ›Ý[™
+ÛÝ\˜ÙWÝ[YJŒL
+K›ÛÛ
+^JJBˆ\›TU\›™œ›ÛSØØ[š[JÝŠÛÝ\˜ÙJJBˆYˆÙ[‹œ^Y\‹œÛÝ\˜ÙJ
+OO]\›‚ˆÙ[‹œ[™[™×ÜÙYZÏS›Û™BˆÙ[‹œ^Y\‹œÙ]ÜÚ][ÛŠ›Ý[™
+ÛÝ\˜ÙWÝ[YJŒL
+JBˆYˆ^N‚ˆÙ[‹œ^Y\‹œ^J
+Bˆ[ÙN‚ˆÙ[‹œ^Y\‹œÝÜ
+
+NÈÙ[‹œ^Y\‹œÙ]ÛÝ\˜ÙJ\›
+B‚ˆYˆXÝ]˜]WÙ\™XÝÜ™]šY]ÊÙ[‹^OS›Û™JN‚ˆˆˆ”ÝÚ]ÚÈ[œÝ[ÛÝ\˜ÙH^X˜XÚÈÚ[ˆH[Y[[™H™YYÈ›È™[™\‹ˆˆˆ‚ˆÛ\Ï\Ù[‹—Ù\™XÝÜ™]šY]×ØÛ\Ê
+BˆYˆ›ÝÛ\Î‚ˆÙ[‹™\™XÝÜ™]šY]ÏQ˜[ÙNÈÙ[‹™\™XÝÜ™]šY]×Ü™]š\Ú[ÛKLBˆÙ[‹™\™XÝÜ™]šY]×ÜÚYÛ˜]\™OS›Û™NÈÙ[‹™\™XÝØÛ\ÝZYS›Û™Bˆ™]\›ˆ˜[ÙBˆYˆ^H\È›Û™N‚ˆ^O\Ù[‹œ^Y\‹œ^X˜XÚÔÝ]J
+OOTSYYXT^Y\‹”^Z[™ÔÝ]BˆÙ[‹™\™XÝÜ™]šY]ÏUYNÈÙ[‹™\™XÝÜ™]šY]×Ü™]š\Ú[Û\Ù[‹œ™]š\Ú[Û‚ˆÙ[‹™\™XÝÜ™]šY]×ÜÚYÛ˜]\™O\Ù[‹™\™XÝÜ™]šY]×ÜÚYÛ˜]\™WÙ›Ü—ØÝ\œ™[
+
+BˆÙ[‹›[ÙOIÝ[Y[[™IÎÈÙ[‹˜]Y[ËœÙ]›Û[YJJNÈÙ[‹œ^Y\‹œÙ]^X˜XÚÔ˜]JKŒ
+BˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	ÑT‘PÕTÐÒ’U0­ÈÛÙ›ÜXœÜY[˜\ˆ0­ÈÙZ[™H™]KP™\™XÚ[™È°íYÉÊBˆÙ[‹—ÛØYÙ\™XÝØÛ\Ø]Ü^ZXY
+›ÛÛ
+^JJBˆ™]\›ˆYB‚ˆYˆ™]šY]×Ú\×ØÝ\œ™[
+Ù[ŠN‚ˆYˆÙ[‹™\™XÝÜ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆ™]\›ˆYBˆ™]\›ˆ›ÛÛ
+Ù[‹œ™]šY]×Ü][™Ù[‹œ™]šY]×ÜÚYÛ˜]\™HOHÙ[‹œ™]šY]×ÜÚYÛ˜]\™WÙ›Ü—ØÝ\œ™[
+
+Bˆ[™]
+Ù[‹œ™]šY]×Ü]
+Kš\×Ùš[J
+JB‚ˆYˆØ[˜Ù[Ü™]šY]ÊÙ[‹ØZ]Q˜[ÙJN‚ˆÛÜšÙ\\Ù[‹œ™]šY]×ÝÛÜšÙ\‚ˆYˆ›ÝÛÜšÙ\Ž‚ˆ™]\›‚ˆÛÜšÙ\‹˜Ø[˜Ù[œÙ]
+
+BˆYˆØZ]‚ˆÛÜšÙ\‹ØZ]
+
+BˆYˆÙ[‹œ™]šY]×ÝÛÜšÙ\ˆ\ÈÛÜšÙ\Ž‚ˆÙ[‹œ™]šY]×ÝÛÜšÙ\S›Û™BˆÛÜšÙ\‹™[]S]\Š
+B‚ˆYˆÚÝ×ØÛÛ^ÛY[JÙ[‹ZYÛØ˜[ÜÜÊN‚ˆYˆZY‚ˆÙ[‹œÙ[XÝØÛ\
+ZY
+BˆÛ\\Ù[‹˜Ý\œ™[ØÛ\
+
+HYˆZY[ÙH›Û™BˆY[OTSY[JÙ[ŠBˆYˆÛ\‚ˆ[œÜXÝ[Y[K˜YXÝ[ÛŠ	ÐÛ\]\ÙÙ]ðé0­ÈZ[œÝ[[™Ù[ˆ™XÚÉÊBˆ[œÜXÝœÙ][˜X›Y
+˜[ÙJBˆY[K˜YÙ\\˜]ÜŠ
+BˆY[K˜YXÝ[ÛŠ	ÒÛÜY\™[‰ËÙ[‹˜ÛÜWÜÙ[XÝ[ÛŠBˆY[K˜YXÝ[ÛŠ	Ð]šX]HÛÜY\™[ˆ0­ÈÝ›
+Ð[
+ÐÉËÙ[‹˜ÛÜWØ]šX]\ÊBˆY[K˜YXÝ[ÛŠ	Ð]šX]HZ[™°ïÙ[ˆ0­ÈÝ›
+Ð[
+Õ‰ËÙ[‹œ\ÝWØ]šX]\ÊBˆYˆÛ\šÚ[™OH	ÝšY[ÉÈ[™Û\œÛÝ\˜ÙWÝ\HOH	ØY\ÝY[	Î‚ˆY[K˜YXÝ[ÛŠ	ÒÙ^Yœ˜[Y\ÈÛÜY\™[ˆ0­ÈÝ›
+Ð[
+ÒÉËÙ[‹˜ÛÜWÚÙ^Yœ˜[Y\ÊBˆY[K˜YXÝ[ÛŠ	ÒÙ^Yœ˜[Y\ÈZ[™°ïÙ[ˆ0­ÈÝ›
+Ð[
+ÔÚY
+ÒÉËÙ[‹œ\ÝWÚÙ^Yœ˜[Y\ÊBˆY[K˜YXÝ[ÛŠ	Ñ\^šY\™[‰ËÙ[‹™\XØ]WÜÙ[XÝ[ÛŠBˆY[K˜YXÝ[ÛŠ	Ò[œÙ\Z[™°ïÙ[‰ËÙ[‹š[œÙ\ÜÙ[XÝ[ÛŠBˆY[K˜YXÝ[ÛŠ	ÓÝ™\Üš]HZ[™°ïÙ[‰ËÙ[‹›Ý™\Üš]WÜÙ[XÝ[ÛŠBˆY[K˜YXÝ[ÛŠ	Ôš\H0íœØÚ[‰ËÙ[‹œš\WÙ[]JBˆYˆ[ŠÙ[‹œÙ[XÝYØÛ\Ê
+JHHŽ‚ˆY[K˜YXÝ[ÛŠ	ÑÜ\Y\™[‰ËÙ[‹™Ü›Ý\ÜÙ[XÝ[ÛŠBˆYˆ[žJ˜[YK™Ü›Ý\ÚY›Üˆ˜[YH[ˆÙ[‹œÙ[XÝYØÛ\Ê
+JN‚ˆY[K˜YXÝ[ÛŠ	ÑÜ\H0íœÙ[‰ËÙ[‹[™Ü›Ý\ÜÙ[XÝ[ÛŠBˆYˆ[ŠÙ[‹œÙ[XÝYØÛ\Ê
+JHHŽ‚ˆY[K˜YXÝ[ÛŠ	ÐÛÛ\Ý[™PÛ\\œÝ[[‰ËÙ[‹˜Ü™X]WØÛÛ\Ý[™
+BˆYˆ[žJ˜[YK˜ÛÛ\Ý[™ÚY›Üˆ˜[YH[ˆÙ[‹œÙ[XÝYØÛ\Ê
+JN‚ˆY[K˜YXÝ[ÛŠ	ÐÛÛ\Ý[™PÛ\]Y›0íœÙ[‰ËÙ[‹™\ÜÛÛ™WØÛÛ\Ý[™
+BˆY[K˜YÙ\\˜]ÜŠ
+BˆYˆÛ\šÚ[™OIÝ^	È[™Û\œÛÝ\˜ÙWÝ\HOIØY\ÝY[	Î‚ˆY[K˜YXÝ[ÛŠ	ø¥­ˆÛ\[œÙZ[‰ËÙ[‹œÛÝ\˜ÙWÜ™]šY]ÊBˆYˆÛ\šÚ[™[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊH[™Û\œÛÝ\˜ÙWÝ\H[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊN‚ˆÛÝ\˜ÙWÛY[O[Y[K˜YY[J	Ô]Y[[Ûš]Ü‰ÊBˆÛÝ\˜ÙWÛY[K˜YXÝ[ÛŠ	Ô]Y[R[ˆÙ]™[ˆ0­ÈIËÙ[‹œÙ]ÜÛÝ\˜ÙWÚ[ŠBˆÛÝ\˜ÙWÛY[K˜YXÝ[ÛŠ	Ô]Y[SÝ]Ù]™[ˆ0­ÈÉËÙ[‹œÙ]ÜÛÝ\˜ÙWÛÝ]
+BˆÛÝ\˜ÙWÛY[K˜YXÝ[ÛŠ	Ô]Y[X\šÙ[ˆ0íœØÚ[‰ËÙ[‹˜ÛX\—ÜÛÝ\˜ÙWÛX\šÜÊBˆÛÝ\˜ÙWÛY[K˜YÙ\\˜]ÜŠ
+BˆÛÝ\˜ÙWÛY[K˜YXÝ[ÛŠ	ÓX\šÚY\[ˆ™\™ZXÚ[È[œÙ\Z[™°ïÙ[‰ËÙ[‹š[œÙ\ÜÛÝ\˜ÙWÜ˜[™ÙJBˆÛÝ\˜ÙWÛY[K˜YXÝ[ÛŠ	ÓX\šÚY\[ˆ™\™ZXÚ[ÈÝ™\Üš]HZ[™°ïÙ[‰ËÙ[‹›Ý™\Üš]WÜÛÝ\˜ÙWÜ˜[™ÙJBˆYˆÛ\šÚ[™OIÝ^	Î‚ˆ7Û½<¶‰žËkºwµç\ÙH˜[ÙJNÈÙ[‹™œ™Y^™WÙ\˜][Û‹œÙ]˜[YJË™œ™Y^™WÙ\˜][ÛˆYˆ\×ÝšY[È[ÙH
+BˆÙ[‹œ™]™\œÙWØÛ\œÙ]ÚXÚÙY
+Ëœ™]™\œÙHYˆ\×ÝšY[È[ÙH˜[ÙJBˆš[\—Ú[™^\Ù[‹™š[\—Ü™\Ù]™š[™]JË™š[\—Ü™\Ù]Yˆ\×ÝšY[È[ÙH	Û›Û™IÊBˆÙ[‹™š[\—Ü™\Ù]œÙ]Ý\œ™[[™^
+š[\—Ú[™^Yˆš[\—Ú[™^H[ÙH
+BˆÙ[‹›]Ü]œÙ]^
+Ë›]Ü]Yˆ\×ÝšY[È[ÙH	ÉÊBˆÙ[‹˜Ú›ÛXWÚÙ^WÙ[˜X›YœÙ]ÚXÚÙY
+Ë˜Ú›ÛXWÚÙ^WÙ[˜X›YYˆ\×ÝšY[È[ÙH˜[ÙJBˆÙ[‹˜Ú›ÛXWÚÙ^WØÛÛÜ‹œÙ]^
+Ë˜Ú›ÛXWÚÙ^WØÛÛÜˆYˆ\×ÝšY[È[ÙH	ÈÌ™Œ	ÊBˆÙ[‹˜Ú›ÛXWÚÙ^WÜÚ[Z[\š]KœÙ]˜[YJË˜Ú›ÛXWÚÙ^WÜÚ[Z[\š]JŒLYˆ\×ÝšY[È[ÙHL
+BˆÙ[‹˜Ú›ÛXWÚÙ^WØ›[™œÙ]˜[YJË˜Ú›ÛXWÚÙ^WØ›[™
+ŒLYˆ\×ÝšY[È[ÙHL
+BˆX\Ú×Ú[™^\Ù[‹›X\Ú×Ý\K™š[™]JË›X\Ú×Ý\HYˆ\×ÝšY[È[ÙH	Û›Û™IÊBˆÙ[‹›X\Ú×Ý\KœÙ]Ý\œ™[[™^
+X\Ú×Ú[™^YˆX\Ú×Ú[™^H[ÙH
+BˆÙ[‹›X\Ú×ÞœÙ]˜[YJË›X\Ú×Þ
+ŒLYˆ\×ÝšY[È[ÙH
+NÈÙ[‹›X\Ú×ÞKœÙ]˜[YJË›X\Ú×ÞJŒLYˆ\×ÝšY[È[ÙH
+BˆÙ[‹›X\Ú×ÝÚYœÙ]˜[YJË›X\Ú×ÝÚY
+ŒLYˆ\×ÝšY[È[ÙHL
+NÈÙ[‹›X\Ú×ÚZYÚœÙ]˜[YJË›X\Ú×ÚZYÚ
+ŒLYˆ\×ÝšY[È[ÙHL
+BˆÙ[‹›X\Ú×Ù™X]\‹œÙ]˜[YJË›X\Ú×Ù™X]\ŠŒLYˆ\×ÝšY[È[ÙH
+Bˆ˜[œÚ][Û—Ú[™^\Ù[‹˜[œÚ][Û—Ý\K™š[™]JË˜[œÚ][Û—Ý\JBˆÙ[‹˜[œÚ][Û—Ý\KœÙ]Ý\œ™[[™^
+˜[œÚ][Û—Ú[™^Yˆ˜[œÚ][Û—Ú[™^H[ÙH
+BˆÙ[‹˜[œÚ][Û—Ù\˜][Û‹œÙ]˜[YJË˜[œÚ][Û—Ù\˜][ÛˆYˆ\×Ý˜[œÚ][Û˜X›H[ÙH
+BˆYˆ\×ÝšY[Î‚ˆÙ[‹šÙ^Yœ˜[YWÝ[YKœÙ]X^[][JX^
+ŒKË›[™Ý
+JBˆØØ[Ý[YO[X^
+ŒZ[ŠË›[™ÝÙ[‹œ^ZXYXËœÜÚ][ÛŠJBˆÙ[‹šÙ^Yœ˜[YWÝ[YKœÙ]˜[YJØØ[Ý[YJBˆÙ[‹šÙ^Yœ˜[YWØÝ\™KœÙ]Ý\œ™[[™^
+Ù[‹šÙ^Yœ˜[YWØÝ\™K™š[™]J	Û[™X\‰ÊJBˆÙ[‹œ™Yœ™\ÚÚÙ^Yœ˜[YWÛ\Ý
+ÊBˆÙ[‹œ™Yœ™\ÚÚÙ^Yœ˜[YWÙÜ˜\
+ÊBˆÙ[‹œÜYYÜ˜[\Ý[YKœÙ]X^[][JX^
+ŒKË™[™XËœÝ\
+JBˆÙ[‹œÜYYÜ˜[\Ý[YKœÙ]˜[YJX^
+ŒZ[ŠË™[™XËœÝ\ØØ[Ý[YJJJBˆÙ[‹œ™Yœ™\ÚÜÜYYÜ˜[\Û\Ý
+ÊBˆ[ÙN‚ˆÙ[‹šÙ^Yœ˜[YWÛ\Ý˜ÛX\Š
+BˆÙ[‹šÙ^Yœ˜[YWÙÜ˜\œÙ]Ù]J×KKŒ	ÜØØ[IËKŒ
+BˆÙ[‹œÜYYÜ˜[\Û\Ý˜ÛX\Š
+BˆYˆ\×Ø]Y[ØX›N‚ˆÙ[‹›Û[YWÚÙ^Yœ˜[YWÝ[YKœÙ]X^[][JX^
+ŒKË›[™Ý
+JBˆØØ[Ý[YO[X^
+ŒZ[ŠË›[™ÝÙ[‹œ^ZXYXËœÜÚ][ÛŠJBˆÙ[‹›Û[YWÚÙ^Yœ˜[YWÝ[YKœÙ]˜[YJØØ[Ý[YJBˆÙ[‹œ™Yœ™\ÚÝ›Û[YWÚÙ^Yœ˜[YWÛ\Ý
+ÊBˆ[ÙN‚ˆÙ[‹›Û[YWÚÙ^Yœ˜[YWÛ\Ý˜ÛX\Š
+BˆYˆ›Ý\×Ø]Y[ØX›N‚ˆÙ[‹›Û[YWÚÙ^Yœ˜[YWØÝ\™KœÙ]Ý\œ™[[™^
+Ù[‹›Û[YWÚÙ^Yœ˜[YWØÝ\™K™š[™]J	Û[™X\‰ÊJBˆ™X]ØÛÝ[\Ý[JH›ÜˆX\šÙ\ˆ[ˆÙ[‹›X\šÙ\œÈYˆX\šÙ\‹™Ù]
+	ÚÚ[™	ÊHOH	Ø™X]	ÊBˆÙ[‹˜™X]Ø[˜[^™WØ]Û‹œÙ][˜X›Y
+\×Ø]Y[ØX›H[™›ÝÙ[‹ÛÜšÙ\ŠBˆÙ[‹˜™X]ØÛX\—Ø]Û‹œÙ][˜X›Y
+™X]ØÛÝ[ˆ[™›ÝÙ[‹ÛÜšÙ\ŠBˆÙ[‹˜™X]ÜÝ]\ËœÙ]^
+‰ÞØ™X]ØÛÝ[H™X]SX\šÙ\ˆ›Üš[™[‹‰ÈYˆ™X]ØÛÝ[[ÙH	ÒÙZ[™H™X]SX\šÙ\ˆ›Üš[™[‹‰ÊBˆÙ[‹^ØÝ]ÜÝ]\ËœÙ]^
+	Ô]\Ù[ˆ[™°ïðíœ\ˆÙ\™[ˆÚØ[[™\›‰ÈYˆ\×Ø]Y[ØX›H[ÙH	ÕðéHZ[ˆšY[ÈÙ\ˆ]Y[ÈZ]Û‹‰ÊBˆÙ[‹˜]]×ØÝ]ÜÝ]\ËœÙ]^
+	Ð™X]H[™Þ™[™[œ[šÝHÙ\™[ˆÚØ[\šØ[›‰ÈYˆ\×ÝšY[È[ÙH	ÕðéHZ[™[ˆ›Ü›X[[ˆšY[ØÛ\‰ÊBˆYˆË›][XØ[WÙÜ›Ý\‚ˆY[X™\œÏVÝ˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÈYˆ˜[YK›][XØ[WÙÜ›Ý\OHË›][XØ[WÙÜ›Ý\BˆXÝ]™O[™^
+
+˜[YH›Üˆ˜[YH[ˆY[X™\œÈYˆ˜[YK›][XØ[WØXÝ]™JK›Û™JBˆÙ[‹›][XØ[WÜÝ]\ËœÙ]^
+ˆ‰ÞÛ[ŠY[X™\œÊ_HÚ[šÙ[0­ÈZÝ]ŽˆØXÝ]™K˜Ø[Y\˜WØ[™ÛHÜˆ[˜™[˜[›ŸIÈYˆXÝ]™Bˆ[ÙH‰ÞÛ[ŠY[X™\œÊ_HÚ[šÙ[0­ÈÙZ[ˆZÝ]™\ˆÚ[šÙ[	ÊBˆ[ÙN‚ˆÙ[‹›][XØ[WÜÝ]\ËœÙ]^
+	ÒÙZ[™H][KRØ[Y\˜KQÜ\K‰ÊB‚ˆYˆÙ[XÝØÛ\
+Ù[‹ZY
+N‚ˆÙ[‹˜ÛÛ\\™WÜ™[X\ÙY
+
+NÈÙ[‹šY[Ë˜Ø[˜Ù[Ý˜[œÙ›Ü›J
+BˆYˆZYO\Ù[‹˜Ý\œ™[[™Ù[‹›[ÙOOIÜÛÝ\˜ÙIÎ‚ˆÙ[‹œ^Y\‹œ]\ÙJ
+NÜÙ[‹œ[™[™×ÜÙYZÏS›Û™NÜÙ[‹œ^Y\‹œÙ]ÛÝ\˜ÙJU\›
+
+JNÜÙ[‹›[ÙOIÝ[Y[[™IÂˆÙ[‹œÛÝ\˜ÙWØÛ\ÝZYS›Û™NÜÙ[‹œÛÝ\˜ÙWÚ[S›Û™NÜÙ[‹œÛÝ\˜ÙWÛÝ]S›Û™BˆÙ[‹šY[×ÜÝXÚËœÙ]Ý\œ™[[™^
+
+NÜÙ[‹œXÙZÛ\‹œÙ]^
+	ÐÛ\]\ÙÙ]ðé0­È8 'Û\[œÙZ[¸ 'Ý\]YH]Y[›ÜœØÚ]K‰ÊBˆÙ[‹œÙ]ÜÙ[XÝ[ÛŠÝZYKZY^[™ÙÜ›Ý\ÏUYJB‚ˆYˆÛÛ[Z]Ù˜YÊÙ[‹Ø[™Y]JN‚ˆYˆÙ[‹ÛÜšÙ\ŽˆÙ[‹œ™Yœ™\Ú
+
+NÈ™]\›‚ˆØ[™Y]\ÈH\Ý
+Ø[™Y]JHYˆ\Ú[œÝ[˜ÙJØ[™Y]K
+\Ý\JJH[ÙHØØ[™Y]WBˆÜšYÚ[˜[ÈHÝ˜[YKZYˆ˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ßBˆYˆ[žJ˜[YKZY›Ý[ˆÜšYÚ[˜[È›Üˆ˜[YH[ˆØ[™Y]\ÊN‚ˆ™]\›‚ˆYˆ[žJÙ[‹˜XÚ×ÛØÚÙY
+ÜšYÚ[˜[ÖÝ˜[YKZYK˜XÚÊHÜˆÙ[‹˜XÚ×ÛØÚÙY
+˜[YK˜XÚÊH›Üˆ˜[YH[ˆØ[™Y]\ÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑYH]Y[HÙ\ˆšY[Ü\ˆ\ÝÙ\Ü\œ‰Ë
+BˆÙ[‹œ™Yœ™\Ú
+
+Bˆ™]\›‚ˆžWÝZYHÝ˜[YKZYˆ˜[YH›Üˆ˜[YH[ˆØ[™Y]\ßBˆ›ÜÜÙYVØžWÝZY™Ù]
+ËZYÊH›ÜˆÈ[ˆÙ[‹˜Û\×BˆžN‚ˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆYˆ›ÜÜÙYO\Ù[‹˜Û\Îœ™]\›‚ˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹œÙ[XÝ[ÛVÝ˜[YKZY›Üˆ˜[YH[ˆØ[™Y]\×NÈÙ[‹˜Ý\œ™[XØ[™Y]\ÖËLWKZYÈÙ[‹˜Ú[™ÙY
+
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJÝŠ^ÊKœ™\XÙJ	×‰Ë	È	ÊKÌ
+BˆÙ[‹[Y[[™K\]J
+B‚ˆYˆ\WÝ^ÜÝ[WÜ™\Ù]
+Ù[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝ^	ÈÜˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÕðéHY\œÝZ[™[ˆ^HÙ\ˆ[\][Û\‰ËÌ
+Bˆ™\Ù]UVÔÕSWÔ‘TÑUË™Ù]
+Ù[‹^ÜÝ[WÜ™\Ù]˜Ý\œ™[]J
+JBˆYˆ›Ý™\Ù]‚ˆ™]\›‚ˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆØ[™Y]O\™\XÙJË
+Š™XÝ
+™\Ù]
+JBˆžN‚ˆ˜[Y]WÝ[Y[[™JØØ[™Y]HYˆ][KZYOXËZY[ÙH][H›Üˆ][H[ˆÙ[‹˜Û\×KÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\ÏVØØ[™Y]HYˆ][KZYOXËZY[ÙH][H›Üˆ][H[ˆÙ[‹˜Û\×NÈÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Õ^Ý[[™Ù]Ù[™]‰ËL
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆ\WÙY™™XÝÜ™\Ù]
+Ù[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÕðéHY\œÝZ[™[ˆšY[ËHÙ\ˆY\ÝY[S^Y\‹‰ËÌ
+BˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆ˜[YO\Ù[‹™Y™™XÝÜ™\Ù]˜Ý\œ™[]J
+HÜˆ	ØÛX[‰Âˆ™\Ù]QQ‘‘PÕÔ‘TÑUË™Ù]
+˜[YJBˆYˆ›Ý™\Ù]‚ˆ™]\›‚ˆØ[™Y]O\™\XÙJËY™™XÝÜ™\Ù][˜[YK
+Š™XÝ
+™\Ù]
+JBˆžN‚ˆ›ÜÜÙYVØØ[™Y]HYˆ][KZYOXËZY[ÙH][H›Üˆ][H[ˆÙ[‹˜Û\×Bˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÑY™™ZÝT™\Ù]8 'žÜÙ[‹™Y™™XÝÜ™\Ù]˜Ý\œ™[^
+
+_x '[™Ù]Ù[™]‰ËÌ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆ^ÜÜÝX]\ÊÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆÝY\Ï\ÝX]WØÝY\×Ùœ›ÛWØÛ\ÊÙ[‹˜Û\ËÙ[‹˜XÚ×Û˜[Y\ÊBˆYˆ›ÝÝY\Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÒÙZ[™H^ÜY\˜˜\™[ˆ^HÙ\ˆ[\][Û\ÈÙY[™[‹‰ÊBˆ]ÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJÙ[‹	Õ[\][^ÜY\™[‰Ë	Õ[\][œÜ	Ëˆ	ÔÝX”š\
+
+‹œÜ
+NÎÕÙX••
+
+‹
+IËÜ[ÛœÏTQš[QX[ÙË‘ÛÛÛ™š\›SÝ™\Üš]JBˆYˆ›Ý]‚ˆ™]\›‚ˆÝY™š^T]
+]
+KœÝY™š^˜Ø\ÙY›Û
+
+BˆYˆÝY™š^›Ý[ˆ
+	ËœÜ	Ë	Ë	ÊN‚ˆ]
+ÏH	Ë	ÈYˆ	ÕÙX••	È[ˆ][ÙH	ËœÜ	Âˆ\™Ù]T]
+]
+Kœ™\ÛÛ™J
+BˆYˆ\™Ù]™^\ÝÊ
+H[™SY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	Õ[\][\œÙ]™[ÉË‰ÞÝ\™Ù]W°ï™\œØÚ™ZX™[ÉËSY\ÜØYÙP›Þ–Y\ßSY\ÜØYÙP›Þ“›ËSY\ÜØYÙP›Þ“›ÊHOTSY\ÜØYÙP›Þ–Y\Î‚ˆ™]\›‚ˆžN‚ˆÜš]WÜÝX]WÙš[J\™Ù]Ù[‹˜Û\ËÙ[‹˜XÚ×Û˜[Y\ÊBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÞÛ[ŠÝY\Ê_H[\][^ÜY\0­ÈÝ\™Ù]›˜[Y_IËL
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆ\WÜ›Ü\Y\ÊÙ[ŠN‚ˆYˆÙ[‹—Ú[œÜXÝÜ—Ùš[[™ÈÜˆÙ[‹ÛÜšÙ\Žˆ™]\›‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ[ŠÙ[‹œÙ[XÝ[ÛŠOŒN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ò[œÜXÝÜ‹pá™\[™Ù[ˆÚ[™™ZHYZ™˜XÚ]\ÝØZXZÝ]šY\‰ËÌ
+Bˆ™]\›‚ˆYˆÎ‚ˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆÙ[‹™š[Ú[œÜXÝÜŠ
+Bˆ™]\›‚ˆ˜[Y\ÏYXÝ
+ÜÚ][Û\Ù[‹œÜÚ][Û‹˜[YJ
+KÝ\\Ù[‹œÝ\˜[YJ
+K[™\Ù[‹™[™˜[YJ
+KÜYY\Ù[‹œÜYY˜[YJ
+K˜YWÚ[\Ù[‹™˜YWÚ[‹˜[YJ
+K˜YWÛÝ]\Ù[‹™˜YWÛÝ]˜[YJ
+K›Û[YO\Ù[‹›Û[YK˜[YJ
+KÌL˜XÚÏ\Ù[‹˜XÚ×ØÛÛX›Ë˜Ý\œ™[]J
+JBˆYˆËšÚ[™OIÝ^	Î‚ˆ˜[Y\Ë\]J^\Ù[‹^Ý˜[YK^
+
+K›ÛÜÚ^™O\Ù[‹^ÜÚ^™K˜[YJ
+KÛÛÜ\Ù[‹^ØÛÛÜ‹^
+
+KœÝš\
+
+Kˆ›ÛÙ˜[Z[O\Ù[‹^Ù›Û˜Ý\œ™[^
+
+KœÝš\
+
+K›ÛØ›Û\Ù[‹^Ø›Ûš\ÐÚXÚÙY
+
+K›ÛÚ][XÏ\Ù[‹^Ú][XËš\ÐÚXÚÙY
+
+KˆÝ][™WÝÚY\Ù[‹^ÛÝ][™WÝÚY˜[YJ
+KÝ][™WØÛÛÜ\Ù[‹^ÛÝ][™WØÛÛÜ‹^
+
+KœÝš\
+
+KˆÚYÝ×ÜÚ^™O\Ù[‹^ÜÚYÝ×ÜÚ^™K˜[YJ
+KÚYÝ×ØÛÛÜ\Ù[‹^ÜÚYÝ×ØÛÛÜ‹^
+
+KœÝš\
+
+Kˆ˜XÚÙÜ›Ý[™Ù[˜X›Y\Ù[‹^Ø˜XÚÙÜ›Ý[™Ù[˜X›Yš\ÐÚXÚÙY
+
+K˜XÚÙÜ›Ý[™ØÛÛÜ\Ù[‹^Ø˜XÚÙÜ›Ý[™ØÛÛÜ‹^
+
+KœÝš\
+
+Kˆ˜XÚÙÜ›Ý[™ÛÜXÚ]O\Ù[‹^Ø˜XÚÙÜ›Ý[™ÛÜXÚ]K˜[YJ
+KÌL˜XÚÙÜ›Ý[™ÜY[™Ï\Ù[‹^Ø˜XÚÙÜ›Ý[™ÜY[™Ë˜[YJ
+Kˆ^Ø[š[X][Û\Ù[‹^Ø[š[X][Û‹˜Ý\œ™[]J
+K^Ø[š[X][Û—Ù\˜][Û\Ù[‹^Ø[š[X][Û—Ù\˜][Û‹˜[YJ
+Kˆ\Ù[‹^Þ˜[YJ
+KÌLO\Ù[‹^ÞK˜[YJ
+KÌL
+BˆYˆËšÚ[™OIÝšY[ÉÎ‚ˆ˜[Y\Ë\]JšY[×ÜØØ[O\Ù[‹˜[œÙ›Ü›WÜØØ[K˜[YJ
+KšY[×Þ\Ù[‹˜[œÙ›Ü›WÞ˜[YJ
+KÌLšY[×ÞO\Ù[‹˜[œÙ›Ü›WÞK˜[YJ
+KÌLˆÜ›ÜÛY\Ù[‹˜Ü›ÜÛY˜[YJ
+KÌLÜ›ÜÝÜ\Ù[‹˜Ü›ÜÝÜ˜[YJ
+KÌLˆÜ›ÜÜšYÚ\Ù[‹˜Ü›ÜÜšYÚ˜[YJ
+KÌLÜ›ÜØ›ÝÛO\Ù[‹˜Ü›ÜØ›ÝÛK˜[YJ
+KÌLˆ›Ý][Û\Ù[‹œ›Ý][Û‹˜[YJ
+K›\ÚÜš^›Û[\Ù[‹™›\ÚÜš^›Û[š\ÐÚXÚÙY
+
+Kˆ›\Ý™\XØ[\Ù[‹™›\Ý™\XØ[š\ÐÚXÚÙY
+
+KœšYÚ™\ÜÏ\Ù[‹˜œšYÚ™\ÜË˜[YJ
+KˆÛÛ˜\Ý\Ù[‹˜ÛÛ˜\Ý˜[YJ
+KØ]\˜][Û\Ù[‹œØ]\˜][Û‹˜[YJ
+KˆÛÛÜ—Ù^ÜÝ\™O\Ù[‹˜ÛÛÜ—Ù^ÜÝ\™K˜[YJ
+KÛÛÜ—Ý[\\˜]\™O\Ù[‹˜ÛÛÜ—Ý[\\˜]\™K˜[YJ
+KÌLˆÛÛÜ—Ý[\Ù[‹˜ÛÛÜ—Ý[˜[YJ
+KÌLÛÛÜ—ÝšXœ˜[˜ÙO\Ù[‹˜ÛÛÜ—ÝšXœ˜[˜ÙK˜[YJ
+KÌLˆ
+ŠžÚÙ^NœÜ[‹˜[YJ
+KÌL›ÜˆÙ^KÜ[ˆ[ˆÙ[‹˜ÛÛÜ—ÝÚY[ÜÜ[œËš][\Ê
+_KˆÜXÚ]O\Ù[‹›ÜXÚ]K˜[YJ
+KÌLˆ›\\Ù[‹˜›\‹˜[YJ
+KÚ\œ[\Ù[‹œÚ\œ[‹˜[YJ
+KÝXš[^˜][Û\Ù[‹œÝXš[^˜][Û‹˜[YJ
+KÌLˆ˜XÚÙÜ›Ý[™Ü™[[Ý˜[Ù[˜X›Y\Ù[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý˜[Ù[˜X›Yš\ÐÚXÚÙY
+
+Kˆ˜XÚÙÜ›Ý[™Ü™[[Ý™YÜ]XË˜˜XÚÙÜ›Ý[™Ü™[[Ý™YÜ]ˆ˜XÚÚ[™×ÚÙ^Yœ˜[Y\ÏVÙXÝ
+Ú[
+H›ÜˆÚ[[ˆË˜XÚÚ[™×ÚÙ^Yœ˜[Y\×Kˆ]]×Ü™Yœ˜[YWÙ[˜X›Y\Ù[‹˜]]×Ü™Yœ˜[YWÙ[˜X›Yš\ÐÚXÚÙY
+
+HYˆËœÛÝ\˜ÙWÝ\HOH	ÝšY[ÉÈ[ÙH˜[ÙKˆ]]×Ü™Yœ˜[YWÙ›Ü›X]\Ù[‹˜]]×Ü™Yœ˜[YWÙ›Ü›X]˜Ý\œ™[]J
+HÜˆ	Ü›Ú™XÝ	Ëˆ]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\ÏVÙXÝ
+Ú[
+H›ÜˆÚ[[ˆË˜]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\×HYˆËœÛÝ\˜ÙWÝ\HOH	ÝšY[ÉÈ[ÙH×KˆØš™XÝÜ™[[Ý˜[Ù[˜X›Y\Ù[‹›Øš™XÝÜ™[[Ý˜[Ù[˜X›Yš\ÐÚXÚÙY
+
+KˆY™™XÝÜ™\Ù]XË™Y™™XÝÜ™\Ù]ˆœ™Y^™WÙœ˜[YO\Ù[‹™œ™Y^™WÙ[˜X›Yš\ÐÚXÚÙY
+
+Kˆœ™Y^™WÙ\˜][Û\Ù[‹™œ™Y^™WÙ\˜][Û‹˜[YJ
+HYˆÙ[‹™œ™Y^™WÙ[˜X›Yš\ÐÚXÚÙY
+
+H[ÙHŒˆ™]™\œÙO\Ù[‹œ™]™\œÙWØÛ\š\ÐÚXÚÙY
+
+Kš[\—Ü™\Ù]\Ù[‹™š[\—Ü™\Ù]˜Ý\œ™[]J
+Kˆ]Ü]\ÝŠ]
+Ù[‹›]Ü]^
+
+KœÝš\
+
+JK™^[™\Ù\Š
+Kœ™\ÛÛ™J
+JHYˆÙ[‹›]Ü]^
+
+KœÝš\
+
+H[ÙH	ÉËˆÚ›ÛXWÚÙ^WÙ[˜X›Y\Ù[‹˜Ú›ÛXWÚÙ^WÙ[˜X›Yš\ÐÚXÚÙY
+
+KÚ›ÛXWÚÙ^WØÛÛÜ\Ù[‹˜Ú›ÛXWÚÙ^WØÛÛÜ‹^
+
+KœÝš\
+
+KˆÚ›ÛXWÚÙ^WÜÚ[Z[\š]O\Ù[‹˜Ú›ÛXWÚÙ^WÜÚ[Z[\š]K˜[YJ
+KÌLÚ›ÛXWÚÙ^WØ›[™\Ù[‹˜Ú›ÛXWÚÙ^WØ›[™˜[YJ
+KÌLˆX\Ú×Ý\O\Ù[‹›X\Ú×Ý\K˜Ý\œ™[]J
+KX\Ú×Þ\Ù[‹›X\Ú×Þ˜[YJ
+KÌLX\Ú×ÞO\Ù[‹›X\Ú×ÞK˜[YJ
+KÌLˆX\Ú×ÝÚY\Ù[‹›X\Ú×ÝÚY˜[YJ
+KÌLX\Ú×ÚZYÚ\Ù[‹›X\Ú×ÚZYÚ˜[YJ
+KÌLX\Ú×Ù™X]\\Ù[‹›X\Ú×Ù™X]\‹˜[YJ
+KÌLˆX\Ú×ÜÚ[Ï\Ù[‹œ\œÙWÛX\Ú×ÜÚ[ÊÙ[‹›X\Ú×ÜÚ[Ë^
+
+JHYˆÙ[‹›X\Ú×Ý\K˜Ý\œ™[]J
+HOH	Ø™^šY\‰È[ÙH×KˆX\Ú×Ü]ÚÙ^Yœ˜[Y\ÏVÙXÝ
+œ˜[YKÚ[ÏVÙXÝ
+Ú[
+H›ÜˆÚ[[ˆœ˜[YK™Ù]
+	ÜÚ[ÉË×JWJBˆ›Üˆœ˜[YH[ˆË›X\Ú×Ü]ÚÙ^Yœ˜[Y\×HYˆÙ[‹›X\Ú×Ý\K˜Ý\œ™[]J
+HOH	Ø™^šY\‰È[ÙH×JBˆ™\Ù]Ý˜[Y\ÏQQ‘‘PÕÔ‘TÑUË™Ù]
+Ë™Y™™XÝÜ™\Ù]
+BˆYˆY™™\œ×Ùœ›ÛWÜ™\Ù]
+Ù^K˜[YJN‚ˆÝ\œ™[]˜[Y\Ë™Ù]
+Ù^KÙ]]ŠËÙ^JJBˆYˆ\Ú[œÝ[˜ÙJÝ\œ™[
+[›Ø]
+JH[™\Ú[œÝ[˜ÙJ˜[YK
+[›Ø]
+JN‚ˆ™]\›ˆXœÊ›Ø]
+Ý\œ™[
+KY›Ø]
+˜[YJJHˆYKMÂˆ™]\›ˆÝ\œ™[OH˜[YBˆYˆ™\Ù]Ý˜[Y\È[™[žJY™™\œ×Ùœ›ÛWÜ™\Ù]
+Ù^K˜[YJH›ÜˆÙ^K˜[YH[ˆ™\Ù]Ý˜[Y\Ëš][\Ê
+HYˆÙ^H[ˆ˜[Y\ÊN‚ˆ˜[Y\ÖÉÙY™™XÝÜ™\Ù]	×OIØÝ\ÝÛIÂˆYˆËšÙ^Yœ˜[Y\È[™
+XœÊ˜[Y\ÖÉÜÝ\	×KXËœÝ\
+OŒYKMÈÜˆXœÊ˜[Y\ÖÉÙ[™	×KXË™[™
+OŒYKMÂˆÜˆXœÊ˜[Y\ÖÉÜÜYY	×KXËœÜYY
+OŒYKMÊN‚ˆ˜[Y\ÖÉÚÙ^Yœ˜[Y\É×O\™][YWÚÙ^Yœ˜[Y\ÊË˜[Y\ÖÉÜÝ\	×K˜[Y\ÖÉÙ[™	×K˜[Y\ÖÉÜÜYY	×JBˆYˆËœÜYYÚÙ^Yœ˜[Y\È[™
+XœÊ˜[Y\ÖÉÜÝ\	×KXËœÝ\
+OŒYKMÈÜˆXœÊ˜[Y\ÖÉÙ[™	×KXË™[™
+OŒYKMÊN‚ˆ˜[Y\ÖÉÜÜYYÚÙ^Yœ˜[Y\É×O\™][YWÜÜYYÚÙ^Yœ˜[Y\ÊË˜[Y\ÖÉÜÝ\	×K˜[Y\ÖÉÙ[™	×JBˆYˆË˜XÚÚ[™×ÚÙ^Yœ˜[Y\È[™
+XœÊ˜[Y\ÖÉÜÝ\	×KXËœÝ\
+OŒYKMÈÜˆXœÊ˜[Y\ÖÉÙ[™	×KXË™[™
+OŒYKMÂˆÜˆXœÊ˜[Y\ÖÉÜÜYY	×KXËœÜYY
+OŒYKMÊN‚ˆ˜[Y\ÖÉÝ˜XÚÚ[™×ÚÙ^Yœ˜[Y\É×O\™][YWÝ˜XÚÚ[™×ÚÙ^Yœ˜[Y\ÊË˜[Y\ÖÉÜÝ\	×K˜[Y\ÖÉÙ[™	×K˜[Y\ÖÉÜÜYY	×JBˆYˆË˜]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\È[™
+XœÊ˜[Y\ÖÉÜÝ\	×KXËœÝ\
+OŒYKMÈÜˆXœÊ˜[Y\ÖÉÙ[™	×KXË™[™
+OŒYKMÂˆÜˆXœÊ˜[Y\ÖÉÜÜYY	×KXËœÜYY
+OŒYKMÊN‚ˆ˜[Y\ÖÉØ]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\É×O\™][YWØ]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\ÊË˜[Y\ÖÉÜÝ\	×K˜[Y\ÖÉÙ[™	×K˜[Y\ÖÉÜÜYY	×JBˆYˆË›X\Ú×Ü]ÚÙ^Yœ˜[Y\È[™
+XœÊ˜[Y\ÖÉÜÝ\	×KXËœÝ\
+OŒYKMÈÜˆXœÊ˜[Y\ÖÉÙ[™	×KXË™[™
+OŒYKMÂˆÜˆXœÊ˜[Y\ÖÉÜÜYY	×KXËœÜYY
+OŒYKMÊN‚ˆ˜[Y\ÖÉÛX\Ú×Ü]ÚÙ^Yœ˜[Y\É×O\™][YWÛX\Ú×Ü]ÚÙ^Yœ˜[Y\ÊË˜[Y\ÖÉÜÝ\	×K˜[Y\ÖÉÙ[™	×K˜[Y\ÖÉÜÜYY	×JBˆYˆËšÚ[™[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊH[™Ë›Û[YWÚÙ^Yœ˜[Y\È[™
+ˆXœÊ˜[Y\ÖÉÜÝ\	×KXËœÝ\
+OŒYKMÈÜˆXœÊ˜[Y\ÖÉÙ[™	×KXË™[™
+OŒYKMÂˆÜˆXœÊ˜[Y\ÖÉÜÜYY	×KXËœÜYY
+OŒYKMÊN‚ˆ˜[Y\ÖÉÝ›Û[YWÚÙ^Yœ˜[Y\É×O\™][YWÝ›Û[YWÚÙ^Yœ˜[Y\ÊË˜[Y\ÖÉÜÝ\	×K˜[Y\ÖÉÙ[™	×K˜[Y\ÖÉÜÜYY	×JBˆYˆËšÚ[™[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊN‚ˆ˜[Y\Ë\]J]Y[×Û›Ú\ÙWÜ™YXÝ[Û\Ù[‹˜]Y[×Û›Ú\ÙWÜ™YXÝ[Û‹˜[YJ
+Kˆ]Y[×Ù\WÛÝÏ\Ù[‹˜]Y[×Ù\WÛÝË˜[YJ
+K]Y[×Ù\WÛZY\Ù[‹˜]Y[×Ù\WÛZY˜[YJ
+K]Y[×Ù\WÚYÚ\Ù[‹˜]Y[×Ù\WÚYÚ˜[YJ
+Kˆ]Y[×ØÛÛ\™\ÜÛÜ—Ù[˜X›Y\Ù[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ù[˜X›Yš\ÐÚXÚÙY
+
+Kˆ]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛ\Ù[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ý™\ÚÛ˜[YJ
+K]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][Ï\Ù[‹˜]Y[×ØÛÛ\™\ÜÛÜ—Ü˜][Ë˜[YJ
+Kˆ]Y[×ÙXÚÚ[™Ï\Ù[‹˜]Y[×ÙXÚÚ[™Ë˜[YJ
+KÌLˆ]Y[×Ý›ÚXÙWÚ\ÛÛ][Û\Ù[‹˜]Y[×Ý›ÚXÙWÚ\ÛÛ][Û‹˜[YJ
+KÌLˆ]Y[×ØÚ[›™[Û[ÙO\Ù[‹˜]Y[×ØÚ[›™[Û[ÙK˜Ý\œ™[]J
+K]Y[×Ü[\Ù[‹˜]Y[×Ü[‹˜[YJ
+KÌLˆ]Y[×Û›Ü›X[^™O\Ù[‹˜]Y[×Û›Ü›X[^™Kš\ÐÚXÚÙY
+
+Kˆ]Y[×Û›Ü›X[^™WÝ\™Ù]\Ù[‹˜]Y[×Û›Ü›X[^™WÝ\™Ù]˜[YJ
+JBˆ˜[œÚ][Û—Ý\OIÛ›Û™IÈYˆËœÛÝ\˜ÙWÝ\OOIØY\ÝY[	È[ÙHÙ[‹˜[œÚ][Û—Ý\K˜Ý\œ™[]J
+Bˆ˜[Y\Ë\]J˜[œÚ][Û—Ý\O]˜[œÚ][Û—Ý\Kˆ˜[œÚ][Û—Ù\˜][Û\Ù[‹˜[œÚ][Û—Ù\˜][Û‹˜[YJ
+HYˆ˜[œÚ][Û—Ý\HOIÛ›Û™IÈ[ÙHŒ
+BˆØ[™Y]O\™\XÙJË
+Š˜[Y\ÊBˆYˆØ[™Y]OOXÎˆ™]\›‚ˆžN‚ˆ›ÜÜÙYVØØ[™Y]HYˆ‹ZYOXËZY[ÙHˆ›Üˆˆ[ˆÙ[‹˜Û\×NÈ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹˜Ú[™ÙY
+
+Bˆ^Ù\^Ù\[Ûˆ\È^ÎœÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆ™\Ù]Ý˜[œÙ›Ü›JÙ[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ[ŠÙ[‹œÙ[XÝ[ÛŠOŒN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ðš[\°ïÚÜÙ]™[ˆ\Ý™ZHYZ™˜XÚ]\ÝØZXZÝ]šY\‰ËÌ
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊNœ™]\›‚ˆY˜][ÏYXÝ
+šY[×ÜØØ[OLKŒšY[×ÞKKšY[×ÞOKKÜ›ÜÛYLŒÜ›ÜÝÜLŒˆÜ›ÜÜšYÚLŒÜ›ÜØ›ÝÛOLŒ›Ý][ÛLŒ›\ÚÜš^›Û[Q˜[ÙK›\Ý™\XØ[Q˜[ÙKˆÙ^Yœ˜[Y\ÏV×KÜYYÚÙ^Yœ˜[Y\ÏV×KœšYÚ™\ÜÏLŒÛÛ˜\ÝLKŒØ]\˜][ÛLKŒˆš[\—Ü™\Ù]IÛ›Û™IË]Ü]IÉËÜXÚ]OLKŒ›\LŒÚ\œ[LŒÝXš[^˜][ÛLŒY™™XÝÜ™\Ù]IØÛX[‰Ëˆ˜XÚÙÜ›Ý[™Ü™[[Ý˜[Ù[˜X›YQ˜[ÙK˜XÚÙÜ›Ý[™Ü™[[Ý™YÜ]IÉË˜XÚÚ[™×ÚÙ^Yœ˜[Y\ÏV×KØš™XÝÜ™[[Ý˜[Ù[˜X›YQ˜[ÙKˆ]]×Ü™Yœ˜[YWÙ[˜X›YQ˜[ÙK]]×Ü™Yœ˜[YWÙ›Ü›X]IÜ›Ú™XÝ	Ë]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\ÏV×KˆÛÛÜ—Ù^ÜÝ\™OLŒÛÛÜ—Ý[\\˜]\™OLŒÛÛÜ—Ý[LŒÛÛÜ—ÝšXœ˜[˜ÙOLŒˆÛÛÜ—ÛYÜLŒÛÛÜ—ÛYÙÏLŒÛÛÜ—ÛYØLŒˆÛÛÜ—ÙØ[[XWÜLŒÛÛÜ—ÙØ[[XWÙÏLŒÛÛÜ—ÙØ[[XWØLŒˆÛÛÜ—ÙØZ[—ÜLŒÛÛÜ—ÙØZ[—ÙÏLŒÛÛÜ—ÙØZ[—ØLŒˆœ™Y^™WÙœ˜[YOQ˜[ÙKœ™Y^™WÙ\˜][ÛLŒ™]™\œÙOQ˜[ÙKÚ›ÛXWÚÙ^WÙ[˜X›YQ˜[ÙKˆÚ›ÛXWÚÙ^WØÛÛÜIÈÌ™Œ	ËÚ›ÛXWÚÙ^WÜÚ[Z[\š]OKŒKÚ›ÛXWÚÙ^WØ›[™KŒKˆX\Ú×Ý\OIÛ›Û™IËX\Ú×ÞLŒX\Ú×ÞOLŒX\Ú×ÝÚYLKŒX\Ú×ÚZYÚLKŒX\Ú×Ù™X]\LŒˆX\Ú×ÜÚ[ÏV×KX\Ú×Ü]ÚÙ^Yœ˜[Y\ÏV×JBˆYˆ[
+Ù]]ŠËÙ^JOO]˜[YH›ÜˆÙ^K˜[YH[ˆY˜][Ëš][\Ê
+JN‚ˆ™]\›‚ˆÙ[‹˜ÚXÚÜÚ[
+
+NÈØ[™Y]O\™\XÙJË
+Š™Y˜][ÊBˆÙ[‹˜Û\ÏVØØ[™Y]HYˆ][KZYOXËZY[ÙH][H›Üˆ][H[ˆÙ[‹˜Û\×NÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆYÝ^
+Ù[‹Ý[OS›Û™JN‚ˆˆˆ\ÚÈ›Üˆ^Y\ˆHÝ[HØ\ÈÚÜÙ[ˆ[™Ü™X]HHÝ[YÛ\ˆˆˆ‚ˆYˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆYˆ›Ý[žJËšÚ[™OIÝšY[ÉÈ[™ËœÛÝ\˜ÙWÝ\HOH	ØY\ÝY[	È›ÜˆÈ[ˆÙ[‹˜Û\ÊN‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	Ñ°ïÙHY\œÝZ[ˆšY[È\ˆ[Y[[™H[žK‰ÊBˆÝ[O\ÝŠÝ[HÜˆÙ[‹^ÜÝ[WÜ™\Ù]˜Ý\œ™[]J
+HÜˆ	Ý]IÊBˆ™\Ù]YXÝ
+VÔÕSWÔ‘TÑUË™Ù]
+Ý[KVÔÕSWÔ‘TÑUÖÉÝ]I×JJBˆ™\Ù]Ú[™^\Ù[‹^ÜÝ[WÜ™\Ù]™š[™]JÝ[JBˆYˆ™\Ù]Ú[™^H‚ˆÙ[‹^ÜÝ[WÜ™\Ù]˜›ØÚÔÚYÛ˜[ÊYJBˆÙ[‹^ÜÝ[WÜ™\Ù]œÙ]Ý\œ™[[™^
+™\Ù]Ú[™^
+BˆÙ[‹^ÜÝ[WÜ™\Ù]˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆ]O^ÉÝ]IÎ‰Õ][	Ë	ÜÝX]IÎ‰Õ[\][	Ë	ÛÝÙ\—Ý\™	Î‰ÓÝÙ\ˆ\™	ßK™Ù]
+Ý[K	Õ^	ÊBˆ^ÚÏTR[œ]X[ÙË™Ù]^
+Ù[‹‰ÞÝ]_H[žY°ïÙ[‰Ë	Õ^Z[™ÙX™[Ž‰ÊBˆYˆ›ÝÚÈÜˆ›Ý^œÝš\
+
+Nœ™]\›‚ˆÜÚ][Û[X^
+Z[ŠÙ[‹œ^ZXY[™Ý
+Ù[‹˜Û\ÊJJBˆ\˜][Û[Z[ŠËŒX^
+K[™Ý
+Ù[‹˜Û\ÊK\ÜÚ][ÛŠJHYˆ[™Ý
+Ù[‹˜Û\ÊOœÜÚ][Ûˆ[ÙHËŒˆ˜XÚÏ[X^
+
+›Üˆ[ˆÙ[‹˜XÚÜÈYˆŒ
+KY˜][L
+JÌBˆÈ^\È›ÈÛÝ\˜ÙHYYXH[Z]È]Èš\ÚX›H\˜][Ûˆ\ÈÛÛ›ÛYžBˆÈHÛ\[™Ýš[HšY[È[™Ø[ˆ™H^[™Y™^[Û™H[š]X[ÈË‚ˆØ[™Y]OPÛ\
+	ÉËŒÝ\L[™Y\˜][Û‹ÜÚ][Û\ÜÚ][Û‹˜XÚÏ]˜XÚËˆÚ[™IÝ^	Ë\×Ø]Y[ÏQ˜[ÙK^]^œÝš\
+
+KÛÝ\˜ÙWÝ\OIÝ^	Ë
+Šœ™\Ù]
+BˆÙ[‹˜ÚXÚÜÚ[
+‰Õ^[žY°ïÙ[ˆ0­ÈÝ]_IÊBˆÙ[‹˜XÚÜË˜\[™
+˜XÚÊBˆÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊBˆÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊBˆÙ[‹˜XÚ×Û˜[Y\ÖÝ˜XÚ×OIÕ^	ÂˆÙ[‹˜Û\Ë˜\[™
+Ø[™Y]JNÈÙ[‹œÙ[XÝ[ÛVØØ[™Y]KZYNÈÙ[‹˜Ý\œ™[XØ[™Y]KZYÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆYØY\ÝY[Û^Y\ŠÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆYˆ›Ý[žJËšÚ[™OIÝšY[ÉÈ[™ËœÛÝ\˜ÙWÝ\HOIØY\ÝY[	È›ÜˆÈ[ˆÙ[‹˜Û\ÊN‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	Ñ°ïÙHY\œÝZ[™\Ý[œÈZ[ˆšY[È\ˆ[Y[[™H[žK‰ÊBˆ\˜][Û[X^
+
+Ë™š[š\Ú›ÜˆÈ[ˆÙ[‹˜Û\ÈYˆËœÛÝ\˜ÙWÝ\HOIØY\ÝY[	ÊKY˜][LŒ
+BˆYˆ\˜][ÛˆRS—ÐÓT‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÑYH[Y[[™H\Ý›ØÚHÝ\žˆ°ïˆZ[™HY\ÝY[S^Y\‹‰ÊBˆ˜XÚÏ[X^
+
+›Üˆ[ˆÙ[‹˜XÚÜÈYˆŒ
+KY˜][L
+JÌBˆØ[™Y]OPÛ\
+	ÉËX^
+Œ\˜][ÛŠKÝ\L[™Y\˜][Û‹ÜÚ][ÛL˜XÚÏ]˜XÚËˆÚ[™IÝšY[ÉË\×Ø]Y[ÏQ˜[ÙKÛÝ\˜ÙWÝ\OIØY\ÝY[	ËY™™XÝÜ™\Ù]IØÛX[‰ÊBˆžN‚ˆ˜[Y]WÝ[Y[[™JÙ[‹˜Û\ÊÖØØ[™Y]WKÙ[‹˜XÚÜÊÖÝ˜XÚ×JBˆÙ[‹˜ÚXÚÜÚ[
+
+BˆšY[×ÜÛÝ[™^
+
+[™^›Üˆ[™^˜[YH[ˆ[[Y\˜]JÙ[‹˜XÚÜÊHYˆ˜[YO
+K[ŠÙ[‹˜XÚÜÊJBˆÙ[‹˜XÚÜËš[œÙ\
+šY[×ÜÛÝ˜XÚÊBˆÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊBˆÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊBˆÙ[‹˜XÚ×Û˜[Y\ÖÝ˜XÚ×OY‰ÐY\ÝY[ÜÝ[J˜[YKœÛÝ\˜ÙWÝ\OOH˜Y\ÝY[ˆ›Üˆ˜[YH[ˆÙ[‹˜Û\ÊJÌ_IÂˆÙ[‹˜Û\Ë˜\[™
+Ø[™Y]JBˆÙ[‹œÙ[XÝ[ÛVØØ[™Y]KZYNÈÙ[‹˜Ý\œ™[XØ[™Y]KZYÈÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÐY\ÝY[S^Y\ˆ[™Ù[YÝ0­ÈY™™ZÝHÚ\šÙ[ˆ]YˆYH\[\›YYÙ[™HÛÛ\ÜÚ][Û‹‰ËÍL
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÜ]
+Ù[ŠN‚ˆÙ[XÝY\Ù[‹œÙ[XÝYØÛ\Ê
+BˆYˆ›ÝÙ[XÝYÜˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆYˆÙ[‹œÙ[XÝ[Û—ÛØÚÙY
+
+N‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑZ[™H]\ÙÙ]ðéHÜ\ˆ\ÝÙ\Ü\œ‰ËÌ
+Bˆ[YÚX›OVØÛ\›ÜˆÛ\[ˆÙ[XÝYYˆÛ\œÜÚ][ÛŠÓRS—ÐÓTÙ[‹œ^ZXYÛ\™š[š\ÚSRS—ÐÓTBˆYˆ›Ý[YÚX›N‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÔÙ]™H[ˆXœÜY[ÛÜˆ[ˆZ[™\Ý[œÈZ[™[ˆ]\ÙÙ]ðé[ˆÛ\‰ÊBˆžN‚ˆ™\XÙ[Y[^ßBˆ™]×ÜÙ[XÝ[ÛV×Bˆ›ÜˆÛ\[ˆ[YÚX›N‚ˆš\œÝÙXÛÛ™\Ü]ØÛ\
+Û\Ù[‹œ^ZXY
+Bˆ™\XÙ[Y[ØÛ\ZYOJš\œÝÙXÛÛ™
+Bˆ™]×ÜÙ[XÝ[Û‹™^[™
+Ùš\œÝZYÙXÛÛ™ZYJBˆ›ÜÜÙYV×Bˆ›ÜˆÛ\[ˆÙ[‹˜Û\Î‚ˆ›ÜÜÙY™^[™
+™\XÙ[Y[™Ù]
+Û\ZY
+Û\
+JJBˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹œÙ[XÝ[Û[™]×ÜÙ[XÝ[ÛŽÈÙ[‹˜Ý\œ™[[™]×ÜÙ[XÝ[Û–ËLWNÈÙ[‹˜Ú[™ÙY
+
+Bˆ^Ù\^Ù\[Ûˆ\È^ÎœÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÜÚ[™ÛWÝš[WØÛ\
+Ù[ŠN‚ˆˆˆ”™]\›ˆHÛ™HÙ[XÝYÛÝ\˜ÙHÛ\\ÙYžH›Ù™\ÜÚ[Û˜[š[HÛÛËˆˆˆ‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›ˆ›Û™BˆÙ[XÝYHÙ[‹œÙ[XÝYØÛ\Ê
+BˆYˆ[ŠÙ[XÝY
+HOHN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÕðéHÙ[˜]HZ[™[ˆšY[ËHÙ\ˆ]Y[ØÛ\°ïˆY\Ù[ˆš[KTØÚš]‰ËÍL
+Bˆ™]\›ˆ›Û™BˆÛ\HÙ[XÝYÌBˆYˆÛ\šÚ[™›Ý[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊHÜˆÛ\œÛÝ\˜ÙWÝ\H›Ý[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑY\Ù\ˆš[KTØÚš]\Ý\ˆ°ïˆšY[ËH[™]Y[ÛYYY[ˆ™\™°ïØ˜\‹‰ËÍL
+Bˆ™]\›ˆ›Û™BˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+Û\
+N‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÛ\‚ˆYˆÙœ˜[YWÜÝ\
+Ù[‹Û\
+N‚ˆˆˆ”™]\›ˆÛ™HÛÝ\˜ÙHœ˜[YH[ˆ[Y[[™HÙXÛÛ™È›Üˆš[HYÙ\Ëˆˆˆ‚ˆžN‚ˆœÈH›Ø]
+Û\œÛÝ\˜ÙWÙœÈÜˆŒ
+Bˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆœÈHŒˆ™]\›ˆX^
+RS—ÐÓTKŒÈX^
+KŒœÊJB‚ˆYˆØÛÛ[Z]Ýš[WÜ™\XÙ[Y[ÊÙ[‹™\XÙ[Y[ËY\ÜØYÙKÙ[XÝ[ÛS›Û™KX\šÙ\œÏS›Û™JN‚ˆˆˆ•˜[Y]H[™ÛÛ[Z]Hš[HY]\ÈÛ™H[™ØX›H˜[œØXÝ[Û‹ˆˆˆ‚ˆ›ÜÜÙYHÜ™\XÙ[Y[Ë™Ù]
+Û\ZYÛ\
+H›ÜˆÛ\[ˆÙ[‹˜Û\×Bˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+BˆÙ[‹˜Û\ÈH›ÜÜÙYˆYˆX\šÙ\œÈ\È›Ý›Û™N‚ˆÙ[‹›X\šÙ\œÈH›Ü›X[^™WÛX\šÙ\œÊX\šÙ\œË[™Ý
+›ÜÜÙY
+JBˆÚÜÙ[ˆHÙ[XÝ[ÛˆÜˆ\Ý
+™\XÙ[Y[ÊBˆÙ[‹œÙ[XÝ[ÛˆHÝZY›ÜˆZY[ˆÚÜÙ[ˆYˆ[žJÛ\ZYOHZY›ÜˆÛ\[ˆ›ÜÜÙY
+WBˆÙ[‹˜Ý\œ™[HÙ[‹œÙ[XÝ[Û–ËLWHYˆÙ[‹œÙ[XÝ[Ûˆ[ÙH›Û™BˆÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJY\ÜØYÙKÍL
+B‚ˆYˆÜš\WÝš[JÙ[‹YÙJN‚ˆÛ\HÙ[‹—ÜÚ[™ÛWÝš[WØÛ\
+
+BˆYˆÛ\\È›Û™N‚ˆ™]\›‚ˆYˆ›ÝÛ\œÜÚ][Ûˆ
+ÈRS—ÐÓTHÙ[‹œ^ZXYHÛ\™š[š\ÚHRS—ÐÓT‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÔÙ]™H[ˆXœÜY[ÛÜˆ[›™\š[ˆ\È]\ÙÙ]ðé[ˆÛ\Ë‰ËÍL
+BˆÛÙš[š\ÚHÛ\™š[š\ÚˆYˆYÙHOH	Ú[‰Î‚ˆ[HHÙ[‹œ^ZXYHÛ\œÜÚ][Û‚ˆš[[YYHY]YØÛ\
+Û\	ÛY	Ë[JBˆÈš\KR[ˆ™[[Ý™\ÈHXY[™ÈÛÝ\˜ÙH˜[™ÙH]ÙY\ÈHÛ\]ˆÈHØ[YH[Y[[™HÜÚ][Û‹ÛÈ]\ˆÛ\ÈØ[ˆÛÜÙHHØ\‚ˆØ[™Y]HH™\XÙJš[[YYÜÚ][ÛXÛ\œÜÚ][ÛŠBˆX™[Ý^H	Ôš\KR[‰Âˆ[ÙN‚ˆ[HHÙ[‹œ^ZXYHÛ\™š[š\ÚˆØ[™Y]HHY]YØÛ\
+Û\	ÜšYÚ	Ë[JBˆX™[Ý^H	Ôš\KSÝ]	Âˆ™[[Ý™YHÛ\›[™ÝHØ[™Y]K›[™ÝˆYˆ™[[Ý™YRS—ÐÓTHYKMÎ‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñ\ˆš[KP™\™ZXÚ\ÝHÛZ[‹‰ËÌ
+Bˆ™\XÙ[Y[ÈHØÛ\ZYˆØ[™Y]_Bˆ›ÜˆÝ\ˆ[ˆÙ[‹˜Û\Î‚ˆYˆÝ\‹ZYOHÛ\ZY‚ˆÛÛ[YBˆYˆÝ\‹˜XÚÈOHÛ\˜XÚÈ[™Ý\‹œÜÚ][ÛˆHÛÙš[š\ÚHYKMÎ‚ˆYˆÙ[‹˜XÚ×ÛØÚÙY
+Ý\‹˜XÚÊN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑZ[™H™]›Ù™™[™HÜ\ˆ\ÝÙ\Ü\œ‰ËÍL
+Bˆ™\XÙ[Y[ÖÛÝ\‹ZYHH™\XÙJÝ\‹ÜÚ][Û[X^
+ŒÝ\‹œÜÚ][ÛˆH™[[Ý™Y
+JBˆX\šÙ\œÈH×Bˆ›ÜˆX\šÙ\ˆ[ˆÙ[‹›X\šÙ\œÎ‚ˆ˜[YHHXÝ
+X\šÙ\ŠBˆYˆ›Ø]
+˜[YK™Ù]
+	Ý[YIËŒ
+JHHÛÙš[š\ÚHYKMÎ‚ˆ˜[YVÉÝ[YI×HHX^
+Œ›Ø]
+˜[YVÉÝ[YI×JHH™[[Ý™Y
+BˆX\šÙ\œË˜\[™
+˜[YJBˆžN‚ˆÙ[‹—ØÛÛ[Z]Ýš[WÜ™\XÙ[Y[Êˆ™\XÙ[Y[Ë‰ÞÛX™[Ý^H]\ÙÙY°ï0­ÈÜ™[[Ý™Y‹ŒÙŸHÈ[™\›	ËˆÙ[XÝ[ÛVØÛ\ZYKX\šÙ\œÏ[X\šÙ\œÊBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆš\WÝš[WÚ[ŠÙ[ŠN‚ˆÙ[‹—Üš\WÝš[J	Ú[‰ÊB‚ˆYˆš\WÝš[WÛÝ]
+Ù[ŠN‚ˆÙ[‹—Üš\WÝš[J	ÛÝ]	ÊB‚ˆYˆØY˜XÙ[ÜZ\—Ù›Ü—Ü›Û
+Ù[‹Û\
+N‚ˆØ[YHHÛÜY
+
+˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÂˆYˆ˜[YKZYOHÛ\ZY[™˜[YK˜XÚÈOHÛ\˜XÚÂˆ[™˜[YKšÚ[™OHÛ\šÚ[™
+KÙ^O[[X™H˜[YNˆ˜[YKœÜÚ][ÛŠBˆ™]š[Ý\ÈHX^
+
+˜[YH›Üˆ˜[YH[ˆØ[YHYˆ˜[YK™š[š\ÚHÛ\œÜÚ][Ûˆ
+ÈYKMŠKˆÙ^O[[X™H˜[YNˆ˜[YK™š[š\ÚY˜][S›Û™JBˆ›ÛÝÚ[™ÈHZ[Š
+˜[YH›Üˆ˜[YH[ˆØ[YHYˆ˜[YKœÜÚ][ÛˆHÛ\™š[š\ÚHYKMŠKˆÙ^O[[X™H˜[YNˆ˜[YKœÜÚ][Û‹Y˜][S›Û™JBˆZ\œÈH×BˆYˆ™]š[Ý\È\È›Ý›Û™H[™XœÊ™]š[Ý\Ë™š[š\ÚHÛ\œÜÚ][ÛŠHHYKMN‚ˆZ\œË˜\[™
+
+™]š[Ý\ËÛ\
+JBˆYˆ›ÛÝÚ[™È\È›Ý›Û™H[™XœÊÛ\™š[š\ÚH›ÛÝÚ[™ËœÜÚ][ÛŠHHYKMN‚ˆZ\œË˜\[™
+
+Û\›ÛÝÚ[™ÊJBˆ˜[YHÜZ\ˆ›ÜˆZ\ˆ[ˆZ\œÂˆYˆZ\–ÌKœÜÚ][Ûˆ
+ÈRS—ÐÓTHÙ[‹œ^ZXYHZ\–ÌWK™š[š\ÚHRS—ÐÓTBˆ™]\›ˆZ[Š˜[YÙ^O[[X™HZ\ŽˆXœÊZ\–ÌK™š[š\ÚHÙ[‹œ^ZXY
+KY˜][S›Û™JB‚ˆYˆ›ÛÝ×Ü^ZXY
+Ù[ŠN‚ˆÛ\HÙ[‹—ÜÚ[™ÛWÝš[WØÛ\
+
+BˆYˆÛ\\È›Û™N‚ˆ™]\›‚ˆZ\ˆHÙ[‹—ØY˜XÙ[ÜZ\—Ù›Ü—Ü›Û
+Û\
+BˆYˆZ\ˆ\È›Û™N‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÔÙ]™H[ˆXœÜY[ÛÜˆÚ\ØÚ[ˆÙZH[™Ü™[ž™[™HÛ\Ë‰ËÍL
+BˆYšYÚHZ\‚ˆYˆÙ[‹˜XÚ×ÛØÚÙY
+Y˜XÚÊHÜˆÙ[‹˜XÚ×ÛØÚÙY
+šYÚ˜XÚÊN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑZ[™H™]›Ù™™[™HÜ\ˆ\ÝÙ\Ü\œ‰ËÍL
+BˆžN‚ˆš\œÝÙXÛÛ™H›ÛÙY]
+YšYÚÙ[‹œ^ZXY
+BˆÙ[‹—ØÛÛ[Z]Ýš[WÜ™\XÙ[Y[ÊˆÛYZYˆš\œÝšYÚZYˆÙXÛÛ™Kˆ‰Ô›ÛTØÚš]]YˆÜÙ[‹œ^ZXY‹ŒÙŸHÈÙ\Ù]	ËˆÙ[XÝ[ÛVÙš\œÝZYÙXÛÛ™ZYJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆØY˜XÙ[Ýš\]
+Ù[‹Û\
+N‚ˆØ[YHHÛÜY
+
+˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÂˆYˆ˜[YKZYOHÛ\ZY[™˜[YK˜XÚÈOHÛ\˜XÚÂˆ[™˜[YKšÚ[™OHÛ\šÚ[™
+KÙ^O[[X™H˜[YNˆ˜[YKœÜÚ][ÛŠBˆ™]š[Ý\ÈHX^
+
+˜[YH›Üˆ˜[YH[ˆØ[YHYˆ˜[YK™š[š\ÚHÛ\œÜÚ][Ûˆ
+ÈYKMŠKˆÙ^O[[X™H˜[YNˆ˜[YK™š[š\ÚY˜][S›Û™JBˆ›ÛÝÚ[™ÈHZ[Š
+˜[YH›Üˆ˜[YH[ˆØ[YHYˆ˜[YKœÜÚ][ÛˆHÛ\™š[š\ÚHYKMŠKˆÙ^O[[X™H˜[YNˆ˜[YKœÜÚ][Û‹Y˜][S›Û™JBˆYˆ
+™]š[Ý\È\È›Û™HÜˆ›ÛÝÚ[™È\È›Û™BˆÜˆXœÊ™]š[Ý\Ë™š[š\ÚHÛ\œÜÚ][ÛŠHˆYKMBˆÜˆXœÊÛ\™š[š\ÚH›ÛÝÚ[™ËœÜÚ][ÛŠHˆYKMJN‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ™]š[Ý\ËÛ\›ÛÝÚ[™Â‚ˆYˆÛYWÜÙ[XÝY
+Ù[‹\™XÝ[ÛŠN‚ˆÛ\HÙ[‹—ÜÚ[™ÛWÝš[WØÛ\
+
+BˆYˆÛ\\È›Û™N‚ˆ™]\›‚ˆš\]HÙ[‹—ØY˜XÙ[Ýš\]
+Û\
+BˆYˆš\]\È›Û™N‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÔÛYHœ˜]XÚZ[™[ˆÛ\Z]\™ZÝ[ˆ˜XÚ˜\›ˆ[šÜÈ[™™XÚË‰ËÍL
+BˆYˆÙ[‹˜XÚ×ÛØÚÙY
+Û\˜XÚÊN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑYH™]›Ù™™[™HÜ\ˆ\ÝÙ\Ü\œ‰ËÍL
+Bˆ™]š[Ý\ËZYK›ÛÝÚ[™ÈHš\]ˆ[HHÙ[‹—Ùœ˜[YWÜÝ\
+Û\
+H
+ˆ
+HYˆ\™XÝ[ÛˆH[ÙHLJBˆžN‚ˆY[Ý™YšYÚHÛYWÙY]
+™]š[Ý\ËZYK›ÛÝÚ[™Ë[JBˆÙ[‹—ØÛÛ[Z]Ýš[WÜ™\XÙ[Y[ÊˆÛYZYˆY[Ý™YZYˆ[Ý™YšYÚZYˆšYÚKˆ‰ÔÛYKTØÚš]Èœ™XÚÈˆYˆ[Hˆ[ÙH›[šÜÈŸH0­ÈØXœÊ[JN‹ŒÙŸHÉËˆÙ[XÝ[ÛVÛ[Ý™YZYJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÛ\ÜÙ[XÝY
+Ù[‹\™XÝ[ÛŠN‚ˆÛ\HÙ[‹—ÜÚ[™ÛWÝš[WØÛ\
+
+BˆYˆÛ\\È›Û™N‚ˆ™]\›‚ˆ[HHÙ[‹—Ùœ˜[YWÜÝ\
+Û\
+H
+ˆ
+HYˆ\™XÝ[ÛˆH[ÙHLJBˆžN‚ˆØ[™Y]HHÛ\ØÛ\
+Û\[JBˆYˆXœÊØ[™Y]KœÝ\HÛ\œÝ\
+HHYKMÎ‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñ\ˆ]Y[™\™ZXÚØ[›ˆšXÚÙZ]\ˆ[ˆY\ÙHšXÚ[™È™\œØÚØ™[ˆÙ\™[‹‰ËÌ
+BˆÙ[‹—ØÛÛ[Z]Ýš[WÜ™\XÙ[Y[ÊˆØÛ\ZYˆØ[™Y]_Kˆ‰ÔÛ\TØÚš]Èœ™XÚÈˆYˆ[Hˆ[ÙH›[šÜÈŸH0­ÈØXœÊØ[™Y]KœÝ\XÛ\œÝ\
+N‹ŒÙŸHÉËˆÙ[XÝ[ÛVØØ[™Y]KZYJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆ™[[Ý™JÙ[ŠN‚ˆÙ[XÝY\Ù[‹œÙ[XÝYØÛ\Ê
+BˆYˆÙ[XÝY[™›ÝÙ[‹ÛÜšÙ\ˆ[™›ÝÙ[‹œÙ[XÝ[Û—ÛØÚÙY
+
+N‚ˆ™[[Ý™Y^ØÛ\ZY›ÜˆÛ\[ˆÙ[XÝYBˆ[˜ÚÜ\Ù[XÝYÌBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\ÏVØÛ\›ÜˆÛ\[ˆÙ[‹˜Û\ÈYˆÛ\ZY›Ý[ˆ™[[Ý™YBˆY˜XÙ[[Z[ŠÙ[‹˜Û\ËÙ^O[[X™HÎŠ
+Ë˜XÚÈOX[˜ÚÜ‹˜XÚÊKXœÊËœÜÚ][Û‹X[˜ÚÜ‹œÜÚ][ÛŠJKY˜][S›Û™JBˆÙ[‹˜Ý\œ™[XY˜XÙ[ZYYˆY˜XÙ[[ÙH›Û™NÈÙ[‹œÙ[XÝ[ÛVÜÙ[‹˜Ý\œ™[HYˆÙ[‹˜Ý\œ™[[ÙH×NÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆYÝ˜XÚÊÙ[‹šY[ÊN‚ˆYˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆÙ[‹˜ÚXÚÜÚ[
+
+Bˆ™]Ï[X^
+Ý›Üˆ[ˆÙ[‹˜XÚÜÈYˆŒKY˜][L
+JÌHYˆšY[È[ÙHZ[ŠÝ›Üˆ[ˆÙ[‹˜XÚÜÈYˆKY˜][L
+KLBˆÙ[‹˜XÚÜË˜\[™
+™]ÊNÈÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊNÈÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊNÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆ˜XÚ×ØÛÝ[×ØÚ[™ÙY
+Ù[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆšY[ÜË]Y[ÜÈHÙ[‹šY[×Ý˜XÚÜË˜[YJ
+KÙ[‹˜]Y[×Ý˜XÚÜË˜[YJ
+BˆØ[Y[\Ý
+˜[™ÙJšY[ÜËLJJJÛ\Ý
+˜[™ÙJLKX]Y[ÜËLKLJJBˆYˆ[žJË˜XÚÈ›Ý[ˆØ[Y›ÜˆÈ[ˆÙ[‹˜Û\ÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑY\ÙHÜ\ˆ[0é›ØÚÛ\Ëˆ™\œØÚYX™HÙ\ˆ0íœØÚHÚYHY\œÝ‰ËŒ
+BˆÙ[‹œ™Yœ™\Ú
+
+NÈ™]\›‚ˆYˆØ[YOHÙ[‹˜XÚÜÎ‚ˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜XÚÜÏ]Ø[YÈÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊNÈÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊNÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆY˜][Ý˜XÚ×Û˜[YJÙ[‹˜XÚÊN‚ˆ™]\›ˆ‰Õ’QSÈÝ˜XÚßIÈYˆ˜XÚÈˆ[ÙH‰ÐUQSÈË]˜XÚßIÂ‚ˆYˆÚÝ×Ý˜XÚ×ØÛÛ^ÛY[JÙ[‹˜XÚËÛØ˜[ÜÜÊN‚ˆYˆ˜XÚÈ›Ý[ˆÙ[‹˜XÚÜÎ‚ˆ™]\›‚ˆY[OTSY[JÙ[ŠBˆY[K˜YXÝ[ÛŠ	ÔÜ\ˆ[X™[™[›™[ˆ8 )‰Ë[X™NœÙ[‹œ™[˜[YWÝ˜XÚÊ˜XÚÊJBˆ[]O[Y[K˜YXÝ[ÛŠ	ÓY\™HÜ\ˆ0íœØÚ[‰Ë[X™NœÙ[‹™[]WÝ˜XÚÊ˜XÚÊJBˆ[]KœÙ][˜X›Y
+›Ý[žJÛ\˜XÚÈOH˜XÚÈ›ÜˆÛ\[ˆÙ[‹˜Û\ÊJBˆY[K™^XÊÛØ˜[ÜÜÊB‚ˆYˆ™[˜[YWÝ˜XÚÊÙ[‹˜XÚÊN‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ˜XÚÈ›Ý[ˆÙ[‹˜XÚÜÈÜˆÙ[‹˜XÚ×ÛØÚÙY
+˜XÚÊN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑY\ÙHÜ\ˆ\ÝÙ\Ü\œ‰ËÌ
+HYˆ˜XÚÈ[ˆÙ[‹˜XÚÜÈ[ÙH›Û™BˆÝ\œ™[\Ù[‹˜XÚ×Û˜[Y\Ë™Ù]
+˜XÚËÙ[‹™Y˜][Ý˜XÚ×Û˜[YJ˜XÚÊJBˆ˜[YKÚÏTR[œ]X[ÙË™Ù]^
+Ù[‹	ÔÜ\ˆ[X™[™[›™[‰Ë	Ó™]Y\ˆÜ\›˜[YN‰Ë^XÝ\œ™[
+BˆYˆ›ÝÚÎ‚ˆ™]\›‚ˆ˜[YO[˜[YKœÝš\
+
+BˆÙ[‹˜ÚXÚÜÚ[
+
+BˆYˆ˜[YH[™˜[YHOHÙ[‹™Y˜][Ý˜XÚ×Û˜[YJ˜XÚÊN‚ˆÙ[‹˜XÚ×Û˜[Y\ÖÝ˜XÚ×O[˜[YVÎBˆ[ÙN‚ˆÙ[‹˜XÚ×Û˜[Y\ËœÜ
+˜XÚË›Û™JBˆÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆ[]WÝ˜XÚÊÙ[‹˜XÚÊN‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ˜XÚÈ›Ý[ˆÙ[‹˜XÚÜÎ‚ˆ™]\›‚ˆYˆÙ[‹˜XÚ×ÛØÚÙY
+˜XÚÊN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑY\ÙHÜ\ˆ\ÝÙ\Ü\œ‰ËÌ
+BˆYˆ[žJÛ\˜XÚÈOH˜XÚÈ›ÜˆÛ\[ˆÙ[‹˜Û\ÊN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑYHÜ\ˆ[0é›ØÚÛ\Ëˆ™\œØÚYX™HÙ\ˆ0íœØÚHÚYHY\œÝ‰ËL
+BˆØ[YWÝ\OVÝ˜[YH›Üˆ˜[YH[ˆÙ[‹˜XÚÜÈYˆ
+˜[YHˆ
+HOH
+˜XÚÈˆ
+WBˆYˆ[ŠØ[YWÝ\JHHN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÓZ[™\Ý[œÈZ[™HšY[ËH[™Z[™H]Y[ÜÜ\ˆ]\ÜÈ›ZX™[‹‰Ë
+BˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜XÚÜÏVÝ˜[YH›Üˆ˜[YH[ˆÙ[‹˜XÚÜÈYˆ˜[YHOH˜XÚ×BˆÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊNÈÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊNÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆ^˜XÝØ]Y[ÊÙ[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆ›ÝËš\×Ø]Y[Îœ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHZ[™[ˆšY[ØÛ\Z]ÜšYÚ[˜[Û‹‰ÊBˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊNœ™]\›‚ˆÛÝ\˜ÙOT]
+Ëœ]
+Bˆ\™Ù]Ù\\Ù[‹œÝ]WÙ\‹ÉÙ^˜XÝYX]Y[ÉÎÈ\™Ù]Ù\‹›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆ\™Ù]]\™Ù]Ù\‹ÊÛÝ\˜ÙKœÝ[JÉËIÊÝ]ZY]ZY
+
+Kš^ÎŽJÉËØ]‰ÊBˆÛ\ÜÛ˜\ÚÝ\™\XÙJÊBˆ˜XÚÜ×ÜÛ˜\ÚÝ[\Ý
+Ù[‹˜XÚÜÊBˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆ\™ÜÏVÉÙ™›\YÉË	ËZYWØ˜[›™\‰Ë	Ë[ÙÛ]™[	Ë	Ù\œ›Ü‰Ë	Ë[›ÜÝ[‰Ë	Ë^IË	ËZIËÝŠÛÝ\˜ÙJKˆ	Ë[X\	Ë	Ì˜NŒ	Ë	Ë]›‰Ë	ËXÎ˜IË	ÜÛWÜÌM›IË	ËX\‰Ë	Í	Ë	ËXXÉË	Ì‰ËÝŠ\™Ù]
+WBˆ›ØÏ\ÝXœ›ØÙ\ÜË”Ü[Š\™ÜËÝÝ]\ÝXœ›ØÙ\ÜË‘U“•SÝ\œ\ÝXœ›ØÙ\ÜË”TK^UYJBˆÚ[H›ØËœÛ
+
+H\È›Û™N‚ˆYˆØ[˜Ù[ØZ]
+ŒJN‚ˆ›ØË\›Z[˜]J
+BˆžNˆ›ØËØZ]
+[Y[Ý]LÊBˆ^Ù\ÝXœ›ØÙ\ÜË•[Y[Ý]^\™Yˆ›ØËšÚ[
+
+NÈ›ØËØZ]
+
+Bˆ˜Z\ÙH^ÜØ[˜Ù[Y
+
+BˆYˆ›ØËœ™]\›˜ÛÙN‚ˆ]Z[J›ØËœÝ\œ‹œ™XY
+
+HYˆ›ØËœÝ\œˆ[ÙH	ÉÊKœÝš\
+
+Bˆ˜Z\ÙH˜[YQ\œ›ÜŠ	Ð]Y[ÈÛÛ›HšXÚ^˜ZY\Ù\™[‹‰ÊÊ
+	×‰ÊÙ]Z[
+HYˆ]Z[[ÙH	ÉÊJBˆ™]\›ˆÝŠ\™Ù]
+BˆÙ[‹œÝ\Ú›ØŠ	Ð]Y[ÜÜ\ˆÚ\™]\È[HšY[È^˜ZY\8 )‰ËÜ\˜][Û‹ˆ[X™H™\Ý[œÙ[‹™^˜XÝYØ]Y[×ÙÛ™J™\Ý[Û\ÜÛ˜\ÚÝ˜XÚÜ×ÜÛ˜\ÚÝ
+JB‚ˆYˆÝ\Ø˜XÚÙÜ›Ý[™Ü™[[Ý˜[
+Ù[ŠN‚ˆˆˆ‘Ù[™\˜]HHØØ[˜[œÜ\™[\š]˜]]™H›ÜˆHÙ[XÝYÛ\ˆˆˆ‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆËœÛÝ\˜ÙWÝ\H›Ý[ˆ
+	ÝšY[ÉË	Ú[XYÙIÊN‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHZ[™[ˆšY[ËHÙ\ˆš[Û\°ïˆYH[\™Ü[™œ™Z\Ý[[™Ë‰ÊBˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆÛÝ\˜ÙOT]
+Ëœ]
+Bˆ\™Ù]Ù\\Ù[‹œÝ]WÙ\‹ÉØZK[YYXIÎÈ\™Ù]Ù\‹›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆÝY™š^IËœ™ÉÈYˆËœÛÝ\˜ÙWÝ\OOIÚ[XYÙIÈ[ÙH	Ë›[Ý‰Âˆ\™Ù]]\™Ù]Ù\‹ÊÛÝ\˜ÙKœÝ[JÉËIÊØËZYÎŒLJÉËX˜XÚÙÜ›Ý[™	ÊÜÝY™š^
+BˆZYXËZYˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆžN‚ˆ™]\›ˆ™[[Ý™WØ˜XÚÙÜ›Ý[™ÛYYXJÛÝ\˜ÙK\™Ù]›ÙÜ™\ÜËØ[˜Ù[
+Bˆ^Ù\RUÛÛ\œ›ÜŽ‚ˆYˆØ[˜Ù[š\×ÜÙ]
+
+N‚ˆ˜Z\ÙH^ÜØ[˜Ù[Y
+
+Bˆ˜Z\ÙBˆÙ[‹œÝ\Ú›ØŠ	ÓÚØ[HÒH[™\›[ˆ[\™Ü[™8 )‰ËÜ\˜][Û‹ˆ[X™H™\Ý[œÙ[‹˜˜XÚÙÜ›Ý[™Ü™[[Ý˜[ÙÛ™J™\Ý[ZY
+JB‚ˆYˆ˜XÚÙÜ›Ý[™Ü™[[Ý˜[ÙÛ™JÙ[‹™\Ý[ZY
+N‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆÏ[™^
+
+˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÈYˆ˜[YKZYO]ZY
+K›Û™JBˆYˆ›ÝÎ‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÐÛ\Ý\™Hðé™[™\ˆ™\˜\˜™Z][™È[™\›‰ËL
+BˆžN‚ˆØ[™Y]O\™\XÙJË˜XÚÙÜ›Ý[™Ü™[[Ý˜[Ù[˜X›YUYK˜XÚÙÜ›Ý[™Ü™[[Ý™YÜ]\ÝŠ™\Ý[ÉÝ˜[YI×JJBˆ›ÜÜÙYVØØ[™Y]HYˆ˜[YKZYO]ZY[ÙH˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\×Bˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹˜Ú[™ÙY
+
+NÈÙ[‹™š[Ú[œÜXÝÜŠ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ò[\™Ü[™[™\›0­È˜[œÜ\™[HÚØ[H]ZH\ÝZÝ]‹‰ËŒ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÛX\—Ø˜XÚÙÜ›Ý[™Ü™[[Ý˜[
+Ù[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆ›ÝË˜˜XÚÙÜ›Ý[™Ü™[[Ý™YÜ]‚ˆ™]\›‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆØ[™Y]O\™\XÙJË˜XÚÙÜ›Ý[™Ü™[[Ý˜[Ù[˜X›YQ˜[ÙK˜XÚÙÜ›Ý[™Ü™[[Ý™YÜ]IÉÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\ÏVØØ[™Y]HYˆ˜[YKZYOXËZY[ÙH˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\×NÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆÝ\Û[Ý[Û—Ý˜XÚÚ[™ÊÙ[ŠN‚ˆˆˆ•˜XÚÈH[œÜXÝÜˆ™XÝ[™ÛH›ÝYÚÛ™HØØ[šY[ÈÛ\ˆˆˆ‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆËœÛÝ\˜ÙWÝ\HOIÝšY[ÉÎ‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHZ[™[ˆ›Ü›X[[ˆšY[ØÛ\°ïˆ[Ý[Û‹U˜XÚÚ[™Ë‰ÊBˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆ™YÚ[ÛJÙ[‹›X\Ú×Þ˜[YJ
+KÌLÙ[‹›X\Ú×ÞK˜[YJ
+KÌLˆÙ[‹›X\Ú×ÝÚY˜[YJ
+KÌLÙ[‹›X\Ú×ÚZYÚ˜[YJ
+KÌL
+BˆYˆ™YÚ[Û–ÌJÜ™YÚ[Û–Ì—HˆKŒHÜˆ™YÚ[Û–ÌWJÜ™YÚ[Û–Ì×HˆKŒN‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	Ñ\ˆ˜XÚÚ[™Ø™\™ZXÚ]\ÜÈ›ÛÝ0é™YÈ[Hš[YYÙ[‹‰ÊBˆZYXËZYˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆžN‚ˆ™]\›ˆ˜XÚ×Û[Ý[ÛŠËœ]ËœÝ\Ë™[™™YÚ[Û‹›ÙÜ™\ÜËØ[˜Ù[
+Bˆ^Ù\RUÛÛ\œ›ÜŽ‚ˆYˆØ[˜Ù[š\×ÜÙ]
+
+N‚ˆ˜Z\ÙH^ÜØ[˜Ù[Y
+
+Bˆ˜Z\ÙBˆÙ[‹œÝ\Ú›ØŠ	ÓÚØ[\È[Ý[Û‹U˜XÚÚ[™ÈÚ\™™\™XÚ™]8 )‰ËÜ\˜][Û‹ˆ[X™H™\Ý[œÙ[‹›[Ý[Û—Ý˜XÚÚ[™×ÙÛ™J™\Ý[ZY
+JB‚ˆYˆÝ\ÛX\Ú×Ý˜XÚÚ[™ÊÙ[ŠN‚ˆˆˆ•˜XÚÈH™^šY\ˆX\ÚÈ›ÝYÚHØ[YHØØ[Øš™XÝ˜XÚÙ\‹ˆˆˆ‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆËœÛÝ\˜ÙWÝ\HOIÝšY[ÉÈÜˆË›X\Ú×Ý\HOIØ™^šY\‰ÈÜˆ[ŠË›X\Ú×ÜÚ[ÊOÎ‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHZ[™H™^šY\‹SX\ÚÙHZ]Z[™\Ý[œÈ™ZH[šÝ[‹‰ÊBˆÙ[‹œÝ\Û[Ý[Û—Ý˜XÚÚ[™Ê
+B‚ˆYˆ[Ý[Û—Ý˜XÚÚ[™×ÙÛ™JÙ[‹™\Ý[ZY
+N‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆÏ[™^
+
+˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÈYˆ˜[YKZYO]ZY
+K›Û™JBˆYˆ›ÝÎ‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÐÛ\Ý\™Hðé™[™\È˜XÚÚ[™ÜÈ[™\›‰ËL
+BˆÈ˜XÚÚ[™ÈÜ\˜]\ÈÛˆÛÝ\˜ÙHÙXÛÛ™ÎÈ™[™\ˆš[\œÈÙYHÛ\[ØØ[ˆÈÙXÛÛ™ÈY\ˆÜYY›ØÙ\ÜÚ[™Ëˆš^Y\ÜYYÛ\È\™Y›Ü™HX\ˆÈÛÝ\˜ÙH[YHžHKÜÜYYˆÜYY\˜[\Û\È\ÙHH˜\ÙHÜYY\ÈBˆÈÝX›H\›Þ[X][Ûˆ[™™[XZ[ˆ[HY]X›HY\Ø\™Ë‚ˆ]š\ÛÜ[X^
+ŒK›Ø]
+ËœÜYY
+JBˆÚ[ÏV×Bˆ›ÜˆÚ[[ˆ™\Ý[ÉÝ˜[YI×N‚ˆ˜[YOYXÝ
+Ú[
+NÈ˜[YVÉÝ[YI×O\›Ý[™
+Z[ŠË›[™ÝX^
+Œ›Ø]
+Ú[ÉÝ[YI×JKÙ]š\ÛÜŠJKŠBˆÚ[Ë˜\[™
+˜[YJBˆÚ[ËœÛÜ
+Ù^O[[X™H˜[YN™›Ø]
+˜[YVÉÝ[YI×JJBˆ[š\]YOV×Bˆ›ÜˆÚ[[ˆÚ[Î‚ˆYˆ[š\]YH[™XœÊ›Ø]
+[š\]YVËLWVÉÝ[YI×JKY›Ø]
+Ú[ÉÝ[YI×JJHHYKMÎ‚ˆ[š\]YVËLWO\Ú[ˆ[ÙN‚ˆ[š\]YK˜\[™
+Ú[
+BˆžN‚ˆØ[™Y]O\™\XÙJË˜XÚÚ[™×ÚÙ^Yœ˜[Y\Ï][š\]YJBˆYˆË›X\Ú×Ý\HOH	Ø™^šY\‰È[™[ŠË›X\Ú×ÜÚ[ÊHHÎ‚ˆØ[™Y]O\™\XÙJØ[™Y]KX\Ú×Ü]ÚÙ^Yœ˜[Y\Ï[X\Ú×Ü]ÚÙ^Yœ˜[Y\×Ùœ›ÛWÝ˜XÚÚ[™ÊØ[™Y]JJBˆ›ÜÜÙYVØØ[™Y]HYˆ˜[YKZYO]ZY[ÙH˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\×Bˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹˜Ú[™ÙY
+
+NÈÙ[‹™š[Ú[œÜXÝÜŠ
+Bˆ^˜OIÈ0­È™^šY\‹SX\ÚÙH[š[ZY\	ÈYˆØ[™Y]K›X\Ú×Ü]ÚÙ^Yœ˜[Y\È[ÙH	ÉÂˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Ó[Ý[Û‹U˜XÚÚ[™È™\YÈ0­ÈÛ[Š[š\]YJ_H[šÝHÙ\ÜZXÚ\žÙ^˜_IËŒ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÝ\Ø]]×Ü™Yœ˜[YJÙ[ŠN‚ˆˆˆ‘]XÝHØØ[˜XÙH›ØÝ\È]›ÜˆHÙ[XÝYšY[ÈÛ\ˆˆˆ‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆËœÛÝ\˜ÙWÝ\HOIÝšY[ÉÎ‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHZ[™[ˆ›Ü›X[[ˆšY[ØÛ\°ïˆ]]ËT™Yœ˜[YK‰ÊBˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆ›Ü›X]Û˜[YO\Ù[‹˜]]×Ü™Yœ˜[YWÙ›Ü›X]˜Ý\œ™[]J
+HÜˆ	Ü›Ú™XÝ	ÂˆžN‚ˆ\™Ù]Ø\ÜXÝX]]×Ü™Yœ˜[YWØ\ÜXÝ
+›Ü›X]Û˜[YK‘TÑUÖÜÙ[‹œ™\Ù]˜Ý\œ™[^
+
+WJBˆ^Ù\
+Ù^Q\œ›Ü‹˜[YQ\œ›ÜŠH\È^Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ^ÊBˆZYXËZYˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆžN‚ˆ™]\›ˆ]]×Ü™Yœ˜[YWÝšY[ÊËœ]ËœÝ\Ë™[™\™Ù]Ø\ÜXÝ›ÙÜ™\ÜËØ[˜Ù[
+Bˆ^Ù\RUÛÛ\œ›ÜŽ‚ˆYˆØ[˜Ù[š\×ÜÙ]
+
+N‚ˆ˜Z\ÙH^ÜØ[˜Ù[Y
+
+Bˆ˜Z\ÙBˆÙ[‹œÝ\Ú›ØŠ	ÓÚØ[\È]]ËT™Yœ˜[YHÚ\™[˜[\ÚY\8 )‰ËÜ\˜][Û‹ˆ[X™H™\Ý[œÙ[‹˜]]×Ü™Yœ˜[YWÙÛ™J™\Ý[ZY›Ü›X]Û˜[YJJB‚ˆYˆ]]×Ü™Yœ˜[YWÙÛ™JÙ[‹™\Ý[ZY›Ü›X]Û˜[YJN‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆÏ[™^
+
+˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÈYˆ˜[YKZYO]ZY
+K›Û™JBˆYˆ›ÝÎ‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÐÛ\Ý\™Hðé™[™\È]]ËT™Yœ˜[Y\È[™\›‰ËL
+Bˆ]š\ÛÜ[X^
+ŒK›Ø]
+ËœÜYY
+JBˆÚ[ÏV×Bˆ›ÜˆÚ[[ˆ™\Ý[ÉÝ˜[YI×N‚ˆ˜[YOYXÝ
+Ú[
+Bˆ˜[YVÉÝ[YI×O\›Ý[™
+Z[ŠË›[™ÝX^
+Œ›Ø]
+Ú[ÉÝ[YI×JKÙ]š\ÛÜŠJKŠBˆÚ[Ë˜\[™
+˜[YJBˆÚ[ËœÛÜ
+Ù^O[[X™H˜[YN™›Ø]
+˜[YVÉÝ[YI×JJBˆ[š\]YOV×Bˆ›ÜˆÚ[[ˆÚ[Î‚ˆYˆ[š\]YH[™XœÊ›Ø]
+[š\]YVËLWVÉÝ[YI×JKY›Ø]
+Ú[ÉÝ[YI×JJHHYKMÎ‚ˆ[š\]YVËLWO\Ú[ˆ[ÙN‚ˆ[š\]YK˜\[™
+Ú[
+BˆžN‚ˆØ[™Y]O\™\XÙJË]]×Ü™Yœ˜[YWÙ[˜X›YUYK]]×Ü™Yœ˜[YWÙ›Ü›X]Y›Ü›X]Û˜[YKˆ]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\Ï][š\]YJBˆ›ÜÜÙYVØØ[™Y]HYˆ˜[YKZYO]ZY[ÙH˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\×Bˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹˜Ú[™ÙY
+
+NÈÙ[‹™š[Ú[œÜXÝÜŠ
+Bˆ]XÝY\Ý[JH›ÜˆÚ[[ˆ[š\]YHYˆ›Ø]
+Ú[™Ù]
+	ÜØÛÜ™IËŒ
+JHˆ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJˆ‰Ð]]ËT™Yœ˜[YH™\YÈ0­ÈÛ[Š[š\]YJ_H›ÚÝ\ËT[šÝH0­ÈÙ]XÝYHZ]Ù\ÚXÚÙ\šÙ[›[™Ë‰ËŒ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÛX\—Ø]]×Ü™Yœ˜[YJÙ[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆ›ÝË˜]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\Î‚ˆ™]\›‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆØ[™Y]O\™\XÙJË]]×Ü™Yœ˜[YWÙ[˜X›YQ˜[ÙK]]×Ü™Yœ˜[YWÚÙ^Yœ˜[Y\ÏV×JBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\ÏVØØ[™Y]HYˆ˜[YKZYOXËZY[ÙH˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\×NÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆÝ\Ø™X]Ø[˜[\Ú\ÊÙ[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™›Ý[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊHÜˆ›ÝËš\×Ø]Y[ÈÜˆËœÛÝ\˜ÙWÝ\OOIØY\ÝY[	Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHZ[™[ˆšY[ËHÙ\ˆ]Y[ØÛ\Z]Ûˆ°ïˆ™X]TÞ[˜Ë‰ÊBˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆZYXËZYˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆžN‚ˆ™]\›ˆ[˜[^™WØ™X]ÊËœ]ËœÝ\Ë™[™›ÙÜ™\ÜËØ[˜Ù[
+Bˆ^Ù\RUÛÛ\œ›ÜŽ‚ˆYˆØ[˜Ù[š\×ÜÙ]
+
+N‚ˆ˜Z\ÙH^ÜØ[˜Ù[Y
+
+Bˆ˜Z\ÙBˆÙ[‹œÝ\Ú›ØŠ	ÓÚØ[H™X]Q\šÙ[›[™ÈÚ\™™\™XÚ™]8 )‰ËÜ\˜][Û‹ˆ[X™H™\Ý[œÙ[‹˜™X]Ø[˜[\Ú\×ÙÛ™J™\Ý[ZY
+JB‚ˆYˆ™X]Ø[˜[\Ú\×ÙÛ™JÙ[‹™\Ý[ZY
+N‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆÏ[™^
+
+˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÈYˆ˜[YKZYO]ZY
+K›Û™JBˆYˆ›ÝÎ‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÐÛ\Ý\™Hðé™[™\ˆ™X]Q\šÙ[›[™È[™\›‰ËL
+Bˆ]š\ÛÜ[X^
+ŒK›Ø]
+ËœÜYY
+JBˆ™X]ÛX\šÙ\œÏVÛX\šÙ\ˆ›ÜˆX\šÙ\ˆ[ˆÙ[‹›X\šÙ\œÂˆYˆ›Ý
+X\šÙ\‹™Ù]
+	ÚÚ[™	ÊHOH	Ø™X]	È[™ËœÜÚ][Û‹LYKMˆH›Ø]
+X\šÙ\‹™Ù]
+	Ý[YIË
+JHHË™š[š\Ú
+ÌYKMŠWBˆ›Üˆ[™^™X][ˆ[[Y\˜]J™\Ý[ÉÝ˜[YI×K™Ù]
+	Ø™X]ÉË×JKJN‚ˆ[YOXËœÜÚ][ÛŠÛZ[ŠË›[™ÝX^
+Œ›Ø]
+™X]
+KÙ]š\ÛÜŠJBˆ™X]ÛX\šÙ\œË˜\[™
+ÉÝ[YIÎœ›Ý[™
+[YKŠK	ÛX™[	Î™‰Ð™X]Ú[™^IË	ÚÚ[™	Î‰Ø™X]	Ë	ØÛÛÜ‰Î‰ÈÙ™ÙY‰ßJBˆžN‚ˆ›Ü›X[^™Y[›Ü›X[^™WÛX\šÙ\œÊ™X]ÛX\šÙ\œË[™Ý
+Ù[‹˜Û\ÊJBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹›X\šÙ\œÏ[›Ü›X[^™YÈÙ[‹˜Ú[™ÙY
+
+BˆœO\™\Ý[ÉÝ˜[YI×K™Ù]
+	ØœIËŒ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJˆˆ™X]TÞ[˜È™\YÈ0­ÈÛ[Š™\Ý[ÉÝ˜[YI×K™Ù]
+	Ø™X]ÉË×JJ_H™X]È‚ˆ
+È
+ˆˆ0­ÈØKˆØœN‹ŒŸH”HˆYˆœH[ÙH	ÉÊKŒ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÝ\Ý^Ø˜\ÙYØÝ]
+Ù[ŠN‚ˆˆˆ•˜[œØÜšX™HÛ™HÛ\ØØ[H[™™[[Ý™H]\Ù\ËÙš[\ˆÛÜ™Ëˆˆˆ‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™›Ý[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊHÜˆËœÛÝ\˜ÙWÝ\H›Ý[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊHÜˆ›ÝËš\×Ø]Y[Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHZ[ˆšY[ÈÙ\ˆ]Y[ÈZ]Ûˆ°ïˆ[ˆ^ØÚš]‰ÊBˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆÛÝ\˜ÙOT]
+Ëœ]
+K™^[™\Ù\Š
+Kœ™\ÛÛ™J
+NÈZYXËZYˆYˆ›ÝÛÝ\˜ÙKš\×Ùš[J
+N‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ‰ÑYH]Y[]ZHÝ\™HšXÚÙY[™[Ž—žÜÛÝ\˜Ù_IÊBˆ]š\ÛÜ[X^
+ŒK›Ø]
+ËœÜYY
+JB‚ˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆ^[ØY]˜[œØÜšX™WÛYYXJÛÝ\˜ÙK[Ù[ÜÚ^™OIØ˜\ÙIË[™ÝXYÙOIØ]]ÉËˆØXÚWÙ\\Ù[‹œÝ]WÙ\‹ÉÝÚ\Ü\‹[[Ù[ÉËˆ›ÙÜ™\ÜÏ\›ÙÜ™\ÜËØ[˜Ù[XØ[˜Ù[
+BˆX\YV×Bˆ›ÜˆÝYH[ˆ^[ØY™Ù]
+	ØÝY\ÉË×JN‚ˆžN‚ˆÛÝ\˜ÙWÜÝ\Y›Ø]
+ÝYVÉÜÝ\	×JNÈÛÝ\˜ÙWÙ[™Y›Ø]
+ÝYVÉÙ[™	×JBˆ^Ù\
+Ù^Q\œ›Ü‹\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆÛÛ[YBˆYˆÛÝ\˜ÙWÙ[™HËœÝ\
+ÌYKMÈÜˆÛÝ\˜ÙWÜÝ\HË™[™LYKMÎ‚ˆÛÛ[YBˆØØ[ÜÝ\[X^
+ËœÝ\ÛÝ\˜ÙWÜÝ\
+KXËœÝ\ˆØØ[Ù[™[Z[ŠË™[™ÛÝ\˜ÙWÙ[™
+KXËœÝ\ˆ][OYXÝ
+ÝYKÝ\\›Ý[™
+ØØ[ÜÝ\Ù]š\ÛÜ‹ŠK[™\›Ý[™
+ØØ[Ù[™Ù]š\ÛÜ‹ŠJBˆÛÜ™ÏV×Bˆ›ÜˆÛÜ™[ˆÝYK™Ù]
+	ÝÛÜ™ÉË×JN‚ˆžN‚ˆÛÜ™ÜÝ\[X^
+ËœÝ\›Ø]
+ÛÜ™ÉÜÝ\	×JJKXËœÝ\ˆÛÜ™Ù[™[Z[ŠË™[™›Ø]
+ÛÜ™ÉÙ[™	×JJKXËœÝ\ˆ^Ù\
+Ù^Q\œ›Ü‹\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆÛÛ[YBˆYˆÛÜ™Ù[™ˆ[™ÛÜ™ÜÝ\Ë™[™XËœÝ\‚ˆÛÜ™Ë˜\[™
+XÝ
+ÛÜ™Ý\\›Ý[™
+X^
+ÛÜ™ÜÝ\
+KÙ]š\ÛÜ‹ŠKˆ[™\›Ý[™
+X^
+ÛÜ™Ù[™
+KÙ]š\ÛÜ‹ŠJJBˆYˆÛÜ™Îˆ][VÉÝÛÜ™É×O]ÛÜ™ÂˆX\Y˜\[™
+][JBˆ[XZ[Ý^ÙY]Ü[ŠX\YË›[™Ý
+Bˆ[–ÉÛ[™ÝXYÙI×O\^[ØY™Ù]
+	Û[™ÝXYÙIË	Ø]]ÉÊBˆ[–ÉØÝYWØÛÝ[	×O[[ŠX\Y
+Bˆ™]\›ˆ[‚ˆÙ[‹œÝ\Ú›ØŠ	Õ^˜\ÚY\\ˆØÚš]Ú\™ÚØ[[˜[\ÚY\8 )‰ËÜ\˜][Û‹ˆ[X™H™\Ý[œÙ[‹^Ø˜\ÙYØÝ]ÙÛ™J™\Ý[ZY
+JB‚ˆYˆ^Ø˜\ÙYØÝ]ÙÛ™JÙ[‹™\Ý[ZY
+N‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆÏ[™^
+
+˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÈYˆ˜[YKZYO]ZY
+K›Û™JBˆYˆ›ÝÎ‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÐÛ\Ý\™Hðé™[™\ˆ^[˜[\ÙH[™\›‰ËL
+Bˆ[\™\Ý[ÉÝ˜[YI×Bˆ™[[Ý™YY›Ø]
+[‹™Ù]
+	Ü™[[Ý™YÜÙXÛÛ™ÉËŒ
+JBˆYˆ™[[Ý™YŒŽ‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÒÙZ[™H0é™Ù\™[ˆ]\Ù[ˆÙ\ˆ°ïðíœ\ˆ\šØ[›‰ÊBˆžN‚ˆÙYÛY[ÏXÝ]ØÛ\Ü˜[™Ù\ÊË[‹™Ù]
+	ÚÙY\Ü˜[™Ù\ÉË×JJBˆÛÙš[š\ÚXË™š[š\ÚˆXÝX[Ü™[[Ý™Y[X^
+ŒË›[™Ý\Ý[J˜[YK›[™Ý›Üˆ˜[YH[ˆÙYÛY[ÊJBˆYˆXÝX[Ü™[[Ý™YŒN‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	Ñ\ˆ^ØÚš]]ÙZ[™H™\Ù\˜\™H0á™\[™ÈÙY[™[‹‰ÊBˆ™[[Ý™YÜ˜[™Ù\ÏVÊ›Ø]
+Ý\
+K›Ø]
+[™
+JH›ÜˆÝ\[™[ˆ[‹™Ù]
+	Ü™[[Ý™YÜ˜[™Ù\ÉË×JWB‚ˆYˆÛÛ\XÝÛX\šÙ\—Ý[YJ[YJN‚ˆ[YOY›Ø]
+[YJBˆYˆ[YHËœÜÚ][Û‹LYKMÎ‚ˆ™]\›ˆ[YBˆYˆ[YHˆÛÙš[š\Ú
+ÌYKMÎ‚ˆ™]\›ˆX^
+Œ[YKXXÝX[Ü™[[Ý™Y
+BˆØØ[[X^
+ŒZ[ŠË›[™Ý[YKXËœÜÚ][ÛŠJNÈÚYLŒˆ›ÜˆÝ\[™[ˆ™[[Ý™YÜ˜[™Ù\Î‚ˆYˆØØ[H[™‚ˆÚY
+ÏH[™\Ý\ˆ[YˆØØ[ˆÝ\‚ˆØØ[\Ý\Èœ™XZÂˆ™]\›ˆËœÜÚ][ÛŠÛX^
+ŒØØ[\ÚY
+B‚ˆ›ÜÜÙYV×Bˆ›Üˆ˜[YH[ˆÙ[‹˜Û\Î‚ˆYˆ˜[YKZYO]ZY‚ˆÛÛ[YBˆYˆ˜[YK˜XÚÏOXË˜XÚÈ[™˜[YKœÜÚ][ÛˆHÛÙš[š\ÚLYKMŽ‚ˆ›ÜÜÙY˜\[™
+™\XÙJ˜[YKÜÚ][Û[X^
+Œ˜[YKœÜÚ][Û‹XXÝX[Ü™[[Ý™Y
+JJBˆ[ÙN‚ˆ›ÜÜÙY˜\[™
+˜[YJBˆ›ÜÜÙY™^[™
+ÙYÛY[ÊBˆX\šÙ\œÏVÙXÝ
+X\šÙ\‹[YO\›Ý[™
+ÛÛ\XÝÛX\šÙ\—Ý[YJX\šÙ\–ÉÝ[YI×JKŠJH›ÜˆX\šÙ\ˆ[ˆÙ[‹›X\šÙ\œ×Bˆ›Ü›X[^™YÛX\šÙ\œÏ[›Ü›X[^™WÛX\šÙ\œÊX\šÙ\œË[™Ý
+›ÜÜÙY
+JBˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹›X\šÙ\œÏ[›Ü›X[^™YÛX\šÙ\œÂˆÙ[‹œÙ[XÝ[ÛVÝ˜[YKZY›Üˆ˜[YH[ˆÙYÛY[×NÈÙ[‹˜Ý\œ™[\ÙYÛY[ÖËLWKZYÈÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJˆ‰Õ^ØÚš]™\YÈ0­ÈØXÝX[Ü™[[Ý™Y‹Œ™ŸHÈ[™\›0­È	Âˆ‰ÞÜ[‹™Ù]
+™š[\—ÜÙYÛY[È‹
+_H°ïÛÜTÙYÛY[H0­ÈÛ[ŠÙYÛY[Ê_HZ[IËÌ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÛX\—Ø™X]ÛX\šÙ\œÊÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆX\šÙ\œÏVÛX\šÙ\ˆ›ÜˆX\šÙ\ˆ[ˆÙ[‹›X\šÙ\œÈYˆX\šÙ\‹™Ù]
+	ÚÚ[™	ÊHOH	Ø™X]	×BˆYˆ[ŠX\šÙ\œÊHOH[ŠÙ[‹›X\šÙ\œÊN‚ˆ™]\›‚ˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹›X\šÙ\œÏ[›Ü›X[^™WÛX\šÙ\œÊX\šÙ\œË[™Ý
+Ù[‹˜Û\ÊJNÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆÝ\Ø]]×ØÝ]
+Ù[ŠN‚ˆˆˆ‘š[™™X]È[™\™ØÙ[™HÚ[™Ù\Ë[ˆÜ]]\ÙY[Ú[Ëˆˆˆ‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆËœÛÝ\˜ÙWÝ\HOIÝšY[ÉÎ‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHZ[™[ˆ›Ü›X[[ˆšY[ØÛ\°ïˆ™X]KÔÞ™[™[‹P]]ËPÝ]‰ÊBˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆZYXËZYÈ]š\ÛÜ[X^
+ŒK›Ø]
+ËœÜYY
+JBˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆžN‚ˆYˆËš\×Ø]Y[Î‚ˆ™X]Ù]OX[˜[^™WØ™X]ÊËœ]ËœÝ\Ë™[™ˆ[X™H˜[YNœ›ÙÜ™\ÜÊ[
+˜[YJ‹JJKØ[˜Ù[
+Bˆ[ÙN‚ˆ™X]Ù]O^ÉØ™X]ÉÎ–×K	ØœIÎŒŒBˆ›ÙÜ™\ÜÊJBˆØÙ[™\ÏY]XÝÜØÙ[™WØÚ[™Ù\ÊËœ]ËœÝ\Ë™[™ˆ[X™H˜[YNœ›ÙÜ™\ÜÊJÚ[
+˜[YJ‹MJJKØ[˜Ù[
+BˆÚ[ÏXZ[Ø]]×ØÝ]ÜÚ[Ê™X]Ù]KØÙ[™\ËË›[™Ý
+Bˆ™]\›ˆÉÜÚ[ÉÎ–Ü›Ý[™
+›Ø]
+˜[YJKÙ]š\ÛÜ‹ŠH›Üˆ˜[YH[ˆÚ[×Kˆ	Ø™X]ÉÎ›[Š™X]Ù]K™Ù]
+	Ø™X]ÉË×JJK	ÜØÙ[™\ÉÎ›[ŠØÙ[™\ÊKˆ	ØœIÎ˜™X]Ù]K™Ù]
+	ØœIËŒ
+_Bˆ^Ù\RUÛÛ\œ›ÜŽ‚ˆYˆØ[˜Ù[š\×ÜÙ]
+
+N‚ˆ˜Z\ÙH^ÜØ[˜Ù[Y
+
+Bˆ˜Z\ÙBˆÙ[‹œÝ\Ú›ØŠ	Ð™X]È[™Þ™[™[ˆÙ\™[ˆÚØ[[˜[\ÚY\8 )‰ËÜ\˜][Û‹ˆ[X™H™\Ý[œÙ[‹˜]]×ØÝ]ÙÛ™J™\Ý[ZY
+JB‚ˆYˆ]]×ØÝ]ÙÛ™JÙ[‹™\Ý[ZY
+N‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆÏ[™^
+
+˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÈYˆ˜[YKZYO]ZY
+K›Û™JBˆYˆ›ÝÎ‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÐÛ\Ý\™Hðé™[™\È]]ËPÝ]È[™\›‰ËL
+Bˆ^[ØY\™\Ý[ÉÝ˜[YI×NÈÚ[Ï\^[ØY™Ù]
+	ÜÚ[ÉË×JBˆYˆ›ÝÚ[Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÒÙZ[™HÝXš[[ˆ™X]HÙ\ˆÞ™[™[‹TØÚš][šÝH\šØ[›‰ÊBˆžN‚ˆÙYÛY[Ï\Ü]ØÛ\Ø]Ý[Y\ÊËÚ[ÊBˆYˆ[ŠÙYÛY[ÊOŽ‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÑYH\šØ[›[ˆ[šÝHYYÙ[ˆHXÚ°ïˆZ[™[ˆÚXÚ˜\™[ˆØÚš]‰ÊBˆ›ÜÜÙYVÝ˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÈYˆ˜[YKZYO]ZYJÜÙYÛY[Âˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹œÙ[XÝ[ÛVÝ˜[YKZY›Üˆ˜[YH[ˆÙYÛY[×NÈÙ[‹˜Ý\œ™[\ÙYÛY[ÖËLWKZYÈÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJˆ‰Ð™X]KÔÞ™[™[‹P]]ËPÝ]™\YÈ0­ÈÛ[ŠÙYÛY[ÊKL_HØÚš]H0­È	Âˆ‰ÞÜ^[ØY™Ù]
+˜™X]È‹
+_H™X]È0­ÈÜ^[ØY™Ù]
+œØÙ[™\È‹
+_HÞ™[™[‰ËÌ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÛX\—Û[Ý[Û—Ý˜XÚÚ[™ÊÙ[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆ›ÝË˜XÚÚ[™×ÚÙ^Yœ˜[Y\Î‚ˆ™]\›‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆØ[™Y]O\™\XÙJË˜XÚÚ[™×ÚÙ^Yœ˜[Y\ÏV×JBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\ÏVØØ[™Y]HYˆ˜[YKZYOXËZY[ÙH˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\×NÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆÙ]ÛØš™XÝÜ™[[Ý˜[Ù[˜X›Y
+Ù[‹[˜X›YUYJN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆËœÛÝ\˜ÙWÝ\OOIØY\ÝY[	ÈÜˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊN‚ˆ™]\›‚ˆÙ[‹›Øš™XÝÜ™[[Ý˜[Ù[˜X›YœÙ]ÚXÚÙY
+›ÛÛ
+[˜X›Y
+JBˆÙ[‹˜\WÜ›Ü\Y\Ê
+B‚ˆÈÛÛ\]Xš[]H[\ˆ›ÜˆHÛ[‹[Y[[ÜžHXÝ[Ûˆ\ÙYžHÛ\ˆ›Ú™XÝËÝ\ÝË‚ˆÈHš\ÚX›H]Ûˆ[[[Û˜[H\Ù\È^˜XÝØ]Y[Ê
+KÚXÚÜ™X]\ÈH™X[ÐU‹‚ˆYˆ]XÚØ]Y[ÊÙ[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝšY[ÉÈÜˆ›ÝËš\×Ø]Y[Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHZ[™[ˆšY[ØÛ\Z]ÜšYÚ[˜[Û‹‰ÊBˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+ÊNœ™]\›‚ˆ›ÜÜÙYS›Û™Bˆ›Üˆ˜XÚÈ[ˆÛÜY
+
+›Üˆ[ˆÙ[‹˜XÚÜÈYˆ
+K™]™\œÙOUYJN‚ˆØ[™Y]O\™\XÙJËZY]]ZY]ZY
+
+Kš^˜XÚÏ]˜XÚËÚ[™IØ]Y[ÉÊBˆžN‚ˆ˜[Y]WÝ[Y[[™JÙ[‹˜Û\ÊÖØØ[™Y]WKÙ[‹˜XÚÜÊNÈ›ÜÜÙYXØ[™Y]NÈœ™XZÂˆ^Ù\˜[YQ\œ›ÜŽ‚ˆÛÛ[YBˆÙ[‹˜ÚXÚÜÚ[
+
+BˆYˆ›ÜÜÙY\È›Û™N‚ˆ˜XÚÏ[Z[ŠÙ[‹˜XÚÜÊÖÌJKLNÈÙ[‹˜XÚÜË˜\[™
+˜XÚÊBˆÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊNÈÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊBˆ›ÜÜÙY\™\XÙJËZY]]ZY]ZY
+
+Kš^˜XÚÏ]˜XÚËÚ[™IØ]Y[ÉÊBˆÙ[‹˜Û\ÏVÜ™\XÙJ‹›Û[YOL
+HYˆ‹ZYOXËZY[ÙHˆ›Üˆˆ[ˆÙ[‹˜Û\×JÖÜ›ÜÜÙYBˆÙ[‹œÙ[XÝ[ÛVÜ›ÜÜÙYZYNÈÙ[‹˜Ý\œ™[\›ÜÜÙYZYÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆ^˜XÝYØ]Y[×ÙÛ™JÙ[‹™\Ý[ÛÝ\˜ÙWØÛ\˜XÚÜ×ÜÛ˜\ÚÝ
+N‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆžN‚ˆ]Y[ÏZ[\ÜØÛ\
+™\Ý[ÉÝ˜[YI×JBˆ[™[Z[ŠÛÝ\˜ÙWØÛ\™[™]Y[Ë™\˜][ÛŠBˆÝ\[Z[ŠÛÝ\˜ÙWØÛ\œÝ\X^
+[™SRS—ÐÓT
+JBˆYˆ[™\Ý\RS—ÐÓT‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ	ÑYH^˜ZY\H]Y[ÜÜ\ˆ\ÝHÝ\žˆ°ïˆY\Ù[ˆÛ\‰ÊBˆ›ÜÜÙYS›Û™NÈÚÜÙ[—Ý˜XÚÜÏ[\Ý
+Ù[‹˜XÚÜÊBˆ›Üˆ˜XÚÈ[ˆÛÜY
+
+›Üˆ[ˆÙ[‹˜XÚÜÈYˆ
+K™]™\œÙOUYJN‚ˆØ[™Y]O\™\XÙJ]Y[ËZY]]ZY]ZY
+
+Kš^˜XÚÏ]˜XÚËÜÚ][Û\ÛÝ\˜ÙWØÛ\œÜÚ][Û‹ˆÝ\\Ý\[™Y[™›Û[YO\ÛÝ\˜ÙWØÛ\›Û[YJBˆžN‚ˆ˜[Y]WÝ[Y[[™JÙ[‹˜Û\ÊÖØØ[™Y]WKÙ[‹˜XÚÜÊNÈ›ÜÜÙYXØ[™Y]NÈœ™XZÂˆ^Ù\˜[YQ\œ›ÜŽ‚ˆÛÛ[YBˆYˆ›ÜÜÙY\È›Û™N‚ˆ˜XÚÏ[Z[ŠÙ[‹˜XÚÜÊÖÌJKLBˆÚÜÙ[—Ý˜XÚÜË˜\[™
+˜XÚÊBˆ›ÜÜÙY\™\XÙJ]Y[ËZY]]ZY]ZY
+
+Kš^˜XÚÏ]˜XÚËÜÚ][Û\ÛÝ\˜ÙWØÛ\œÜÚ][Û‹ˆÝ\\Ý\[™Y[™›Û[YO\ÛÝ\˜ÙWØÛ\›Û[YJBˆ˜[Y]WÝ[Y[[™JÙ[‹˜Û\ÊÖÜ›ÜÜÙYKÚÜÙ[—Ý˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜XÚÜÏXÚÜÙ[—Ý˜XÚÜÎÈÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊNÈÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊBˆÙ[‹˜Û\ÏVÜ™\XÙJ‹›Û[YOL
+HYˆ‹ZYO\ÛÝ\˜ÙWØÛ\ZY[ÙHˆ›Üˆˆ[ˆÙ[‹˜Û\×JÖÜ›ÜÜÙYBˆÙ[‹˜\ÜÙ]Ë˜\[™
+›ÜÜÙY
+NÈÙ[‹œÙ[XÝ[ÛVÜ›ÜÜÙYZYNÈÙ[‹˜Ý\œ™[\›ÜÜÙYZYÈÙ[‹œ™\\™WÝš\ÝX[ÊÜ›ÜÜÙYJNÈÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ð]Y[È^˜ZY\[™]YˆZ[™HZYÙ[™H]Y[ÜÜ\ˆÙ[YÝ‰ËŒ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆ[\ÜÙX[ÙÊÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆ]ËÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[Y\ÊÙ[‹	ÕšY[ÈÈ]Y[È[\ÜY\™[‰Ë	ÉËˆ	ÓYYY[ˆ
+
+‹›\
+‹›[Ýˆ
+‹›ZÝˆ
+‹ÙX›H
+‹˜]šH
+‹›Mˆ
+‹›\È
+‹Ø]ˆ
+‹™›XÈ
+‹›ÙÙÈ
+‹›MH
+‹˜XXÈ
+‹œ™È
+‹šœÈ
+‹šœYÈ
+‹˜›\
+‹ÙXœ
+‹Yˆ
+‹Y™ŠNÎÐ[H]ZY[ˆ
+
+ŠIÊBˆÙ[‹š[\ÜÜ]Ê]ÊB‚ˆYˆ[\ÜÜÙ\]Y[˜ÙWÙX[ÙÊÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆ]ËÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[Y\ÊÙ[‹	Ðš[Ù\]Y[žˆ[\ÜY\™[‰Ë	ÉËˆ	Ðš[\ˆ
+
+‹œ™È
+‹šœÈ
+‹šœYÈ
+‹˜›\
+‹ÙXœ
+‹Yˆ
+‹Y™ŠNÎÐ[H]ZY[ˆ
+
+ŠIÊBˆYˆ›Ý]Î‚ˆ™]\›‚ˆœËÚÏTR[œ]X[ÙË™Ù]ÝX›JÙ[‹	Ðš[Ù\]Y[ž‰Ë	Ðš[˜]H\ˆÙ\]Y[žŽ‰ËŒKŒLŒŒŠBˆYˆÚÎ‚ˆÙ[‹š[\ÜÜ]Ê]ËÙ\]Y[˜ÙWÙœÏYœÊB‚ˆYˆ]]ÛX]X×ÜÝX]WÙX[ÙÊÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆÛÝ\˜Ù\ÏV×NÈÙY[\Ù]
+
+BˆØ[™Y]\ÏV×BˆÝ\œ™[\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆÝ\œ™[\È›Ý›Û™N‚ˆØ[™Y]\Ë˜\[™
+Ý\œ™[
+BˆØ[™Y]\Ë™^[™
+Ù[‹˜\ÜÙ]ÊBˆØ[™Y]\Ë™^[™
+Ù[‹˜Û\ÊBˆ›ÜˆØ[™Y]H[ˆØ[™Y]\Î‚ˆYˆØ[™Y]KšÚ[™›Ý[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊHÜˆØ[™Y]KœÛÝ\˜ÙWÝ\H[ˆ
+	Ú[XYÙIË	Ú[XYÙWÜÙ\]Y[˜ÙIË	ØY\ÝY[	ÊN‚ˆÛÛ[YBˆ]\ÝŠØ[™Y]Kœ]Üˆ	ÉÊKœÝš\
+
+BˆYˆ›Ý]Üˆ][ˆÙY[Ž‚ˆÛÛ[YBˆÙY[‹˜Y
+]
+Bˆ]OY‰ÞÔ]
+]
+K›˜[Y_H0­ÈÈ•šY[ÈˆYˆØ[™Y]KšÚ[™OHšY[Èˆ[ÙH]Y[ÈŸIÂˆÛÝ\˜Ù\Ë˜\[™
+
+]K]
+JBˆX[ÙÏP]]ÛX]XÔÝX]QX[ÙÊÛÝ\˜Ù\ËÙ[ŠBˆYˆX[ÙË™^XÊ
+HOTQX[ÙËXØÙ\Y‚ˆ™]\›‚ˆÙ][™ÜÏYX[ÙËœÙ][™ÜÊ
+BˆÙ[‹œÝ\Ý˜[œØÜš\[ÛŠÙ][™ÜÖÉÜ]	×KÙ][™ÜÖÉÛ[™ÝXYÙI×KÙ][™ÜÖÉÛ[Ù[ÜÚ^™I×JB‚ˆYˆÝ\Ý˜[œØÜš\[ÛŠÙ[‹][™ÝXYÙOIØ]]ÉË[Ù[ÜÚ^™OIØ˜\ÙIÊN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆYˆ›Ý]‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÕðéHY\œÝZ[ˆšY[ÈÙ\ˆZ[™H]Y[Ù]ZH°ïˆYHÜ˜XÚ\šÙ[›[™È]\Ë‰ÊBˆÛÝ\˜ÙOT]
+]
+K™^[™\Ù\Š
+Kœ™\ÛÛ™J
+BˆYˆ›ÝÛÝ\˜ÙKš\×Ùš[J
+N‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ‰ÑYH]Y[]ZHÝ\™HšXÚÙY[™[Ž—žÜÛÝ\˜Ù_IÊB‚ˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆ™]\›ˆ˜[œØÜšX™WÛYYXJÛÝ\˜ÙK[Ù[ÜÚ^™O[[Ù[ÜÚ^™K[™ÝXYÙO[[™ÝXYÙKˆØXÚWÙ\\Ù[‹œÝ]WÙ\‹ÉÝÚ\Ü\‹[[Ù[ÉËˆ›ÙÜ™\ÜÏ\›ÙÜ™\ÜËØ[˜Ù[XØ[˜Ù[
+BˆÙ[‹œÝ\Ú›ØŠ	Ð]]ÛX]\ØÚH[\][Ù\™[ˆ\œÝ[8 )‰ËÜ\˜][Û‹ˆ[X™H™\Ý[œÙ[‹˜[œØÜš\[Û—ÙÛ™J™\Ý[ÛÝ\˜ÙJJB‚ˆYˆ˜[œØÜš\[Û—ÙÛ™JÙ[‹™\Ý[ÛÝ\˜ÙJN‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+Bˆ^[ØY\™\Ý[ÉÝ˜[YI×BˆÝY\Ï\^[ØY™Ù]
+	ØÝY\ÉË×JHYˆ\Ú[œÝ[˜ÙJ^[ØYXÝ
+H[ÙH^[ØYˆYˆ›ÝÝY\Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÒÙZ[™HÙ\Ü›ØÚ[™[ˆÛÜH[HYY][H\šØ[›‰ÊBˆžN‚ˆÛÝ[\Ù[‹˜YÜÝX]WØÝY\ÊÝY\Ë]
+ÛÝ\˜ÙJK›˜[YK	Ø]]ÛX]\ØÚ\œÝ[	ÊBˆ]XÝY\ÝŠ^[ØY™Ù]
+	Û[™ÝXYÙIË	Ø]]ÉÊJK\\Š
+HYˆ\Ú[œÝ[˜ÙJ^[ØYXÝ
+H[ÙH	ÐUUÉÂˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÞØÛÝ[H[\][]]ÛX]\ØÚ\œÝ[0­ÈÜ˜XÚHÙ]XÝYIËŒ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆ[\ÜÜÝX]WÙX[ÙÊÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆ]ÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[YJÙ[‹	Õ[\][[\ÜY\™[‰Ë	ÉË	Õ[\][
+
+‹œÜ
+‹
+NÎÐ[H]ZY[ˆ
+
+ŠIÊBˆYˆ]‚ˆÙ[‹š[\ÜÜÝX]\Ê]
+B‚ˆYˆ[\ÜÜÝX]\ÊÙ[‹]
+N‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆYˆØ[˜Ù[š\×ÜÙ]
+
+N‚ˆ˜Z\ÙH^ÜØ[˜Ù[Y
+
+BˆÝY\Ï\\œÙWÜÝX]WÙš[J]
+Bˆ›ÙÜ™\ÜÊL
+Bˆ™]\›ˆÝY\ÂˆÙ[‹œÝ\Ú›ØŠ	Õ[\][Ù\™[ˆÙ[\Ù[ˆ8 )‰ËÜ\˜][Û‹ˆ[X™H™\Ý[œÙ[‹œÝX]WÚ[\ÜÙÛ™J™\Ý[]
+JB‚ˆYˆÝX]WÚ[\ÜÙÛ™JÙ[‹™\Ý[]
+N‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆžN‚ˆÙ[‹˜YÜÝX]WØÝY\Ê™\Ý[ÉÝ˜[YI×K]
+]
+K›˜[YK	Ú[\ÜY\	ÊBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆYÜÝX]WØÝY\ÊÙ[‹ÝY\ËÛÝ\˜ÙWÛX™[XÝ[ÛIÚ[\ÜY\	ÊN‚ˆYˆ›ÝÝY\Î‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ	ÒÙZ[™HðïYÙ[ˆ[\][ÙY[™[‹‰ÊBˆ^\Ý[™Ï[\Ý
+Ù[‹˜Û\ÊBˆ˜XÚÜÏ[\Ý
+Ù[‹˜XÚÜÊBˆšY[×Ý˜XÚÜÏVÝ˜XÚÈ›Üˆ˜XÚÈ[ˆ˜XÚÜÈYˆ˜XÚÈˆBˆ™^Ý˜XÚÏ[X^
+šY[×Ý˜XÚÜËY˜][L
+JÌBˆÝX]WÝ˜XÚÜÏV×Bˆ™]×ØÛ\ÏV×B‚ˆYˆÝ™\›\Ê˜XÚËÝ\[™
+N‚ˆ™]\›ˆ[žJ][K˜XÚÈOH˜XÚÈ[™][KœÜÚ][Ûˆ[™HYKMÈ[™][K™š[š\ÚˆÝ\
+ÈYKMÂˆ›Üˆ][H[ˆ^\Ý[™È
+È™]×ØÛ\ÊB‚ˆ›ÜˆÝYH[ˆÝY\Î‚ˆÝ\Y›Ø]
+ÝYVÉÜÝ\	×JNÈ[™Y›Ø]
+ÝYVÉÙ[™	×JBˆ˜XÚÏ[™^
+
+Ø[™Y]H›ÜˆØ[™Y]H[ˆÝX]WÝ˜XÚÜÈYˆ›ÝÝ™\›\ÊØ[™Y]KÝ\[™
+JK›Û™JBˆYˆ˜XÚÈ\È›Û™N‚ˆ˜XÚÏ[™^Ý˜XÚÎÈ™^Ý˜XÚÊÏLNÈÝX]WÝ˜XÚÜË˜\[™
+˜XÚÊNÈ˜XÚÜË˜\[™
+˜XÚÊBˆ\˜][ÛY[™\Ý\ˆØ[™Y]OPÛ\
+	ÉËŒÝ\L[™Y\˜][Û‹ÜÚ][Û\Ý\˜XÚÏ]˜XÚËÚ[™IÝ^	Ëˆ\×Ø]Y[ÏQ˜[ÙK^XÝYVÉÝ^	×KÛÝ\˜ÙWÝ\OIÝ^	ÊBˆ™]×ØÛ\Ë˜\[™
+Ø[™Y]JBˆ›ÜÜÙYY^\Ý[™ÊÛ™]×ØÛ\Âˆ˜[Y]WÝ[Y[[™J›ÜÜÙY˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜XÚÜÏ]˜XÚÜÂˆÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊBˆÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊBˆ›Üˆ[™^˜XÚÈ[ˆ[[Y\˜]JÝX]WÝ˜XÚÜËJN‚ˆÙ[‹˜XÚ×Û˜[Y\ÖÝ˜XÚ×OIÕ[\][	ÈYˆ[™^OHH[ÙH‰Õ[\][Ú[™^IÂˆÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹œÙ[XÝ[ÛVØÛ\ZY›ÜˆÛ\[ˆ™]×ØÛ\×BˆÙ[‹˜Ý\œ™[[™]×ØÛ\ÖËLWKZYYˆ™]×ØÛ\È[ÙH›Û™NÈÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÞÛ[Š™]×ØÛ\Ê_H[\][]\ÈÜÛÝ\˜ÙWÛX™[HØXÝ[ÛŸK‰ËL
+Bˆ™]\›ˆ[Š™]×ØÛ\ÊB‚ˆYˆ[\ÜÜ]ÊÙ[‹]ËÙ\]Y[˜ÙWÙœÏS›Û™JN‚ˆYˆ›Ý]ÈÜˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆ\ÜÙ]ÏV×NÈ\œ›ÜœÏV×BˆYˆÙ\]Y[˜ÙWÙœÈ\È›Ý›Û™N‚ˆžN‚ˆ\ÜÙ]Ë˜\[™
+[\ÜÚ[XYÙWÜÙ\]Y[˜ÙJ]ËÙ\]Y[˜ÙWÙœÊJBˆ›ÙÜ™\ÜÊL
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ\œ›ÜœË˜\[™
+ÝŠ^ÊJBˆ™]\›ˆ\ÜÙ]Ë\œ›ÜœÂˆ›ÜˆK][ˆ[[Y\˜]J]ÊN‚ˆYˆØ[˜Ù[š\×ÜÙ]
+
+Nœ˜Z\ÙH^ÜØ[˜Ù[Y
+
+BˆžN˜\ÜÙ]Ë˜\[™
+[\ÜØÛ\
+]
+JBˆ^Ù\^Ù\[Ûˆ\È^Î™\œ›ÜœË˜\[™
+ÝŠ^ÊJBˆ›ÙÜ™\ÜÊ[
+
+JÌJKÛ[Š]ÊJŒL
+JBˆYˆØ[˜Ù[š\×ÜÙ]
+
+Nœ˜Z\ÙH^ÜØ[˜Ù[Y
+
+Bˆ™]\›ˆ\ÜÙ]Ë\œ›ÜœÂˆÙ[‹œÝ\Ú[™\[™[Ú›ØŠ	Ú[\Ü	Ë	ÓYYY[ˆÙ\™[ˆÙ\°ï8 )‰ËÜ\˜][Û‹Ù[‹š[\ÜÙÛ™JB‚ˆYˆ[\ÜÙÛ™JÙ[‹™\Ý[
+N‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×Nœ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+Bˆ\ÜÙ]Ë\œ›ÜœÏ\™\Ý[ÉÝ˜[YI×Bˆ\ÜÙ]ÚÙ^O[[X™H\ÜÙ]Š\ÜÙ]œÛÝ\˜ÙWÝ\K\J\ÜÙ]œÛÝ\˜ÙWÜ]ÊHYˆ\ÜÙ]œÛÝ\˜ÙWÜ]È[ÙH\ÜÙ]œ]
+BˆÛ›ÝÛ^Ø\ÜÙ]ÚÙ^J\ÜÙ]
+H›Üˆ\ÜÙ][ˆÙ[‹˜\ÜÙ]ßBˆYYVØ\ÜÙ]›Üˆ\ÜÙ][ˆ\ÜÙ]ÈYˆ\ÜÙ]ÚÙ^J\ÜÙ]
+H›Ý[ˆÛ›ÝÛ—BˆYˆYYˆÙ[‹˜ÚXÚÜÚ[
+	ÓYYY[ˆ[\ÜY\™[‰ÊBˆÙ[‹˜\ÜÙ]Ë™^[™
+YY
+NÈÙ[‹œ™\\™WÝš\ÝX[ÊYY
+NÈÙ[‹œ™Yœ™\ÚÛYYXJ
+BˆYˆYYœÙ[‹˜Ú[™ÙY
+
+BˆYˆYY[™Ù[‹œ\™›Ü›X[˜ÙWØÛÛX›Ë˜Ý\œ™[]J
+OOIÜÛ[ÛÝ	ÎˆU[Y\‹œÚ[™ÛTÚÝ
+Ù[‹œ\™›Ü›X[˜ÙWØÚ[™ÙY
+BˆYˆ\œ›ÜœÎœÙ[‹™\œ›ÜŠ	×‰Ëš›Ú[Š\œ›ÜœÊJB‚ˆYˆÜ[—ÛYYXWÜ[™[
+Ù[ŠN‚ˆˆˆ”ÚÝÈH›Ú™XÝYYXHš[ˆ[™ÙY\HXœ˜\žH[™[Ý]ÙˆHØ^Kˆˆˆ‚ˆYˆ›Ý\Ø]ŠÙ[‹	Ø\ÜÙ]ÛXœ˜\žWÜ[™[	ÊN‚ˆ™]\›‚ˆÙ[‹›YYXWÚXY[™ËœÙ]^
+	ÓQQQS‰ÊBˆ›ÜˆÚYÙ][ˆÙ[‹—ÛYYXWØÛÛ›ÛÎ‚ˆYˆÚYÙ]\ÈÙ[‹›YYXWÙ[\WÚ[‚ˆÛÛ[YBˆÚYÙ]œÚÝÊ
+BˆÙ[‹›Xœ˜\žWÜÝXÚËšYJ
+BˆÙ[‹›YYXWÙ[\WÚ[œÙ]š\ÚX›JÙ[‹›YYXWÛ\Ý˜ÛÝ[
+
+HOH
+BˆÙ[‹œ™Yœ™\ÚÛYYXJ
+B‚ˆYˆÜ[—ÛXœ˜\žWÜ[™[
+Ù[ŠN‚ˆˆˆ”™\XÙHHYYXHš[ˆÚ]HÛÛ\XÝÙ™›[™HÝ\\ˆXœ˜\žKˆˆˆ‚ˆYˆ›Ý\Ø]ŠÙ[‹	Ø\ÜÙ]ÛXœ˜\žWÜ[™[	ÊN‚ˆ™]\›‚ˆ›ÜˆÚYÙ][ˆÙ[‹—ÛYYXWØÛÛ›ÛÎ‚ˆÚYÙ]šYJ
+BˆÙ[‹›YYXWÚXY[™ËœÙ]^
+	Ð’P“SÕRÉÊBˆÙ[‹›YYXWØÛÝ[œÙ]^
+‰ÞÛ[ŠXœ˜\žWÚ][\Ê
+J_HÝ\\‹P\ÜÙ]ÉÊBˆÙ[‹›Xœ˜\žWÜÝXÚËœÙ]Ý\œ™[ÚYÙ]
+Ù[‹˜\ÜÙ]ÛXœ˜\žWÜ[™[
+BˆÙ[‹›Xœ˜\žWÜÝXÚËœÚÝÊ
+BˆÙ[‹˜\ÜÙ]ÛXœ˜\žWÜ[™[œ™Yœ™\Ú
+
+B‚ˆYˆÜ[—Ü™\Ù]ÛXœ˜\žJÙ[‹Ù^JN‚ˆˆˆ”ÚÝÈÛ™HYXØ]YÙ™›[™HXœ˜\žH[ˆHYYXHÛÛ[[‹ˆˆˆ‚ˆ[™[ÝÚYÙ]\Ù[‹›Xœ˜\žWÜ[™[Ë™Ù]
+ÝŠÙ^JJHYˆ\Ø]ŠÙ[‹	ÛXœ˜\žWÜ[™[ÉÊH[ÙH›Û™BˆYˆ[™[ÝÚYÙ]\È›Û™N‚ˆ™]\›‚ˆ›ÜˆÚYÙ][ˆÙ[‹—ÛYYXWØÛÛ›ÛÎ‚ˆÚYÙ]šYJ
+BˆX™[Ï^Âˆ	Ý^	Î‰ÕV	Ë	ÜÝXÚÙ\‰Î‰ÔÕPÒÑT‰Ë	ÙY™™XÝÉÎ‰ÑQ‘‘RÕIËˆ	Ý˜[œÚ][ÛœÉÎ‰ðç‘T‘ðá‘ÑIË	Ùš[\œÉÎ‰Ñ’ST‰ËˆBˆÙ[‹›YYXWÚXY[™ËœÙ]^
+X™[Ë™Ù]
+ÝŠÙ^JKÝŠÙ^JK\\Š
+JJBˆÙ[‹›YYXWØÛÝ[œÙ]^
+‰ÞÜ[™[ÝÚYÙ]›\Ý˜ÛÝ[
+
+_H™\Ù]ÉÊBˆÙ[‹›Xœ˜\žWÜÝXÚËœÙ]Ý\œ™[ÚYÙ]
+[™[ÝÚYÙ]
+BˆÙ[‹›Xœ˜\žWÜÝXÚËœÚÝÊ
+Bˆ[™[ÝÚYÙ]œ™Yœ™\Ú
+
+B‚ˆYˆÜ[—Ý^Ü[™[
+Ù[ŠN‚ˆÙ[‹›Ü[—Ü™\Ù]ÛXœ˜\žJ	Ý^	ÊB‚ˆYˆÜ[—ÜÝXÚÙ\—Ü[™[
+Ù[ŠN‚ˆÙ[‹›Ü[—Ü™\Ù]ÛXœ˜\žJ	ÜÝXÚÙ\‰ÊB‚ˆYˆÜ[—ÙY™™XÝ×Ü[™[
+Ù[ŠN‚ˆÙ[‹›Ü[—Ü™\Ù]ÛXœ˜\žJ	ÙY™™XÝÉÊB‚ˆYˆÜ[—Ý˜[œÚ][Ûœ×Ü[™[
+Ù[ŠN‚ˆÙ[‹›Ü[—Ü™\Ù]ÛXœ˜\žJ	Ý˜[œÚ][ÛœÉÊB‚ˆYˆÜ[—Ùš[\œ×Ü[™[
+Ù[ŠN‚ˆÙ[‹›Ü[—Ü™\Ù]ÛXœ˜\žJ	Ùš[\œÉÊB‚ˆYˆ™]šY]×ÛXœ˜\žWÚ][JÙ[‹][WÚY
+N‚ˆ][OYÙ]ÛXœ˜\žWÚ][J][WÚY
+BˆYˆ][H\È›Û™N‚ˆ™]\›‚ˆYˆ][KšÚ[™OH	ÜÛÝ[™	Î‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑY\Ù\È™\Ù]Ú\™\™ZÝ]Yˆ[ˆ]\ÙÙ]ðé[ˆÛ\[™Ù]Ù[™]‰ËÌ
+Bˆ™]\›‚ˆžN‚ˆ][Xœ˜\žWÜÛÝ[™Ü]
+][Kš][WÚYÙ[‹œÝ]WÙ\ŠBˆÙ[‹›Xœ˜\žWÜ^Y\‹œÝÜ
+
+BˆÙ[‹›Xœ˜\žWÜ^Y\‹œÙ]ÛÝ\˜ÙJU\›™œ›ÛSØØ[š[JÝŠ]
+JJBˆÙ[‹›Xœ˜\žWÜ^Y\‹œ^J
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Õ›ÜœØÚ]NˆÚ][K]_IËŒ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÛXœ˜\žWØ]Y[×Ý˜XÚÊÙ[‹™Y™\œ™YS›Û™JN‚ˆˆˆÚÛÜÙH[ˆ[›ØÚÙY]Y[È˜XÚËÜ™X][™ÈÛ™HÛ›HÚ[ˆ™XÙ\ÜØ\žKˆˆˆ‚ˆ]Y[×Ý˜XÚÜÏVÝ˜XÚÈ›Üˆ˜XÚÈ[ˆÙ[‹˜XÚÜÈYˆ˜XÚÈBˆYˆ™Y™\œ™Y[ˆ]Y[×Ý˜XÚÜÈ[™›ÝÙ[‹˜XÚ×ÛØÚÙY
+™Y™\œ™Y
+N‚ˆ™]\›ˆ™Y™\œ™Yˆ]˜Z[X›OVÝ˜XÚÈ›Üˆ˜XÚÈ[ˆ]Y[×Ý˜XÚÜÈYˆ›ÝÙ[‹˜XÚ×ÛØÚÙY
+˜XÚÊWBˆYˆ]˜Z[X›N‚ˆ™]\›ˆZ[Š]˜Z[X›KÙ^OXXœÊBˆÈHØ[\ˆYÈ\È˜XÚÈÙÙ]\ˆÚ]H™\ÝÙˆHY]ÛÈBˆÈÚ[™ÛH[™ÈÝ\Ø[ˆ™[[Ý™H]YØZ[ˆYˆ[^\Ý[™È]Y[È˜XÚÜÂˆÈÙ\™HØÚÙY‚ˆ™]\›ˆZ[Š]Y[×Ý˜XÚÜÈÜˆÌJKLB‚ˆYˆÛXœ˜\žWÚ[œÙ\ÜÜÚ][ÛŠÙ[‹˜XÚË\˜][Û‹™Y™\œ™YS›Û™JN‚ˆˆˆ‘š[™Hš\œÝœ™YHÛÝÛˆH\™Ù]˜XÚÈœ›ÛHH^ZXYÛØ\™ˆˆˆ‚ˆÜÚ][Û[X^
+Œ›Ø]
+Ù[‹œ^ZXYYˆ™Y™\œ™Y\È›Û™H[ÙH™Y™\œ™Y
+JBˆ›ÜˆÛ\[ˆÛÜY
+
+˜[YH›Üˆ˜[YH[ˆÙ[‹˜Û\ÈYˆ˜[YK˜XÚÈOH˜XÚÊKÙ^O[[X™H˜[YN˜[YKœÜÚ][ÛŠN‚ˆYˆÛ\™š[š\ÚHÜÚ][Ûˆ
+ÈYKMÎ‚ˆÛÛ[YBˆYˆÛ\œÜÚ][ÛˆHÜÚ][Ûˆ
+È\˜][ÛˆHYKMÎ‚ˆœ™XZÂˆÜÚ][ÛXÛ\™š[š\Úˆ™]\›ˆÜÚ][Û‚‚ˆYˆØÛÛ[Z]ÛXœ˜\žWØÛ\
+Ù[‹Ø[™Y]K]JN‚ˆ›ÜÜÙYVØØ[™Y]HYˆ][KZYOXØ[™Y]KZY[ÙH][H›Üˆ][H[ˆÙ[‹˜Û\×Bˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+]JBˆÙ[‹˜Û\Ï\›ÜÜÙYÈÙ[‹œÙ[XÝ[ÛVØØ[™Y]KZYNÈÙ[‹˜Ý\œ™[XØ[™Y]KZYÈÙ[‹˜Ú[™ÙY
+
+B‚ˆYˆØ\WÛXœ˜\žWÙY™™XÝ
+Ù[‹][JN‚ˆÛ\\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÛ\ÜˆÛ\šÚ[™OH	ÝšY[ÉÈÜˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÕðéHY\œÝZ[™[ˆšY[ËHÙ\ˆY\ÝY[PÛ\]\Ë‰ËÌ
+BˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+Û\
+N‚ˆ™]\›‚ˆ\˜[Y]\œÏYXÝ
+][Kœ\˜[Y]\œÊBˆ™\Ù]Û˜[YO\\˜[Y]\œËœÜ
+	ÙY™™XÝÜ™\Ù]	Ë	ØÛX[‰ÊBˆ˜[Y\ÏYXÝ
+Q‘‘PÕÔ‘TÑUË™Ù]
+™\Ù]Û˜[YKßJJBˆ˜[Y\Ë\]J\˜[Y]\œÊBˆØ[™Y]O\™\XÙJÛ\Y™™XÝÜ™\Ù]\™\Ù]Û˜[YK
+Š˜[Y\ÊBˆžN‚ˆÙ[‹—ØÛÛ[Z]ÛXœ˜\žWØÛ\
+Ø[™Y]K‰ÐšX›[ÝZÎˆÚ][K]_IÊBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÑY™™ZÝ8 'žÚ][K]_x '[™Ù]Ù[™]‰ËÌ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆØ\WÛXœ˜\žWØ[š[X][ÛŠÙ[‹][JN‚ˆÛ\\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÛ\ÜˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÕðéHY\œÝZ[™[ˆÛ\°ïˆYH[š[X][Ûˆ]\Ë‰ËÌ
+BˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+Û\
+N‚ˆ™]\›‚ˆ[š[X][ÛZ][Kœ\˜[Y]\œË™Ù]
+	Ø[š[X][Û‰ÊBˆYˆÛ\šÚ[™OH	Ý^	Î‚ˆ^Ø[š[X][Û^ÉÝ^Ù˜YIÎ‰Ù˜YIË	Ý^ÜÛYIÎ‰ÜÛYWÛY	ßK™Ù]
+[š[X][ÛŠBˆYˆ^Ø[š[X][Ûˆ\È›Û™N‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑY\ÙH[š[X][Ûˆ\Ý°ïˆ^Û\È›Ü™Ù\ÙZ[‹‰ËÌ
+BˆØ[™Y]O\™\XÙJÛ\^Ø[š[X][Û]^Ø[š[X][Û‹ˆ^Ø[š[X][Û—Ù\˜][Û[Z[ŠŽX^
+ŒKÛ\›[™Ý
+JJBˆ[YˆÛ\šÚ[™OH	ÝšY[ÉÈ[™Û\œÛÝ\˜ÙWÝ\HOH	ØY\ÝY[	Î‚ˆ\˜][Û[X^
+ŒK›Ø]
+Û\›[™Ý
+JBˆYÙO[Z[ŠKX^
+ŒK\˜][ÛŠ‹ŒÍJJBˆÝ\ÜØØ[OXÛ\šY[×ÜØØ[NÈ[™ÜØØ[OXÛ\šY[×ÜØØ[BˆÝ\ÞXÛ\šY[×ÞÈ[™ÞXÛ\šY[×ÞˆÝ\ÞOXÛ\šY[×ÞNÈ[™ÞOXÛ\šY[×ÞBˆYˆ[š[X][ÛˆOH	Þ›ÛÛWÚ[‰Î‚ˆÝ\ÜØØ[O[X^
+ŒKÛ\šY[×ÜØØ[J‹Ž
+Bˆ[Yˆ[š[X][ÛˆOH	Þ›ÛÛWÛÝ]	Î‚ˆ[™ÜØØ[O[X^
+ŒKÛ\šY[×ÜØØ[J‹Ž
+Bˆ[Yˆ[š[X][ÛˆOH	ÜÛYWÛY	Î‚ˆÝ\ÞKŒˆ[Yˆ[š[X][ÛˆOH	ÜÛYWÝ\	Î‚ˆÝ\ÞOKŒˆ[ÙN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑY\ÙH[š[X][Ûˆ\Ý°ïˆ^Û\È›Ü™Ù\ÙZ[‹‰ËÌ
+Bˆœ˜[Y\ÏVÙXÝ
+[YOLŒØØ[O\Ý\ÜØØ[K\Ý\ÞO\Ý\ÞKˆ›Ý][ÛXÛ\œ›Ý][Û‹ÜXÚ]OXÛ\›ÜXÚ]K›\XÛ\˜›\‹Ý\™OIÙX\ÙWÛÝ]	ÊKˆXÝ
+[YOY\˜][Û‹ØØ[OY[™ÜØØ[KY[™ÞOY[™ÞKˆ›Ý][ÛXÛ\œ›Ý][Û‹ÜXÚ]OXÛ\›ÜXÚ]K›\XÛ\˜›\‹Ý\™OIÙX\ÙWÚ[—ÛÝ]	ÊWBˆØ[™Y]O\™\XÙJÛ\Ù^Yœ˜[Y\ÏYœ˜[Y\ÊBˆ[ÙN‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÕðéHZ[™[ˆ›Ü›X[[ˆšY[ËHÙ\ˆ^Û\]\Ë‰ËÌ
+BˆžN‚ˆÙ[‹—ØÛÛ[Z]ÛXœ˜\žWØÛ\
+Ø[™Y]K‰ÐšX›[ÝZÎˆÚ][K]_IÊBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Ð[š[X][Ûˆ8 'žÚ][K]_x '[™Ù]Ù[™]‰ËÌ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆØ\WÛXœ˜\žWÝ˜[œÚ][ÛŠÙ[‹][JN‚ˆÛ\\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÛ\ÜˆÛ\šÚ[™›Ý[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊHÜˆÛ\œÛÝ\˜ÙWÝ\HOH	ØY\ÝY[	ÈÜˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÕðéHZ[™[ˆšY[ËHÙ\ˆ]Y[ØÛ\°ïˆ[ˆ0ç™\™Ø[™È]\Ë‰ËÌ
+BˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+Û\
+N‚ˆ™]\›‚ˆ˜[œÚ][ÛZ][Kœ\˜[Y]\œË™Ù]
+	Ý˜[œÚ][Û—Ý\IË	Ù\ÜÛÛ™IÊBˆ\˜][Û[Z[Š›Ø]
+][Kœ\˜[Y]\œË™Ù]
+	Ù\˜][Û‰ËJJKX^
+ŒÛ\›[™Ý
+JBˆØ[™Y]O\™\XÙJÛ\˜[œÚ][Û—Ý\O]˜[œÚ][Û‹˜[œÚ][Û—Ù\˜][ÛY\˜][ÛŠBˆžN‚ˆÙ[‹—ØÛÛ[Z]ÛXœ˜\žWØÛ\
+Ø[™Y]K‰ÐšX›[ÝZÎˆÚ][K]_IÊBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ðç™\™Ø[™È8 'žÚ][K]_x '[™Ù]Ù[™]‰ËÌ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆØ\WÛXœ˜\žWÙš[\ŠÙ[‹][JN‚ˆÛ\\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÛ\ÜˆÛ\šÚ[™OH	ÝšY[ÉÈÜˆÛ\œÛÝ\˜ÙWÝ\HOH	ØY\ÝY[	ÈÜˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÕðéHY\œÝZ[™[ˆ›Ü›X[[ˆšY[ØÛ\°ïˆ[ˆš[\ˆ]\Ë‰ËÌ
+BˆYˆ›ÝÙ[‹œ™\]Z\™WÝ[›ØÚÙY
+Û\
+N‚ˆ™]\›‚ˆ™\Ù]\ÝŠ][Kœ\˜[Y]\œË™Ù]
+	Ùš[\—Ü™\Ù]	Ë	Û›Û™IÊJBˆYˆ™\Ù]›Ý[ˆ’ST—Ô‘TÑUÎ‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑY\Ù\Èš[\‹T™\Ù]\ÝšXÚ™\™°ïØ˜\‹‰ËÌ
+BˆØ[™Y]O\™\XÙJÛ\š[\—Ü™\Ù]\™\Ù]
+BˆžN‚ˆÙ[‹—ØÛÛ[Z]ÛXœ˜\žWØÛ\
+Ø[™Y]K‰ÐšX›[ÝZÎˆÚ][K]_IÊBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Ñš[\ˆ8 'žÚ][K]_x '[™Ù]Ù[™]‰ËÌ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÚ[œÙ\ÛXœ˜\žWÜÝXÚÙ\ŠÙ[‹][JN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆYˆ›Ý[žJËšÚ[™OH	ÝšY[ÉÈ[™ËœÛÝ\˜ÙWÝ\HOH	ØY\ÝY[	È›ÜˆÈ[ˆÙ[‹˜Û\ÊN‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	Ñ°ïÙHY\œÝZ[ˆšY[È\ˆ[Y[[™H[žK‰ÊBˆ\˜[Y]\œÏYXÝ
+][Kœ\˜[Y]\œÊBˆÜÚ][Û[X^
+ŒZ[ŠÙ[‹œ^ZXY[™Ý
+Ù[‹˜Û\ÊJJBˆ\˜][Û[Z[ŠËŒX^
+K[™Ý
+Ù[‹˜Û\ÊK\ÜÚ][ÛŠJHYˆ[™Ý
+Ù[‹˜Û\ÊOœÜÚ][Ûˆ[ÙHËŒˆ˜XÚÏ[X^
+
+˜XÚÈ›Üˆ˜XÚÈ[ˆÙ[‹˜XÚÜÈYˆ˜XÚÈˆ
+KY˜][L
+JÌBˆØ[™Y]OPÛ\
+	ÉËŒÝ\LŒ[™Y\˜][Û‹ÜÚ][Û\ÜÚ][Û‹˜XÚÏ]˜XÚËˆÚ[™IÝ^	Ë\×Ø]Y[ÏQ˜[ÙK^\ÝŠ\˜[Y]\œË™Ù]
+	ÙÛ\	Ë	ø¦!IÊJKˆÛÝ\˜ÙWÝ\OIÝ^	Ë›ÛÜÚ^™OZ[
+\˜[Y]\œË™Ù]
+	Ù›ÛÜÚ^™IËMŠJKˆÛÛÜ\ÝŠ\˜[Y]\œË™Ù]
+	ØÛÛÜ‰Ë	ÈÙ™™™™™‰ÊJK›ÛÙ˜[Z[OIÑZ˜UHØ[œÉËˆ›ÛØ›ÛUYKÝ][™WÝÚYL‹ŒÝ][™WØÛÛÜIÈÌLNŒ	ËˆÚYÝ×ÜÚ^™OL‹ŒÚYÝ×ØÛÛÜIÈÌ	Ë˜XÚÙÜ›Ý[™Ù[˜X›YQ˜[ÙKˆ˜XÚÙÜ›Ý[™ÛÜXÚ]OLŒ^Ø[š[X][ÛIÙ˜YIËˆ^Ø[š[X][Û—Ù\˜][ÛKŒKY›Ø]
+\˜[Y]\œË™Ù]
+	Þ	ËJJKˆOY›Ø]
+\˜[Y]\œË™Ù]
+	ÞIËJJK\Ü^WÛ˜[YOZ][K]JBˆžN‚ˆ›ÜÜÙY\Ù[‹˜Û\ÊÖØØ[™Y]WBˆ˜[Y]WÝ[Y[[™J›ÜÜÙYÙ[‹˜XÚÜÊÖÝ˜XÚ×JBˆÙ[‹˜ÚXÚÜÚ[
+‰ÐšX›[ÝZÎˆÚ][K]_HZ[™°ïÙ[‰ÊBˆÙ[‹˜XÚÜË˜\[™
+˜XÚÊBˆÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊBˆÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊBˆÙ[‹˜XÚ×Û˜[Y\ÖÝ˜XÚ×OY‰ÔÝXÚÙ\ˆÜÝ[J˜[YKšÚ[™OH^ˆ›Üˆ˜[YH[ˆÙ[‹˜Û\ÊJÌ_IÂˆÙ[‹˜Û\Ë˜\[™
+Ø[™Y]JNÈÙ[‹œÙ[XÝ[ÛVØØ[™Y]KZYNÈÙ[‹˜Ý\œ™[XØ[™Y]KZYˆÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÔÝXÚÙ\ˆ8 'žÚ][K]_x 'Z[™ÙY°ïÝ‰ËÌ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÚ[œÙ\ÛXœ˜\žWÜÛÝ[™
+Ù[‹][KÜÚ][ÛS›Û™K˜XÚÏS›Û™JN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆžN‚ˆ][Xœ˜\žWÜÛÝ[™Ü]
+][Kš][WÚYÙ[‹œÝ]WÙ\ŠBˆ^\Ý[™Ï[™^
+
+\ÜÙ]›Üˆ\ÜÙ][ˆÙ[‹˜\ÜÙ]ÂˆYˆ\ÜÙ]œ][™]
+\ÜÙ]œ]
+Kœ™\ÛÛ™J
+OO\]œ™\ÛÛ™J
+JK›Û™JBˆYˆ^\Ý[™È\È›Û™N‚ˆ\ÜÙ]\™\XÙJ[\ÜØÛ\
+ÝŠ]
+JK\Ü^WÛ˜[YOZ][K]JBˆ[ÙN‚ˆ\ÜÙ]Y^\Ý[™ÂˆYˆ›Ý\ÜÙ]™\Ü^WÛ˜[YN‚ˆ\ÜÙ]\™\XÙJ\ÜÙ]\Ü^WÛ˜[YOZ][K]JBˆ\™Ù]Ý˜XÚÏ\Ù[‹—ÛXœ˜\žWØ]Y[×Ý˜XÚÊ˜XÚÊBˆ\™Ù]Ý˜XÚÜÏ[\Ý
+Ù[‹˜XÚÜÊBˆYˆ\™Ù]Ý˜XÚÈ›Ý[ˆ\™Ù]Ý˜XÚÜÎ‚ˆ\™Ù]Ý˜XÚÜË˜\[™
+\™Ù]Ý˜XÚÊBˆ\™Ù]ÜÜÚ][Û\Ù[‹—ÛXœ˜\žWÚ[œÙ\ÜÜÚ][ÛŠ\™Ù]Ý˜XÚË\ÜÙ]›[™ÝÜÚ][ÛŠBˆØ[™Y]O\™\XÙJ\ÜÙ]ZY]]ZY]ZY
+
+Kš^ÜÚ][Û]\™Ù]ÜÜÚ][Û‹˜XÚÏ]\™Ù]Ý˜XÚÊBˆ˜[Y]WÝ[Y[[™JÙ[‹˜Û\ÊÖØØ[™Y]WK\™Ù]Ý˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+	ÐšX›[ÝZÎˆÛÝ[™Z[™°ïÙ[‰ÊBˆYˆ\™Ù]Ý˜XÚÜÈOHÙ[‹˜XÚÜÎ‚ˆÙ[‹˜XÚÜÏ]\™Ù]Ý˜XÚÜÂˆÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\ÊÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚÜÊBˆÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\ÊÙ[‹˜XÚ×Û˜[Y\ËÙ[‹˜XÚÜÊBˆYˆ^\Ý[™È\È›Ý›Û™H[™\ÜÙ]ZYOH^\Ý[™ËZY‚ˆÙ[‹˜\ÜÙ]ÏVØ\ÜÙ]Yˆ˜[YKZYOY^\Ý[™ËZY[ÙH˜[YH›Üˆ˜[YH[ˆÙ[‹˜\ÜÙ]×BˆYˆ^\Ý[™È\È›Û™N‚ˆÙ[‹˜\ÜÙ]Ë˜\[™
+\ÜÙ]
+BˆÙ[‹˜Û\Ë˜\[™
+Ø[™Y]JNÈÙ[‹œÙ[XÝ[ÛVØØ[™Y]KZYNÈÙ[‹˜Ý\œ™[XØ[™Y]KZYˆÙ[‹œ™\\™WÝš\ÝX[ÊØ\ÜÙ]JNÈÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÔÛÝ[™8 'žÚ][K]_x 'Z[™ÙY°ïÝ‰ËÌ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆ\ÙWÛXœ˜\žWÚ][JÙ[‹][WÚY
+N‚ˆˆˆ\HH™\Ù]Üˆ[œÙ\HÙ[™\˜]YÛÝ[™\Ú[™È^\Ý[™ÈY]Üˆ]Kˆˆˆ‚ˆ][OYÙ]ÛXœ˜\žWÚ][J][WÚY
+BˆYˆ][H\È›Û™N‚ˆ™]\›‚ˆYˆ][KšÚ[™OH	ÜÛÝ[™	Î‚ˆÙ[‹—Ú[œÙ\ÛXœ˜\žWÜÛÝ[™
+][JBˆ[Yˆ][KšÚ[™OH	ÙY™™XÝ	Î‚ˆÙ[‹—Ø\WÛXœ˜\žWÙY™™XÝ
+][JBˆ[Yˆ][KšÚ[™OH	Ø[š[X][Û‰Î‚ˆÙ[‹—Ø\WÛXœ˜\žWØ[š[X][ÛŠ][JBˆ[Yˆ][KšÚ[™OH	Ý˜[œÚ][Û‰Î‚ˆÙ[‹—Ø\WÛXœ˜\žWÝ˜[œÚ][ÛŠ][JBˆ[Yˆ][KšÚ[™OH	Ùš[\‰Î‚ˆÙ[‹—Ø\WÛXœ˜\žWÙš[\Š][JBˆ[Yˆ][KšÚ[™OH	Ý^ÜÝ[IÎ‚ˆÙ[‹˜YÝ^
+][Kœ\˜[Y]\œË™Ù]
+	ÜÝ[IÊJBˆ[Yˆ][KšÚ[™OH	ÜÝXÚÙ\‰Î‚ˆÙ[‹—Ú[œÙ\ÛXœ˜\žWÜÝXÚÙ\Š][JB‚ˆYˆ[™WÛXœ˜\žWÙ›Ü
+Ù[‹][WÚYÜÚ][Û‹˜XÚÊN‚ˆ][OYÙ]ÛXœ˜\žWÚ][J][WÚY
+BˆYˆ][H\È›Û™HÜˆ][KšÚ[™OH	ÜÛÝ[™	Î‚ˆ™]\›‚ˆÙ[‹—Ú[œÙ\ÛXœ˜\žWÜÛÝ[™
+][KÜÚ][ÛY›Ø]
+ÜÚ][ÛŠK˜XÚÏZ[
+˜XÚÊJB‚ˆYˆ™Yœ™\ÚÛYYXJÙ[ŠN‚ˆÙ[‹›Z\ÜÚ[™×ÛYYXO[Z\ÜÚ[™×Ü›Ú™XÝÛYYXJÙ[‹˜Û\ËÙ[‹˜\ÜÙ]ÊBˆÙ[XÝYÚ][O\Ù[‹›YYXWÛ\Ý˜Ý\œ™[][J
+HYˆ\Ø]ŠÙ[‹	ÛYYXWÛ\Ý	ÊH[ÙH›Û™BˆÙ[XÝYÝZY\Ù[XÝYÚ][K™]JYYXS\ÝTÔÑUÕRQÔ“ÓJHYˆÙ[XÝYÚ][H\È›Ý›Û™H[ÙH›Û™Bˆ]Y\žO\Ù[‹›YYXWÜÙX\˜Ú^
+
+KœÝš\
+
+K˜Ø\ÙY›Û
+
+HYˆ\Ø]ŠÙ[‹	ÛYYXWÜÙX\˜Ú	ÊH[ÙH	ÉÂˆš[\—Ý˜[YO\Ù[‹›YYXWÙš[\‹˜Ý\œ™[]J
+HYˆ\Ø]ŠÙ[‹	ÛYYXWÙš[\‰ÊH[ÙH	Ø[	ÂˆÛÜÝ˜[YO\Ù[‹›YYXWÜÛÜ˜Ý\œ™[]J
+HYˆ\Ø]ŠÙ[‹	ÛYYXWÜÛÜ	ÊH[ÙH	ÛÜ™\‰Âˆ˜]›Üš]\×ÛÛ›O\Ù[‹›YYXWÙ˜]›Üš]\×ÛÛ›Kš\ÐÚXÚÙY
+
+HYˆ\Ø]ŠÙ[‹	ÛYYXWÙ˜]›Üš]\×ÛÛ›IÊH[ÙH˜[ÙBˆ›ÝÜÏV×Bˆ›Üˆ[™^È[ˆ[[Y\˜]JÙ[‹˜\ÜÙ]ÊN‚ˆXÛÛIø¥©‰ÈYˆËœÛÝ\˜ÙWÝ\OOIÚ[XYÙWÜÙ\]Y[˜ÙIÈ[ÙH	ø¥©ÉÈYˆËœÛÝ\˜ÙWÝ\OOIÚ[XYÙIÈ[ÙH	ø¥®	ÈYˆËšÚ[™OIÝšY[ÉÈ[ÙH	ø¦jÉÂˆX™[ÚÚ[™IÐ’SÑTUQS–‰ÈYˆËœÛÝ\˜ÙWÝ\OOIÚ[XYÙWÜÙ\]Y[˜ÙIÈ[ÙH	Ð’S	ÈYˆËœÛÝ\˜ÙWÝ\OOIÚ[XYÙIÈ[ÙHËšÚ[™\\Š
+Bˆ™Y™\™[˜ÙYVØËœ]JÛ\Ý
+ËœÛÝ\˜ÙWÜ]ÊJÊØË›]Ü]HYˆË›]Ü][ÙH×JBˆÙ™›[™OX[žJ][™›Ý]
+]
+Kš\×Ùš[J
+H›Üˆ][ˆ™Y™\™[˜ÙY
+BˆØ]YÛÜžOIÜÙ\]Y[˜ÙIÈYˆËœÛÝ\˜ÙWÝ\OOIÚ[XYÙWÜÙ\]Y[˜ÙIÈ[ÙH	Ú[XYÙIÈYˆËœÛÝ\˜ÙWÝ\OOIÚ[XYÙIÈ[ÙH	ÝšY[ÉÈYˆËšÚ[™OIÝšY[ÉÈ[ÙH	Ø]Y[ÉÂˆÙX\˜ÚX›OIÈ	Ëš›Ú[Š
+]
+Ëœ]
+K›˜[YKÝŠËœ]
+KX™[ÚÚ[™Ø]YÛÜžJJK˜Ø\ÙY›Û
+
+BˆYˆ]Y\žH[™]Y\žH›Ý[ˆÙX\˜ÚX›N‚ˆÛÛ[YBˆYˆš[\—Ý˜[YH›Ý[ˆ
+	Ø[	ËØ]YÛÜžJH[™›Ý
+š[\—Ý˜[YOOIÛÙ™›[™IÈ[™Ù™›[™JN‚ˆÛÛ[YBˆYˆ˜]›Üš]\×ÛÛ›H[™ÝŠ]
+Ëœ]
+Kœ™\ÛÛ™J
+JH›Ý[ˆÙ[‹™˜]›Üš]WØ\ÜÙ]Î‚ˆÛÛ[YBˆ›ÝÜË˜\[™
+
+[™^ËØ]YÛÜžKÙ™›[™KXÛÛ‹X™[ÚÚ[™
+JBˆYˆÛÜÝ˜[YHOH	Û˜[YIÎ‚ˆ›ÝÜËœÛÜ
+Ù^O[[X™H›ÝÎŠ]
+›ÝÖÌWKœ]
+K›˜[YK˜Ø\ÙY›Û
+
+K›ÝÖÌJJBˆ[YˆÛÜÝ˜[YHOH	Ý\IÎ‚ˆ›ÝÜËœÛÜ
+Ù^O[[X™H›ÝÎŠ›ÝÖÍWK]
+›ÝÖÌWKœ]
+K›˜[YK˜Ø\ÙY›Û
+
+K›ÝÖÌJJBˆ[YˆÛÜÝ˜[YHOH	Ù\˜][Û‰Î‚ˆ›ÝÜËœÛÜ
+Ù^O[[X™H›ÝÎŠY›Ø]
+›ÝÖÌWK™\˜][ÛŠK]
+›ÝÖÌWKœ]
+K›˜[YK˜Ø\ÙY›Û
+
+K›ÝÖÌJJBˆÙ[‹›YYXWÛ\ÝœÙ]\]\Ñ[˜X›Y
+˜[ÙJNÈÙ[‹›YYXWÛ\Ý˜ÛX\Š
+Bˆ›Üˆ[™^ËØ]YÛÜžKÙ™›[™KXÛÛ‹X™[ÚÚ[™[ˆ›ÝÜÎ‚ˆX\šÙ\J	ø¦¨	ÈYˆÙ™›[™H[ÙH	ÉÊJÊ	ø¦!H	ÈYˆÝŠ]
+Ëœ]
+Kœ™\ÛÛ™J
+JH[ˆÙ[‹™˜]›Üš]WØ\ÜÙ]È[ÙH	ÉÊBˆ][OTS\ÝÚYÙ]][J‰ÞÛX\šÙ\Ÿ^ÚXÛÛŸHÔ]
+Ëœ]
+K›˜[Y_WžØË™\˜][ÛŽ‹ŒYŸHÈ0­ÈÛX™[ÚÚ[™IÊBˆÜÝ\\Ù[‹[X›˜Z[Ë™Ù]
+Ù[‹š\ÝX[ÚÙ^JËœ]
+JHYˆ\Ø]ŠÙ[‹	Ý[X›˜Z[ÉÊH[ÙH›Û™BˆYˆÜÝ\ˆ\È›Ý›Û™H[™›ÝÜÝ\‹š\Ó[
+
+N‚ˆ\™Ù]TTÚ^™J‹Í
+HYˆÙ]]ŠÙ[‹›YYXWÛ\Ý	ÝšY]Ó[ÙIË[X™N”S\ÝÚYÙ]’XÛÛ“[ÙJJ
+HOHS\ÝÚYÙ]“\Ý[ÙH[ÙHTÚ^™JLM‹ŠBˆ][KœÙ]XÛÛŠRXÛÛŠT^X\™œ›ÛR[XYÙJÜÝ\ŠKœØØ[Y
+\™Ù]]’ÙY\\ÜXÝ˜][Ë]”Û[ÛÝ˜[œÙ›Ü›X][ÛŠJJBˆ][KœÙ]Ú^™R[
+TÚ^™J
+HYˆÙ]]ŠÙ[‹›YYXWÛ\Ý	ÝšY]Ó[ÙIË[X™N”S\ÝÚYÙ]’XÛÛ“[ÙJJ
+HOHS\ÝÚYÙ]“\Ý[ÙH[ÙHTÚ^™JLÌ‹MŠJBˆ][KœÙ]ÛÛ\
+Ëœ]
+NÈ][KœÙ]]JYYXS\ÝTÔÑUÒS‘VÔ“ÓK[™^
+NÈ][KœÙ]]JYYXS\ÝTÔÑUÕRQÔ“ÓKËZY
+NÈÙ[‹›YYXWÛ\Ý˜Y][J][JBˆÙ[‹›YYXWÛ\ÝœÙ]\]\Ñ[˜X›Y
+YJBˆYˆÙ[XÝYÝZY‚ˆÙ[XÝYÜ›ÝÏ[™^
+
+›ÝÈ›Üˆ›ÝÈ[ˆ˜[™ÙJÙ[‹›YYXWÛ\Ý˜ÛÝ[
+
+JBˆYˆÙ[‹›YYXWÛ\Ýš][J›ÝÊK™]JYYXS\ÝTÔÑUÕRQÔ“ÓJOO\Ù[XÝYÝZY
+KLJBˆ[ÙN‚ˆÙ[XÝYÜ›ÝÏKLBˆYˆÙ[XÝYÜ›ÝÈH‚ˆÙ[‹›YYXWÛ\ÝœÙ]Ý\œ™[›ÝÊÙ[XÝYÜ›ÝÊBˆ[YˆÙ[‹›YYXWÛ\Ý˜ÛÝ[
+
+N‚ˆÙ[‹›YYXWÛ\ÝœÙ]Ý\œ™[›ÝÊ
+BˆYˆ\Ø]ŠÙ[‹	ÛYYXWØÛÝ[	ÊN‚ˆÝ[[[ŠÙ[‹˜\ÜÙ]ÊNÈš\ÚX›O[[Š›ÝÜÊBˆÙ[‹›YYXWØÛÝ[œÙ]^
+‰ÞÝš\ÚX›_HÈÝÝ[HYYY[‰ÈYˆš\ÚX›HOHÝ[[ÙH‰ÞÝÝ[HYYY[‰ÊBˆYˆ\Ø]ŠÙ[‹	ÛYYXWÙ[\WÚ[	ÊN‚ˆÙ[‹›YYXWÙ[\WÚ[œÙ]š\ÚX›J›Ý›ÝÜÊBˆYˆ›ÝÙ[‹˜\ÜÙ]Î‚ˆÙ[‹›YYXWÙ[\WÚ[œÙ]^
+	Ó›ØÚÙZ[™HYYY[—’[\ÜY\™HZ[ˆšY[Ë]Y[ÈÙ\ˆš[[HHÝ\[‹‰ÊBˆ[Yˆ˜]›Üš]\×ÛÛ›N‚ˆÙ[‹›YYXWÙ[\WÚ[œÙ]^
+	ÒÙZ[™H˜]›Üš][ˆÚXÚ˜\—“X\šÚY\™HZ[ˆYY][HZ]8¦!‹[H\ÈY\ˆHØ[[Y[‹‰ÊBˆ[ÙN‚ˆÙ[‹›YYXWÙ[\WÚ[œÙ]^
+	ÒÙZ[™HYYY[ˆ\ÜÙ[ˆHY\Ù[Hš[\—”ÝXÚHÙ\ˆš[\ˆ\°ïÚÜÙ]™[‹‰ÊBˆÙ[‹\]WÛYYXWÙ˜]›Üš]WØ]ÛŠ
+BˆÙ[‹[Y[[™K˜\ÜÙ]Ï\Ù[‹˜\ÜÙ]ÈYˆ\Ø]ŠÙ[‹	Ý[Y[[™IÊH[ÙH×BˆYˆ\Ø]ŠÙ[‹	Ü›ÞWØ›Þ	ÊN‚ˆ]˜Z[X›OX[žJËšÚ[™[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊH[™ËœÛÝ\˜ÙWÝ\H›Ý[ˆ
+	Ú[XYÙIË	Ú[XYÙWÜÙ\]Y[˜ÙIÊBˆ[™Ëœ][™]
+Ëœ]
+Kš\×Ùš[J
+H›ÜˆÈ[ˆÙ[‹˜\ÜÙ]ÊÜÙ[‹˜Û\ÊBˆÙ[‹œ›ÞWØ›ÞœÙ][˜X›Y
+]˜Z[X›JBˆÙ[‹œ›ÞWÜ›Ùš[WØÛÛX›ËœÙ][˜X›Y
+]˜Z[X›JBˆYˆ›Ý]˜Z[X›H[™Ù[‹œ›ÞWØ›Þš\ÐÚXÚÙY
+
+N‚ˆÙ[‹œ›ÞWØ›ÞœÙ]ÚXÚÙY
+˜[ÙJB‚ˆYˆ™\\™WÝš\ÝX[ÊÙ[‹\ÜÙ]ÊN‚ˆˆˆ”ÜÝ\œÈ[™Ø]™Y›Ü›\È\™HXÛÙYÙ™ˆHÕRH™XYˆˆˆ‚ˆÙ[‹œ]Y]YWÝš\ÝX[Ê\ÜÙ]ÊB‚ˆYˆ[\ØÝ]
+Ù[‹\™XÝ[ÛŠN‚ˆ\™Ù]Ï\ÛÜY
+Ýˆ›ÜˆÈ[ˆÙ[‹˜Û\È›Üˆˆ[ˆ
+ËœÜÚ][Û‹Ë™š[š\Ú
+_JBˆÚÚXÙ\ÏVÝˆ›Üˆˆ[ˆ\™Ù]ÈYˆ
+‹\Ù[‹œ^ZXY
+J™\™XÝ[ÛŒYKM—BˆYˆÚÚXÙ\ÎˆÙ[‹œÙ]Ü^ZXY
+Z[ŠÚÚXÙ\ÊHYˆ\™XÝ[ÛŒ[ÙHX^
+ÚÚXÙ\ÊJB‚ˆYˆYÙWÜ^ZXY
+Ù[‹ÙXÛÛ™ÊN‚ˆYˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆÙ[‹œÙ]Ü^ZXY
+X^
+Z[Š[™Ý
+Ù[‹˜Û\ÊKÙ[‹œ^ZXY
+ÜÙXÛÛ™ÊJJB‚ˆYˆ˜[œÜÜÜÝÜ
+Ù[ŠN‚ˆÙ[‹˜[œÜÜÜ˜]WÜ[™[™ÏS›Û™BˆÙ[‹˜[œÜÜÝ[Y\‹œÝÜ
+
+BˆÙ[‹˜[œÜÜÜ˜]OLŒˆÙ[‹œ^Y\‹œ]\ÙJ
+NÈÙ[‹œ^Y\‹œÙ]^X˜XÚÔ˜]JKŒ
+BˆÙ[‹œ^WØ]Û‹œÙ]^
+	ø¥­ˆ[Y[[™IÊB‚ˆYˆÜÝ\Ý˜[œÜÜ
+Ù[‹˜]JN‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹˜Û\Î‚ˆ™]\›‚ˆ˜]OY›Ø]
+˜]JBˆYˆ›ÝÙ[‹œ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆÙ[‹˜[œÜÜÜ˜]WÜ[™[™Ï\˜]BˆÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYX›ÛÛ
+Ù[‹œ™]šY]×Ü][™]
+Ù[‹œ™]šY]×Ü]
+Kš\×Ùš[J
+JBˆYˆÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝY[™˜]Hˆ‚ˆÙ[‹›[ÙOIÝ[Y[[™IÎÈÙ[‹˜]Y[ËœÙ]›Û[YJJNÈÙ[‹œ^Y\‹œÙ]^X˜XÚÔ˜]J˜]JBˆÙ[‹›ØYÜ^Y\ŠÙ[‹œ™]šY]×Ü]Z[ŠÙ[‹œ^ZXY[™Ý
+Ù[‹˜Û\ÊJKYJBˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	ÓU•TˆðçQÑTˆÕS‘0­ÈÚ]HÝ\]™]YH›ÜœØÚ]H0éY[H[\™Ü[™8 )‰ÊBˆÙ[‹œ™[™\—Ü™]šY]Ê
+Bˆ™]\›‚ˆÙ[‹›[ÙOIÝ[Y[[™IÎÈÙ[‹˜]Y[ËœÙ]›Û[YJJNÈÙ[‹˜[œÜÜÜ˜]O\˜]NÈÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆYˆ˜]H‚ˆYˆÙ[‹œ^ZXYHŒN‚ˆÙ[‹œ^ZXY[[™Ý
+Ù[‹˜Û\ÊBˆÙ[‹œ^Y\‹œ]\ÙJ
+NÈÙ[‹˜[œÜÜÝ[Y\‹œÝ\
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Òˆ0­È°ïÚÝðéÈØXœÊ˜]JN™ßpåÉËŒ
+Bˆ™]\›‚ˆÙ[‹˜[œÜÜÝ[Y\‹œÝÜ
+
+BˆYˆÙ[‹œ^ZXYH[™Ý
+Ù[‹˜Û\ÊKKŒŽ‚ˆÙ[‹œ^ZXYLŒˆÙ[‹œ^Y\‹œÙ]^X˜XÚÔ˜]J˜]JBˆÙ[‹›ØYÜ^Y\ŠÙ[‹œ™]šY]×Ü]Ù[‹œ^ZXYYJBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Ó0­È›ÜðéÈÜ˜]N™ßpåÉËŒ
+B‚ˆYˆ˜[œÜÜÚŠÙ[ŠN‚ˆYˆÙ[‹˜[œÜÜÜ˜]H‚ˆÙ[‹—ÜÝ\Ý˜[œÜÜ
+X^
+MŒÙ[‹˜[œÜÜÜ˜]JŒ‹Œ
+JBˆ[ÙN‚ˆÙ[‹—ÜÝ\Ý˜[œÜÜ
+LKŒ
+B‚ˆYˆ˜[œÜÜÚÊÙ[ŠN‚ˆÙ[‹˜[œÜÜÜÝÜ
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÒÈ0­È]\ÙIËŒ
+B‚ˆYˆ˜[œÜÜÛ
+Ù[ŠN‚ˆYˆÙ[‹˜[œÜÜÜ˜]Hˆ‚ˆÙ[‹—ÜÝ\Ý˜[œÜÜ
+Z[ŠŒÙ[‹˜[œÜÜÜ˜]JŒ‹Œ
+JBˆ[ÙN‚ˆÙ[‹—ÜÝ\Ý˜[œÜÜ
+KŒ
+B‚ˆYˆ˜[œÜÜÝXÚÊÙ[ŠN‚ˆYˆÙ[‹˜[œÜÜÜ˜]HHÜˆ›ÝÙ[‹˜Û\Î‚ˆÙ[‹˜[œÜÜÜÝÜ
+
+Bˆ™]\›‚ˆ™^Ý[YO\Ù[‹œ^ZXY
+ÈÙ[‹˜[œÜÜÜ˜]JŒŒˆYˆ™^Ý[YHH‚ˆÙ[‹œÙ]Ü^ZXY
+
+BˆÙ[‹˜[œÜÜÜÝÜ
+
+Bˆ™]\›‚ˆÙ[‹œÙ]Ü^ZXY
+™^Ý[YJB‚ˆYˆYÜÙ[XÝYØ\ÜÙ]
+Ù[ŠN‚ˆ›ÝÏ\Ù[‹›YYXWÛ\Ý˜\ÜÙ]Ú[™^
+
+BˆYˆ›ÝÏÜˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆO\Ù[‹˜\ÜÙ]ÖÜ›Ý×NÈÙ[XÝY\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆÛÛ\]X›OVÝ›Üˆ[ˆÙ[‹˜XÚÜÈYˆ
+Œ
+OOJKšÚ[™OIÝšY[ÉÊWBˆ˜XÚÏ\Ù[XÝY˜XÚÈYˆÙ[XÝY[™Ù[XÝY˜XÚÈ[ˆÛÛ\]X›H[ÙHZ[ŠÛÛ\]X›KÙ^OXXœÊBˆÜÚ][Û[X^
+
+Ë™š[š\Ú›ÜˆÈ[ˆÙ[‹˜Û\ÈYˆË˜XÚÏO]˜XÚÊKY˜][L
+BˆÙ[‹™›ÜØ\ÜÙ]
+›ÝËÜÚ][Û‹˜XÚÊB‚ˆYˆ›ÜØ\ÜÙ]
+Ù[‹[™^ÜÚ][Û‹˜XÚÊN‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝZ[™^[ŠÙ[‹˜\ÜÙ]ÊNœ™]\›‚ˆYˆÙ[‹˜XÚ×ÛØÚÙY
+˜XÚÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑY\ÙHšY[Ü\ˆ\ÝÙ\Ü\œ‰ËÌ
+Bˆ™]\›‚ˆO\Ù[‹˜\ÜÙ]ÖÚ[™^BˆØ[™Y]O\™\XÙJKÜÚ][Û\ÜÚ][Û‹˜XÚÏ]˜XÚËZY]]ZY]ZY
+
+Kš^
+BˆžN‚ˆ˜[Y]WÝ[Y[[™JÙ[‹˜Û\ÊÖØØ[™Y]WKÙ[‹˜XÚÜÊBˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\Ë˜\[™
+Ø[™Y]JNÈÙ[‹œÙ[XÝ[ÛVØØ[™Y]KZYNÈÙ[‹˜Ý\œ™[XØ[™Y]KZYÈÙ[‹˜Ú[™ÙY
+
+Bˆ^Ù\^Ù\[Ûˆ\È^ÎœÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆ˜YÑ[\‘]™[
+Ù[‹]™[
+N‚ˆYˆ]™[›Z[YQ]J
+Kš\Õ\›Ê
+H[™›ÝÙ[‹ÛÜšÙ\Ž™]™[˜XØÙ\›ÜÜÙYXÝ[ÛŠ
+B‚ˆYˆ›Ü]™[
+Ù[‹]™[
+N‚ˆ]ÏVÝKÓØØ[š[J
+H›ÜˆH[ˆ]™[›Z[YQ]J
+K\›Ê
+HYˆKš\ÓØØ[š[J
+WBˆÝX]WÜ]ÏVÜ]›Üˆ][ˆ]ÈYˆ]
+]
+KœÝY™š^›ÝÙ\Š
+H[ˆ
+	ËœÜ	Ë	Ë	ÊWBˆYYXWÜ]ÏVÜ]›Üˆ][ˆ]ÈYˆ]›Ý[ˆÝX]WÜ]×BˆYˆÝX]WÜ]Î‚ˆÙ[‹š[\ÜÜÝX]\ÊÝX]WÜ]ÖÌJBˆYˆYYXWÜ]Î‚ˆÙ[‹š[\ÜÜ]ÊYYXWÜ]ÊBˆ]™[˜XØÙ\›ÜÜÙYXÝ[ÛŠ
+B‚ˆYˆ›ÛÛJÙ[‹˜[YJN‚ˆÛ\Ù[‹[Y[[™KœØØ[NÈØÜ›Û\Ù[‹œØÜ›ÛšÜš^›Û[ØÜ›Û˜\Š
+BˆÙ[\‹Ù™œÙ]\Ù[‹—Þ›ÛÛWØ[˜ÚÜˆÜˆ
+
+ØÜ›Û˜[YJ
+JÜÙ[‹œØÜ›ÛšY]ÜÜ
+
+KÚY
+
+KÌ‹\Ù[‹[Y[[™K“Q•
+KÛÛÙ[‹œØÜ›ÛšY]ÜÜ
+
+KÚY
+
+KÌŠBˆÙ[‹[Y[[™KœØØ[OY›Ø]
+˜[YJNÈÙ[‹[Y[[™Kœ™Yœ™\Ú
+Ù[‹˜Û\ËÙ[‹˜XÚÜËÙ[‹˜Ý\œ™[Ù[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚ×Û˜[Y\ËÙ[‹œÙ[XÝ[ÛŠBˆÙ[‹[Y[[™Kœ™\Ú^™JX^
+Ù[‹[Y[[™K›Z[š[][UÚY
+
+KÙ[‹œØÜ›ÛšY]ÜÜ
+
+KÚY
+
+JKÙ[‹[Y[[™KšZYÚ
+
+JBˆØÜ›ÛœÙ]˜[YJ[
+Ù[\Š˜[YJÜÙ[‹[Y[[™K“Q•[Ù™œÙ]
+JB‚ˆYˆš]Ý[Y[[™JÙ[ŠN‚ˆÚY\Ù[‹œØÜ›ÛšY]ÜÜ
+
+KÚY
+
+K\Ù[‹[Y[[™K“Q•LÍBˆÙ[‹ž›ÛÛWÜÛY\‹œÙ]˜[YJX^
+‹Z[ŠŒ[
+ÚYÛX^
+K[™Ý
+Ù[‹˜Û\ÊJJJJJB‚ˆÝ]XÛY]ÙˆYˆÜÛÝ\˜ÙWØÛØÚÊÙXÛÛ™ÊN‚ˆÙXÛÛ™Ï[X^
+Œ›Ø]
+ÙXÛÛ™ÊJBˆ™]\›ˆ‰ÞÚ[
+ÙXÛÛ™ÊKËÍŒŒŸNžÜÙXÛÛ™ÉMŒŒKŒ™ŸIÂ‚ˆYˆÜÛÝ\˜ÙWÛYYXWØÛ\
+Ù[ŠN‚ˆˆˆ”™]\›ˆHXÝ]™HšY[ËØ]Y[ÈÛÝ\˜ÙHÚÝÛˆ[ˆHÛÝ\˜ÙH[Ûš]Ü‹ˆˆˆ‚ˆÛ\\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ
+Ù[‹›[ÙHOIÜÛÝ\˜ÙIÈÜˆÛ\\È›Û™HÜˆÛ\šÚ[™›Ý[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊBˆÜˆÛ\œÛÝ\˜ÙWÝ\H›Ý[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊJN‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÛ\‚ˆYˆØXÝ]˜]WÜÛÝ\˜ÙWØÛ\
+Ù[‹Û\
+N‚ˆˆˆ”Ý\Hœ™\Ú˜[œÚY[[‹ÓÝ]Ù\ÜÚ[Ûˆ›ÜˆH™]ÛHÙ[XÝYÛÝ\˜ÙKˆˆˆ‚ˆYˆÙ[‹œÛÝ\˜ÙWØÛ\ÝZYOXÛ\ZY‚ˆÙ[‹œÛÝ\˜ÙWØÛ\ÝZYXÛ\ZYÈÙ[‹œÛÝ\˜ÙWÚ[S›Û™NÈÙ[‹œÛÝ\˜ÙWÛÝ]S›Û™B‚ˆYˆÜÛÝ\˜ÙWØ›Ý[™ÊÙ[‹Û\
+N‚ˆˆˆ”™]\›ˆHY™™XÝ]™HÛÝ\˜ÙH[‹ÓÝ]Û[\YÈHÝ\œ™[Û\ˆˆˆ‚ˆÝ\XÛ\œÝ\YˆÙ[‹œÛÝ\˜ÙWØÛ\ÝZYOXÛ\ZYÜˆÙ[‹œÛÝ\˜ÙWÚ[ˆ\È›Û™H[ÙHÙ[‹œÛÝ\˜ÙWÚ[‚ˆ[™XÛ\™[™YˆÙ[‹œÛÝ\˜ÙWØÛ\ÝZYOXÛ\ZYÜˆÙ[‹œÛÝ\˜ÙWÛÝ]\È›Û™H[ÙHÙ[‹œÛÝ\˜ÙWÛÝ]ˆÝ\[X^
+Û\œÝ\Z[ŠÛ\™[™Ý\
+JNÈ[™[X^
+Û\œÝ\Z[ŠÛ\™[™[™
+JBˆYˆ[™\Ý\RS—ÐÓT‚ˆ™]\›ˆÛ\œÝ\Û\™[™ˆ™]\›ˆÝ\[™‚ˆYˆÜÛÝ\˜ÙWÜÜÚ][ÛŠÙ[‹Û\
+N‚ˆˆˆ”™]\›ˆHÝ\œ™[ÛÝ\˜ÙH[YK\Ú[™ÈH^Y\ˆÚ[ˆ]˜Z[X›Kˆˆˆ‚ˆ˜[˜XÚÏXÛ\œÝ\
+ÛX^
+ŒZ[ŠÛ\›[™ÝX^
+ŒÙ[‹œ^ZXYXÛ\œÜÚ][ÛŠJJBˆžN‚ˆ\›TU\›™œ›ÛSØØ[š[JÝŠÛ\œ]
+JBˆ^Y\—ÜÜÚ][Û\Ù[‹œ^Y\‹œÜÚ][ÛŠ
+KÌLŒˆYˆÙ[‹œ^Y\‹œÛÝ\˜ÙJ
+OO]\›[™Û\œÝ\KŒO\^Y\—ÜÜÚ][ÛXÛ\™[™
+ËŒN‚ˆ™]\›ˆX^
+Û\œÝ\Z[ŠÛ\™[™^Y\—ÜÜÚ][ÛŠJBˆ^Ù\
+]šX]Q\œ›Ü‹\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ\ÜÂˆ™]\›ˆX^
+Û\œÝ\Z[ŠÛ\™[™˜[˜XÚÊJB‚ˆYˆ\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊÙ[ŠN‚ˆˆˆ”™Yœ™\ÚÛÝ\˜ÙK[[Ûš]ÜˆX™[È[™XÝ[Ûˆ]˜Z[Xš[]Kˆˆˆ‚ˆYˆ›Ý\Ø]ŠÙ[‹	ÜÛÝ\˜ÙWÚ[—Ø]Û‰ÊN‚ˆ™]\›‚ˆÛ\\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆXÝ]™O\Ù[‹—ÜÛÝ\˜ÙWÛYYXWØÛ\
+
+H\È›Ý›Û™Bˆ›ÜˆÚYÙ][ˆ
+Ù[‹œÛÝ\˜ÙWÚ[—Ø]Û‹Ù[‹œÛÝ\˜ÙWÛÝ]Ø]Û‹Ù[‹œÛÝ\˜ÙWØÛX\—Ø]Û‹ˆÙ[‹œÛÝ\˜ÙWÚ[œÙ\Ø]Û‹Ù[‹œÛÝ\˜ÙWÛÝ™\Üš]WØ]ÛŠN‚ˆÚYÙ]œÙ][˜X›Y
+XÝ]™JBˆYˆXÝ]™N‚ˆÛÝ\˜ÙWÚ[‹ÛÝ\˜ÙWÛÝ]\Ù[‹—ÜÛÝ\˜ÙWØ›Ý[™ÊÛ\
+BˆX\šÜÏV×BˆYˆÙ[‹œÛÝ\˜ÙWÚ[ˆ\È›Ý›Û™NˆX\šÜË˜\[™
+‰ÒHÜÙ[‹—ÜÛÝ\˜ÙWØÛØÚÊÛÝ\˜ÙWÚ[Š_IÊBˆYˆÙ[‹œÛÝ\˜ÙWÛÝ]\È›Ý›Û™NˆX\šÜË˜\[™
+‰ÓÈÜÙ[‹—ÜÛÝ\˜ÙWØÛØÚÊÛÝ\˜ÙWÛÝ]
+_IÊBˆ^IÔ]Y[H0­È	ÊÊ	È0­È	Ëš›Ú[ŠX\šÜÊHYˆX\šÜÈ[ÙH	ÙÙ\Ø[]\ˆÛ\	ÊBˆÙ[‹œÛÝ\˜ÙWÜ˜[™ÙWÛX™[œÙ]^
+^
+Bˆ[YˆÛ\\È›Ý›Û™H[™Û\šÚ[™[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊH[™Û\œÛÝ\˜ÙWÝ\H[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊN‚ˆÙ[‹œÛÝ\˜ÙWÜ˜[™ÙWÛX™[œÙ]^
+	Ô]Y[Nˆ8 'Û\[œÙZ[¸ '°ïˆ[‹ÓÝ]	ÊBˆ[YˆÛ\\È›Ý›Û™H[™Û\œÛÝ\˜ÙWÝ\H[ˆ
+	Ú[XYÙIË	Ú[XYÙWÜÙ\]Y[˜ÙIÊN‚ˆÙ[‹œÛÝ\˜ÙWÜ˜[™ÙWÛX™[œÙ]^
+	Ô]Y[NˆÝ[™š[0­ÈÙZ[™H[‹ÓÝ]SX\šÙ[‰ÊBˆ[ÙN‚ˆÙ[‹œÛÝ\˜ÙWÜ˜[™ÙWÛX™[œÙ]^
+	Ô]Y[NˆÙZ[ˆYYY[˜Û\]\ÙÙ]ðé	ÊB‚ˆYˆÙ]ÜÛÝ\˜ÙWÚ[ŠÙ[ŠN‚ˆÛ\\Ù[‹—ÜÛÝ\˜ÙWÛYYXWØÛ\
+
+BˆYˆÛ\\È›Û™N‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ðå™™›™HY\œÝZ[™[ˆšY[ËHÙ\ˆ]Y[ØÛ\Z]8 'Û\[œÙZ[¸ '‰ËÍL
+BˆÛÝ\˜ÙWÝ[YO\Ù[‹—ÜÛÝ\˜ÙWÜÜÚ][ÛŠÛ\
+NÈËÛÝ\˜ÙWÛÝ]\Ù[‹—ÜÛÝ\˜ÙWØ›Ý[™ÊÛ\
+BˆYˆÛÝ\˜ÙWÝ[YO\ÛÝ\˜ÙWÛÝ]SRS—ÐÓT‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñ\ˆ]Y[R[ˆ]\ÜÈ›Üˆ[H]Y[SÝ]YYÙ[‹‰ËÌ
+BˆÙ[‹œÛÝ\˜ÙWÚ[\›Ý[™
+ÛÝ\˜ÙWÝ[YKŠNÈÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Ô]Y[R[ˆ™ZHÜÙ[‹—ÜÛÝ\˜ÙWØÛØÚÊÛÝ\˜ÙWÝ[YJ_HÙ\Ù]‰ËL
+B‚ˆYˆÙ]ÜÛÝ\˜ÙWÛÝ]
+Ù[ŠN‚ˆÛ\\Ù[‹—ÜÛÝ\˜ÙWÛYYXWØÛ\
+
+BˆYˆÛ\\È›Û™N‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ðå™™›™HY\œÝZ[™[ˆšY[ËHÙ\ˆ]Y[ØÛ\Z]8 'Û\[œÙZ[¸ '‰ËÍL
+BˆÛÝ\˜ÙWÝ[YO\Ù[‹—ÜÛÝ\˜ÙWÜÜÚ][ÛŠÛ\
+NÈÛÝ\˜ÙWÚ[‹Ï\Ù[‹—ÜÛÝ\˜ÙWØ›Ý[™ÊÛ\
+BˆYˆÛÝ\˜ÙWÝ[YO\ÛÝ\˜ÙWÚ[ŠÓRS—ÐÓT‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñ\ˆ]Y[SÝ]]\ÜÈ˜XÚ[H]Y[R[ˆYYÙ[‹‰ËÌ
+BˆÙ[‹œÛÝ\˜ÙWÛÝ]\›Ý[™
+ÛÝ\˜ÙWÝ[YKŠNÈÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Ô]Y[SÝ]™ZHÜÙ[‹—ÜÛÝ\˜ÙWØÛØÚÊÛÝ\˜ÙWÝ[YJ_HÙ\Ù]‰ËL
+B‚ˆYˆÛX\—ÜÛÝ\˜ÙWÛX\šÜÊÙ[ŠN‚ˆYˆÙ[‹—ÜÛÝ\˜ÙWÛYYXWØÛ\
+
+H\È›Û™N‚ˆ™]\›ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ðå™™›™HY\œÝZ[™[ˆšY[ËHÙ\ˆ]Y[ØÛ\Z]8 'Û\[œÙZ[¸ '‰ËÍL
+BˆÙ[‹œÛÝ\˜ÙWÚ[S›Û™NÈÙ[‹œÛÝ\˜ÙWÛÝ]S›Û™NÈÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ô]Y[R[‹ÓÝ]\°ïÚÙÙ\Ù]0­ÈÙ\Ø[]\ˆÛ\ZÝ]‹‰ËL
+B‚ˆYˆÜÛÝ\˜ÙWØØ[™Y]JÙ[ŠN‚ˆˆˆZ[HÛX[ˆ[Y[[™HØ[™Y]Hœ›ÛHHX\šÙYÛÝ\˜ÙH˜[™ÙKˆˆˆ‚ˆÛ\\Ù[‹—ÜÛÝ\˜ÙWÛYYXWØÛ\
+
+BˆYˆÛ\\È›Û™N‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ðå™™›™HY\œÝZ[™[ˆšY[ËHÙ\ˆ]Y[ØÛ\Z]8 'Û\[œÙZ[¸ '‰ËÍL
+Bˆ™]\›ˆ›Û™BˆÛÝ\˜ÙWÚ[‹ÛÝ\˜ÙWÛÝ]\Ù[‹—ÜÛÝ\˜ÙWØ›Ý[™ÊÛ\
+BˆYˆÛÝ\˜ÙWÛÝ]\ÛÝ\˜ÙWÚ[RS—ÐÓT‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñ\ˆ]Y[™\™ZXÚ\ÝHÝ\ž‹‰ËÌ
+Bˆ™]\›ˆ›Û™BˆYˆÙ[‹˜XÚ×ÛØÚÙY
+Û\˜XÚÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑYHšY[Ü\ˆ\ÝÙ\Ü\œ‰ËÌ
+Bˆ™]\›ˆ›Û™Bˆ™]\›ˆ™\XÙJÛ\ZY]]ZY]ZY
+
+Kš^ÜÚ][Û[X^
+ŒÙ[‹œ^ZXY
+KˆÝ\\ÛÝ\˜ÙWÚ[‹[™\ÛÝ\˜ÙWÛÝ]Ü›Ý\ÚYIÉËˆ˜[œÚ][Û—Ý\OIÛ›Û™IË˜[œÚ][Û—Ù\˜][ÛLŒˆ˜YWÚ[LŒ˜YWÛÝ]LŒœ™Y^™WÙœ˜[YOQ˜[ÙKœ™Y^™WÙ\˜][ÛLŒˆÙ^Yœ˜[Y\ÏV×K›Û[YWÚÙ^Yœ˜[Y\ÏV×KÜYYÚÙ^Yœ˜[Y\ÏV×KˆÛÝ\˜ÙWÜ]Ï[\Ý
+Û\œÛÝ\˜ÙWÜ]ÊJB‚ˆYˆ[œÙ\ÜÛÝ\˜ÙWÜ˜[™ÙJÙ[ŠN‚ˆØ[™Y]O\Ù[‹—ÜÛÝ\˜ÙWØØ[™Y]J
+BˆYˆØ[™Y]H\È›Û™Nœ™]\›‚ˆžN‚ˆÙ[‹—Ú[œÙ\ØØ[™Y]\×Üš\JØØ[™Y]WJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÝ™\Üš]WÜÛÝ\˜ÙWÜ˜[™ÙJÙ[ŠN‚ˆØ[™Y]O\Ù[‹—ÜÛÝ\˜ÙWØØ[™Y]J
+BˆYˆØ[™Y]H\È›Û™Nœ™]\›‚ˆžN‚ˆÙ[‹—ÛÝ™\Üš]WØØ[™Y]\ÊØØ[™Y]WJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊB‚ˆYˆÙ]Ü^ZXY
+Ù[‹[YJN‚ˆÙ[‹œ^ZXY[X^
+Z[Š[™Ý
+Ù[‹˜Û\ÊK›Ø]
+[YJJJNÈÙ[‹[Y[[™KœÙ]Ü^ZXY
+Ù[‹œ^ZXY
+NÈÙ[‹\]WÝ[YJ
+BˆÙ[‹œ™Yœ™\ÚÝšY]×ÙÙ[ÛY]žJ
+BˆYˆÙ[‹›[ÙOOIÝ[Y[[™IÈ[™Ù[‹™\™XÝÜ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆÙ[‹—ÛØYÙ\™XÝØÛ\Ø]Ü^ZXY
+Ù[‹œ^Y\‹œ^X˜XÚÔÝ]J
+OOTSYYXT^Y\‹”^Z[™ÔÝ]JBˆ[YˆÙ[‹›[ÙOOIÝ[Y[[™IÈ[™Ù[‹œ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆÙ[‹œ^Y\‹œÙ]ÜÚ][ÛŠ[
+Z[ŠÙ[‹œ^ZXY[™Ý
+Ù[‹˜Û\ÊJJŒL
+JBˆ[Yˆ
+Ù[‹›[ÙOOIÝ[Y[[™IÈ[™Ù[‹œ™]šY]×Ü][™]
+Ù[‹œ™]šY]×Ü]
+Kš\×Ùš[J
+Bˆ[™Ù[‹œ^Y\‹œÛÝ\˜ÙJ
+Kš\ÓØØ[š[J
+JN‚ˆÈÙYZÈH\Ý˜[YÛÛ\ÜÚ][Ûˆ[[YYX][NÈH™]Ù\ˆ™[™\ˆØ[‚ˆÈÝ[™\XÙH]]\ˆÚ]Ý]›ØÚÚ[™ÈH˜[œÜÜ‚ˆÙ[‹œ^Y\‹œÙ]ÜÚ][ÛŠ[
+Ù[‹œ^ZXY
+ŒL
+JBˆ[YˆÙ[‹›[ÙOOIÜÛÝ\˜ÙIÈ[™Ù[‹˜Ý\œ™[ØÛ\
+
+N‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆËœÜÚ][Û][YOXË™š[š\Ú‚ˆÛÝ\˜ÙWÝ[YOXËœÝ\
+Ý[YKXËœÜÚ][Û‚ˆÛÝ\˜ÙWÚ[‹ÛÝ\˜ÙWÛÝ]\Ù[‹—ÜÛÝ\˜ÙWØ›Ý[™ÊÊBˆÙ[‹œ^Y\‹œÙ]ÜÚ][ÛŠ[
+X^
+ÛÝ\˜ÙWÚ[‹Z[ŠÛÝ\˜ÙWÛÝ]ÛÝ\˜ÙWÝ[YJJJŒL
+JBˆÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+B‚ˆYˆÙYZ×ÜÛY\ŠÙ[‹˜[YJN‚ˆÙ[‹œÙ]Ü^ZXY
+˜[YKÌL
+›[™Ý
+Ù[‹˜Û\ÊJB‚ˆYˆ\]WÝ[YJÙ[ŠN‚ˆYˆÛØÚÊ
+Nœ™]\›ˆ‰ÞÚ[
+
+KËÍŒŒŸNžÝ	MŒŒŒYŸIÂˆÝ[[[™Ý
+Ù[‹˜Û\ÊNÈÙ[‹[YWÛX™[œÙ]^
+‰ÞØÛØÚÊÙ[‹œ^ZXY
+_HÈØÛØÚÊÝ[
+_IÊBˆYˆ›ÝÙ[‹œÙYZËš\ÔÛY\‘ÝÛŠ
+NœÙ[‹œÙYZËœÙ]˜[YJ[
+Z[ŠKÙ[‹œ^ZXYÝÝ[
+JŒL
+HYˆÝ[[ÙH
+B‚ˆYˆ^WÜÝ]JÙ[‹Ý]JN‚ˆYˆÝ]OOTSYYXT^Y\‹”^Z[™ÔÝ]N‚ˆÙ[‹™›ÛÝ×ÜÝ\Ü[™YQ˜[ÙBˆÙ[‹œ^WØ]Û‹œÙ]^
+‰ø¡hHÜÙ[‹˜[œÜÜÜ˜]N™ßpåÉÈYˆÙ[‹˜[œÜÜÜ˜]H[ÙH	ø¡hH]\ÙIÊBˆ[ÙN‚ˆÙ[‹œ^WØ]Û‹œÙ]^
+	ø¥­ˆ[Y[[™IÊB‚ˆYˆÜÚ][Û—ØÚ[™ÙY
+Ù[‹\ÊN‚ˆYˆÙ[‹œ[™[™×ÜÙYZÈÜˆÙ[‹˜ÛÛ\\™WØXÝ]™Nœ™]\›‚ˆYˆÙ[‹›[ÙOOIÝ[Y[[™IÎ‚ˆYˆÙ[‹™\™XÝÜ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆÛ\Ï\Ù[‹—Ù\™XÝÜ™]šY]×ØÛ\Ê
+BˆÛ\[™^
+
+˜[YH›Üˆ˜[YH[ˆÛ\ÈYˆ˜[YKZYO\Ù[‹™\™XÝØÛ\ÝZY
+K›Û™JBˆYˆÛ\\È›Û™N‚ˆÙ[XÝY\Ù[‹—Ù\™XÝØÛ\Ø]
+Ù[‹œ^ZXYÛ\ÊBˆÛ\\Ù[XÝYÌWHYˆÙ[XÝY[ÙH›Û™BˆYˆÛ\\È›Û™N‚ˆ™]\›‚ˆØØ[[X^
+ŒZ[ŠÛ\›[™Ý\ËÌLŒXÛ\œÝ\
+JBˆÙ[‹œ^ZXYXÛ\œÜÚ][ÛŠÛØØ[ˆYˆÙ[‹œ^ZXYXÛ\™š[š\ÚKŒ‚ˆ[™^[™^
+
+[™^›Üˆ[™^˜[YH[ˆ[[Y\˜]JÛ\ÊHYˆ˜[YKZYOXÛ\ZY
+KLJBˆYˆ[™^
+ÌO[ŠÛ\ÊN‚ˆÙ[‹œ^ZXYXÛ\ÖÚ[™^
+ÌWKœÜÚ][Û‚ˆÙ[‹—ÛØYÙ\™XÝØÛ\Ø]Ü^ZXY
+YJBˆ[ÙN‚ˆÙ[‹œ^ZXY[[™Ý
+Ù[‹˜Û\ÊNÈÙ[‹œ^Y\‹œ]\ÙJ
+BˆÙ[‹[Y[[™KœÙ]Ü^ZXY
+Ù[‹œ^ZXY
+NÈÙ[‹\]WÝ[YJ
+BˆÙ[‹™›ÛÝ×Ü^ZXY
+
+NÈÙ[‹œ™Yœ™\ÚÝšY]×ÙÙ[ÛY]žJ
+NÈÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+Bˆ™]\›‚ˆYˆÙ[‹œ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆÙ[‹œ^ZXY[\ËÌLˆ[YˆÙ[‹œ™]šY]×Ü][™]
+Ù[‹œ™]šY]×Ü]
+Kš\×Ùš[J
+N‚ˆÈH^Y\ˆX^HÝ[™HÚÝÚ[™ÈH™]š[Ý\È˜[YZ^Ú[BˆÈHY]Y][]˜XÚÈ™]š\Ú[Ûˆ™[™\œÈ[ˆH˜XÚÙÜ›Ý[™‚ˆÙ[‹œ^ZXY[X^
+ŒZ[Š[™Ý
+Ù[‹˜Û\ÊK\ËÌLŒ
+JBˆ[ÙN‚ˆ™]\›‚ˆ[ÙN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÎœ™]\›‚ˆØØ[[X^
+Z[ŠË›[™Ý\ËÌLXËœÝ\
+JNÈÙ[‹œ^ZXYXËœÜÚ][ÛŠÛØØ[ˆËÛÝ\˜ÙWÛÝ]\Ù[‹—ÜÛÝ\˜ÙWØ›Ý[™ÊÊBˆYˆ\ËÌL\ÛÝ\˜ÙWÛÝ]KŒMH[™Ù[‹œ^Y\‹œ^X˜XÚÔÝ]J
+OOTSYYXT^Y\‹”^Z[™ÔÝ]N‚ˆÙ[‹œ^Y\‹œÙ]ÜÚ][ÛŠ›Ý[™
+ÛÝ\˜ÙWÛÝ]
+ŒL
+JNÈÙ[‹œ^Y\‹œ]\ÙJ
+BˆÙ[‹[Y[[™KœÙ]Ü^ZXY
+Ù[‹œ^ZXY
+NÈÙ[‹\]WÝ[YJ
+BˆÙ[‹™›ÛÝ×Ü^ZXY
+
+NÈÙ[‹œ™Yœ™\ÚÝšY]×ÙÙ[ÛY]žJ
+BˆÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+B‚ˆYˆYYXWÜ™XYJÙ[‹Ý]\ÊN‚ˆYˆÝ]\È[ˆ
+SYYXT^Y\‹“ØYYYYXKSYYXT^Y\‹Y™™\™YYYXJH[™Ù[‹œ[™[™×ÜÙYZÎ‚ˆÜÚ][Û‹^O\Ù[‹œ[™[™×ÜÙYZÎÈÙ[‹œ[™[™×ÜÙYZÏS›Û™NÈÙ[‹œ^Y\‹œÙ]ÜÚ][ÛŠÜÚ][ÛŠBˆYˆ^NœÙ[‹œ^Y\‹œ^J
+B‚ˆYˆØYÜ^Y\ŠÙ[‹]ÜÚ][Û‹^KšY[ÏUYJN‚ˆÙ[‹œ^Y\‹œÝÜ
+
+NÈÙ[‹œ[™[™×ÜÙYZÏJ›Ý[™
+ÜÚ][ÛŠŒL
+K^JBˆÙ[‹šY[×ÜÝXÚËœÙ]Ý\œ™[[™^
+HYˆšY[È[ÙH
+BˆYˆ›ÝšY[ÎœÙ[‹œXÙZÛ\‹œÙ]^
+	ø¦j×]Y[Ý›ÜœØÚ]IÊBˆ\›TU\›™œ›ÛSØØ[š[JÝŠ]
+JBˆYˆÙ[‹œ^Y\‹œÛÝ\˜ÙJ
+OO]\›‚ˆÙ[‹œ[™[™×ÜÙYZÏS›Û™NÜÙ[‹œ^Y\‹œÙ]ÜÚ][ÛŠ›Ý[™
+ÜÚ][ÛŠŒL
+JBˆYˆ^NœÙ[‹œ^Y\‹œ^J
+Bˆ[ÙNœÙ[‹œ^Y\‹œÙ]ÛÝ\˜ÙJ\›
+B‚ˆYˆÛÝ\˜ÙWÜ™]šY]ÊÙ[ŠN‚ˆÏ\Ù[‹˜Ý\œ™[ØÛ\
+
+BˆYˆ›ÝÈÜˆËšÚ[™OIÝ^	ÈÜˆËœÛÝ\˜ÙWÝ\OOIØY\ÝY[	ÈÜˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆÙ[‹˜[œÜÜÜÝÜ
+
+BˆÙ[‹—ØXÝ]˜]WÜÛÝ\˜ÙWØÛ\
+ÊBˆYˆËœÛÝ\˜ÙWÝ\H[ˆ
+	Ú[XYÙIË	Ú[XYÙWÜÙ\]Y[˜ÙIÊN‚ˆ[XYÙOTR[XYÙJËœÛÝ\˜ÙWÜ]ÖÌHYˆËœÛÝ\˜ÙWÜ]È[ÙHËœ]
+BˆYˆ[XYÙKš\Ó[
+
+N‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	Ñ\Èš[ÛÛ›HšXÚ[™Ù^™ZYÝÙ\™[‹‰ÊBˆÙ[‹›[ÙOIÜÛÝ\˜ÙIÎÈÙ[‹šY[×ÜÝXÚËœÙ]Ý\œ™[[™^
+JNÈÙ[‹šY[Ë™œ˜[YOZ[XYÙNÈÙ[‹šY[Ë\]J
+BˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	Ð’S“Ô”ÐÒUH0­È[Y[[™KU›ÜœØÚ]H™ZYÝYH›ÛÝ0é™YÙHÛÛ\ÜÚ][Û‰ÊBˆÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+Bˆ™]\›‚ˆYˆÙ[‹œ™]šY]×ÝÛÜšÙ\Ž‚ˆÙ[‹˜Ø[˜Ù[Ü™]šY]ÊØZ]UYJNÈÙ[‹œ™]šY]×Ü]Y]YYQ˜[ÙBˆÙ[‹›[ÙOIÜÛÝ\˜ÙIÎÜÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	ÐÓT“Ô”ÐÒUH0­È\ˆYH]\ÙÙ]ðéH]Y[KšXÚ\ˆZ^	ÊBˆÙ[‹˜]Y[ËœÙ]›Û[YJË›Û[YJNÈÙ[‹œ^Y\‹œÙ]^X˜XÚÔ˜]JËœÜYY
+BˆÛÝ\˜ÙWÚ[‹ÛÝ\˜ÙWÛÝ]\Ù[‹—ÜÛÝ\˜ÙWØ›Ý[™ÊÊBˆÛÝ\˜ÙWÝ[YO[X^
+ÛÝ\˜ÙWÚ[‹Z[ŠÛÝ\˜ÙWÛÝ]KŒKÙ[‹—ÜÛÝ\˜ÙWÜÜÚ][ÛŠÊJJBˆÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆÛÝ\˜ÙO\Ù[‹œ›ÞWÛX\™Ù]
+ÝŠ]
+Ëœ]
+Kœ™\ÛÛ™J
+JKËœ]
+HYˆÙ[‹œ›ÞWÙ[˜X›Y[ÙHËœ]ˆÙ[‹›ØYÜ^Y\ŠÛÝ\˜ÙKÛÝ\˜ÙWÝ[YKYKËšÚ[™OIÝšY[ÉÊB‚ˆYˆÙÙÛWÜ^JÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆYˆÙ[‹˜[œÜÜÝ[Y\‹š\ÐXÝ]™J
+HÜˆÙ[‹˜[œÜÜÜ˜]HOH‚ˆÙ[‹˜[œÜÜÜÝÜ
+
+NÈ™]\›‚ˆYˆÙ[‹œ^Y\‹œ^X˜XÚÔÝ]J
+OOTSYYXT^Y\‹”^Z[™ÔÝ]N‚ˆÙ[‹œ^Y\‹œ]\ÙJ
+NÜ™]\›‚ˆYˆ›ÝÙ[‹˜Û\Îœ™]\›ˆÙ[‹™\œ›ÜŠ	Ñ°ïÙHY\œÝYYY[ˆ\ˆ[Y[[™H[žK‰ÊBˆYˆÙ[‹™\™XÝÜ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆYˆÙ[‹œ^ZXY[[™Ý
+Ù[‹˜Û\ÊKKŒŽ‚ˆÙ[‹œ^ZXYLŒˆÙ[‹—ÛØYÙ\™XÝØÛ\Ø]Ü^ZXY
+YJBˆ™]\›‚ˆYˆÙ[‹œ™]šY]×ÝÛÜšÙ\Ž‚ˆÈH™[™\ˆX^H[™XYH™H[›š[™È™XØ]\ÙHÙˆ]™H™]šY]Ëˆ™]\ÙBˆÈ]™[™\ˆ[œÝXYÙˆÝ\[™ÈHÙXÛÛ™‘›\YÈ›ØÙ\ÜËˆYˆ[‚ˆÈÛ\ˆÛÛ\ÜÚ][Ûˆ^\ÝËÝ\][[YYX][H[™]H™]ÂˆÈÛ™H™\XÙH]Ú[ˆ™XYK‚ˆÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYUYBˆYˆÙ[‹œ™]šY]×Ü][™]
+Ù[‹œ™]šY]×Ü]
+Kš\×Ùš[J
+N‚ˆÙ[‹›[ÙOIÝ[Y[[™IÎÈÙ[‹œ^Y\‹œÙ]^X˜XÚÔ˜]JKŒ
+NÈÙ[‹˜]Y[ËœÙ]›Û[YJJBˆÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	ÓU•TˆðçQÑTˆÕS‘0­È™]YH›ÜœØÚ]HÚ\™[H[\™Ü[™ZÝX[\ÚY\8 )‰ÊBˆÙ[‹›ØYÜ^Y\ŠÙ[‹œ™]šY]×Ü]Z[ŠÙ[‹œ^ZXY[™Ý
+Ù[‹˜Û\ÊJKYJBˆ™]\›‚ˆYˆÙ]]ŠÙ[‹œ™]šY]×ÝÛÜšÙ\‹	Ü™]šY]×ÜÚYÛ˜]\™IË›Û™JHOHÙ[‹œ™]šY]×ÜÚYÛ˜]\™WÙ›Ü—ØÝ\œ™[
+
+N‚ˆÙ[‹œ™]šY]×Ü]Y]YYUYNÈÙ[‹œ™]šY]×ÝÛÜšÙ\‹˜Ø[˜Ù[œÙ]
+
+BˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	Õ›ÜœØÚ]HÚ\™°ïˆYHÚYY\™ØX™HZÝX[\ÚY\8 )‰ÊBˆ[ÙN‚ˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	Õ›ÜœØÚ]H™\YÜÝ[[ˆ0­ÈÚYY\™ØX™HÝ\]ÛZXÚ8 )‰ÊBˆ™]\›‚ˆYˆÙ[‹œ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆÙ[‹›[ÙOIÝ[Y[[™IÎÜÙ[‹œ^Y\‹œÙ]^X˜XÚÔ˜]JKŒ
+NÜÙ[‹˜]Y[ËœÙ]›Û[YJJNÜÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	ÕSQSS‘H0­È[HšY[ËH[™]Y[ÜÜ\™[ˆ0­È›ÜœØÚ]HÈ^Ü[ˆÙ]ðé\ˆ]Y›0íœÝ[™ÉÊBˆYˆÙ[‹œ^ZXY[[™Ý
+Ù[‹˜Û\ÊKKŒŽœÙ[‹œ^ZXYLˆÙ[‹›ØYÜ^Y\ŠÙ[‹œ™]šY]×Ü]Ù[‹œ^ZXYYJNÜ™]\›‚ˆYˆÙ[‹œ™]šY]×Ü][™]
+Ù[‹œ™]šY]×Ü]
+Kš\×Ùš[J
+N‚ˆÈ^X˜XÚÈ]\Ý™]™\ˆ™HØ]YÛˆHœ™\ÚÛÛ\ÜÚ][Ûˆ™[™\‹‚ˆÈHÛZ^\È\ÙY[›Üˆ[[YYX]H˜]šYØ][Ûˆ[™\È™\XÙYˆÈ]]ÛX]XØ[HÛ˜ÙHHÝ\œ™[™]š\Ú[Ûˆš[š\Ú\Ë‚ˆÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYUYBˆÙ[‹›[ÙOIÝ[Y[[™IÎÈÙ[‹œ^Y\‹œÙ]^X˜XÚÔ˜]JKŒ
+NÈÙ[‹˜]Y[ËœÙ]›Û[YJJBˆÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	ÓU•TˆðçQÑTˆÕS‘0­ÈZÝY[H›ÜœØÚ]HÚ\™[H[\™Ü[™™\™XÚ™]8 )‰ÊBˆYˆÙ[‹œ^ZXY[[™Ý
+Ù[‹˜Û\ÊKKŒŽœÙ[‹œ^ZXYLˆÙ[‹›ØYÜ^Y\ŠÙ[‹œ™]šY]×Ü]Ù[‹œ^ZXYYJBˆÙ[‹œ™[™\—Ü™]šY]Ê
+Bˆ™]\›‚ˆÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYUYBˆÙ[‹œ™[™\—Ü™]šY]Ê
+B‚ˆYˆ]]×Ü™]šY]ÊÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹˜Û\ÈÜˆÙ[‹˜ÛÛ\\™WØXÝ]™Nˆ™]\›‚ˆYˆ›ÝÙ[‹›]™WÜ™]šY]×Ø›Þš\ÐÚXÚÙY
+
+H[™›ÝÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYœ™]\›‚ˆÙ[‹œ™]šY]×Ü]Y]YYQ˜[ÙBˆÙ[‹œ™[™\—Ü™]šY]Ê]]ÏUYJB‚ˆYˆ™]šY]×ÛÜ[Û—ØÚ[™ÙY
+Ù[‹
+—ÊN‚ˆYˆÙ[‹˜Û\È[™Ù[‹›]™WÜ™]šY]×Ø›Þš\ÐÚXÚÙY
+
+N‚ˆYˆÙ[‹™\™XÝÜ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆ™]\›‚ˆÙ[‹œ™]šY]×Ü]Y]YYUYBˆYˆÙ[‹œ™]šY]×ÝÛÜšÙ\ŽœÙ[‹œ™]šY]×ÝÛÜšÙ\‹˜Ø[˜Ù[œÙ]
+
+BˆÙ[‹›]™WÜ™]šY]×Ý[Y\‹œÝ\
+
+B‚ˆYˆ™[™\—Ü™]šY]ÊÙ[‹]]ÏQ˜[ÙJN‚ˆYˆÙ[‹˜ÛÛ\\™WØXÝ]™Nˆ™]\›‚ˆYˆÙ[‹œ™]šY]×Ú\×ØÝ\œ™[
+
+N‚ˆ™]\›‚ˆYˆÙ[‹—Ù\™XÝÜ™]šY]×ØÛ\Ê
+N‚ˆYˆÙ[‹œ™]šY]×ÝÛÜšÙ\Ž‚ˆÙ[‹œ™]šY]×ÝÛÜšÙ\‹˜Ø[˜Ù[œÙ]
+
+Bˆ™\]Y\ÝY\Ù[‹œ™]šY]×Ü^WÜ™\]Y\ÝYˆÙ[‹˜XÝ]˜]WÙ\™XÝÜ™]šY]Ê^O\™\]Y\ÝYÜˆÙ[‹œ^Y\‹œ^X˜XÚÔÝ]J
+OOTSYYXT^Y\‹”^Z[™ÔÝ]JBˆÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYQ˜[ÙBˆÙ[‹œ™]šY]×Ü]Y]YYQ˜[ÙBˆ™]\›‚ˆYˆÙ[‹œ™]šY]×ÝÛÜšÙ\Ž‚ˆYˆÙ]]ŠÙ[‹œ™]šY]×ÝÛÜšÙ\‹	Ü™]šY]×ÜÚYÛ˜]\™IË›Û™JHOHÙ[‹œ™]šY]×ÜÚYÛ˜]\™WÙ›Ü—ØÝ\œ™[
+
+N‚ˆÙ[‹œ™]šY]×Ü]Y]YYUYNÈÙ[‹œ™]šY]×ÝÛÜšÙ\‹˜Ø[˜Ù[œÙ]
+
+Bˆ™]\›‚ˆ™]š\Ú[Û\Ù[‹œ™]š\Ú[ÛŽÈÚ^™O\Ù[‹œ™]šY]×ÜÚ^™J
+NÈÚYÛ˜]\™O\Ù[‹œ™]šY]×ÜÚYÛ˜]\™WÙ›Ü—ØÝ\œ™[
+
+Bˆ›ÞWÝYÏIÜ›ÞIÈYˆÙ[‹œ›ÞWÙ[˜X›Y[ÙH	ÛÜšYÚ[˜[	Âˆ\™Ù]T]
+Ù[‹˜ØXÚK›˜[YJKÙ‰Ü™]šY]Ë^Ü™]š\Ú[ÛŸK^ÜÚ^™VÌ_^ÜÚ^™VÌW_K^Ü›ÞWÝYßK›\	ÂˆÛ\ÏV×Bˆ›ÜˆÛ\[ˆÙ[‹˜Û\Î‚ˆÛÝ\˜ÙOXÛ\œ]ˆYˆÙ[‹œ›ÞWÙ[˜X›Y[™ÛÝ\˜ÙN‚ˆÛÝ\˜ÙO\Ù[‹œ›ÞWÛX\™Ù]
+ÝŠ]
+ÛÝ\˜ÙJKœ™\ÛÛ™J
+JKÛÝ\˜ÙJBˆÛ\Ë˜\[™
+™\XÙJÛ\]\ÛÝ\˜ÙKÛÝ\˜ÙWÜ]Ï[\Ý
+Û\œÛÝ\˜ÙWÜ]ÊJJBˆ˜XÚÜÏ[\Ý
+Ù[‹˜XÚÜÊNÈ˜XÚ×ÜÝ]\Ï^Ý˜XÚÎ™XÝ
+Ý]JH›Üˆ˜XÚËÝ]H[ˆÙ[‹˜XÚ×ÜÝ]\Ëš][\Ê
+_NÈX\Ý\—ÜÙ][™ÜÏYXÝ
+Ù[‹›X\Ý\—ÛZ^\ŠBˆ\ÙWÙÜO\Ù[‹™ÜWÜ™]šY]×Ø›Þš\ÐÚXÚÙY
+
+BˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆžN‚ˆ™[™\ŠÛ\Ë˜XÚÜË\™Ù]Ú^™K›ÙÜ™\ÜËØ[˜Ù[YK˜XÚ×ÜÝ]\Ëˆ™]šY]×ØXØÙ[\˜][Û]\ÙWÙÜKX\Ý\—ÜÙ][™ÜÏ[X\Ý\—ÜÙ][™ÜÊBˆ^Ù\^Ù\[ÛŽ‚ˆYˆ›Ý\ÙWÙÜN‚ˆ˜Z\ÙBˆÈ\™Ø\™HXÛÙH\È[ˆXØÙ[\˜][Ûˆ[›ÝH™\]Z\™[Y[‚ˆÈš]™\œÈØ[ˆ\Ø\X\ˆ™]ÙY[ˆ]XÝ[Ûˆ[™™[™\š[™ËÛÈBˆÈ™]šY]È[Ø^\ÈÙ]ÈÛ™H]]ÛX]XÈÛÙØ\™H˜[˜XÚË‚ˆ™[™\ŠÛ\Ë˜XÚÜË\™Ù]Ú^™K›ÙÜ™\ÜËØ[˜Ù[YK˜XÚ×ÜÝ]\Ëˆ™]šY]×ØXØÙ[\˜][ÛQ˜[ÙKX\Ý\—ÜÙ][™ÜÏ[X\Ý\—ÜÙ][™ÜÊBˆ™]\›ˆÝŠ\™Ù]
+K™]š\Ú[Û‚ˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	ÓYZœÜ\‹U›ÜœØÚ]HÚ\™[H[\™Ü[™ZÝX[\ÚY\8 )‰ÊBˆ›ØR›ØŠÜ\˜][ÛŠNÈ›Ø‹œ™]šY]×ÜÚYÛ˜]\™O\ÚYÛ˜]\™NÈÙ[‹œ™]šY]×ÝÛÜšÙ\Z›Ø‚ˆ›Ø‹œ›ÙÜ™\ÜË˜ÛÛ›™XÝ
+[X™H˜[YN“›Û™HYˆÙ[‹˜ÛÛ\\™WØXÝ]™H[ÙHÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+‰ÓYZœÜ\‹U›ÜœØÚ]HÚ\™ZÝX[\ÚY\8 )ˆÝ˜[Y_IIÊJBˆ›Ø‹œ™\Ý[˜ÛÛ›™XÝ
+[X™H™\Ý[Z›ØŽœÙ[‹™š[š\ÚÜ™]šY]×Ú›ØŠ‹™\Ý[]]Ë™]š\Ú[Û‹ÚYÛ˜]\™JJBˆ›Ø‹œÝ\
+
+B‚ˆYˆš[š\ÚÜ™]šY]×Ú›ØŠÙ[‹›Ø‹™\Ý[]]Ë™]š\Ú[Û‹ÚYÛ˜]\™JN‚ˆYˆÙ[‹œ™]šY]×ÝÛÜšÙ\ˆ\È›Ý›ØŽ‚ˆ™]\›‚ˆ›Ø‹ØZ]
+
+NÈÙ[‹œ™]šY]×ÝÛÜšÙ\S›Û™NÈ›Ø‹™[]S]\Š
+BˆÝ[O\™]š\Ú[ÛˆO\Ù[‹œ™]š\Ú[ÛˆÜˆÚYÛ˜]\™HO\Ù[‹œ™]šY]×ÜÚYÛ˜]\™WÙ›Ü—ØÝ\œ™[
+
+BˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆYˆÙ[‹˜ÛÛ\\™WØXÝ]™N‚ˆÙ[‹œ™]šY]×Ü]Y]YYUYBˆ™]\›‚ˆYˆ™\Ý[™Ù]
+	ØØ[˜Ù[Y	ÊH[™
+Ý[HÜˆÙ[‹œ™]šY]×Ü]Y]YYÜˆÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝY
+N‚ˆÙ[‹›]™WÜ™]šY]×Ý[Y\‹œÝ\
+
+Bˆ™]\›‚ˆYˆ]]Î‚ˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	Õ›ÜœØÚ]HÛÛ›HšXÚZÝX[\ÚY\Ù\™[ˆ0­È^Ü›ZX™\™°ïØ˜\‰ÊBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ™\Ý[™Ù]
+	Ù\œ›Ü‰Ë	Õ›ÜœØÚ]H™ZÙ\ØÚYÙ[‰ÊKŒ
+Bˆ[ÙN‚ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+Bˆ™]\›‚ˆ]™]\™\Ý[ÉÝ˜[YI×BˆYˆÝ[N‚ˆžN”]
+]
+K[›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆ^Ù\ÔÑ\œ›ÜŽœ\ÜÂˆYˆÙ[‹œ™]šY]×Ü]Y]YYÜˆÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝY‚ˆÙ[‹›]™WÜ™]šY]×Ý[Y\‹œÝ\
+
+Bˆ™]\›‚ˆÛ\Ù[‹œ™]šY]×Ü]ÈÙ[‹œ™]šY]×Ü]\]ÈÙ[‹œ™]šY]×Ü™]š\Ú[Û\™]ŽÈÙ[‹œ™]šY]×ÜÚYÛ˜]\™O\ÚYÛ˜]\™BˆYˆÙ[‹˜ÛÛ\\™WØXÝ]™N‚ˆÙ[‹œ™]šY]×Ü]Y]YYQ˜[ÙBˆ™]\›‚ˆÙ[‹›[ÙOIÝ[Y[[™IÎÈÙ[‹˜]Y[ËœÙ]›Û[YJJNÈÙ[‹\]WÜÛÝ\˜ÙWÛ[Ûš]Ü—ØÛÛ›ÛÊ
+BˆÚÝ[Ü^O\Ù[‹œ™]šY]×Ü^WÜ™\]Y\ÝYˆ[™[™×Ü˜]O\Ù[‹˜[œÜÜÜ˜]WÜ[™[™ÂˆÙ[‹˜[œÜÜÜ˜]WÜ[™[™ÏS›Û™BˆÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYQ˜[ÙBˆYˆ
+ÚÝ[Ü^HÜˆ[™[™×Ü˜]H\È›Ý›Û™JH[™Ù[‹œ^ZXY[[™Ý
+Ù[‹˜Û\ÊKKŒˆ[™[™[™×Ü˜]H\È›Ý›Û™H[™[™[™×Ü˜]Hˆ‚ˆÙ[‹œ^ZXYLˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	ÕSQSS‘H0­È[HšY[ËH[™]Y[ÜÜ\™[ˆ0­ÈØÚ™[›ÜœØÚ]IÈYˆÙ[‹œ]ZXÚ×Ü™]šY]×Ø›Þš\ÐÚXÚÙY
+
+H[ÙH	ÕSQSS‘H0­È[HšY[ËH[™]Y[ÜÜ\™[‰ÊBˆÙ[‹›ØYÜ^Y\Š]Z[ŠÙ[‹œ^ZXY[™Ý
+Ù[‹˜Û\ÊJKÚÝ[Ü^H[™[™[™×Ü˜]H\È›Û™JBˆYˆÛ[™ÛO\]‚ˆžN”]
+Û
+K[›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆ^Ù\ÔÑ\œ›ÜŽœ\ÜÂˆÙ[‹š[WØØXÚJÙY\^Ü]JBˆ]Y]YY\Ù[‹œ™]šY]×Ü]Y]YYÈÙ[‹œ™]šY]×Ü]Y]YYQ˜[ÙBˆYˆ]Y]YY[™Ù[‹›]™WÜ™]šY]×Ø›Þš\ÐÚXÚÙY
+
+N‚ˆÙ[‹›]™WÜ™]šY]×Ý[Y\‹œÝ\
+
+BˆYˆ[™[™×Ü˜]H\È›Ý›Û™N‚ˆU[Y\‹œÚ[™ÛTÚÝ
+[X™H˜]O\[™[™×Ü˜]NœÙ[‹—ÜÝ\Ý˜[œÜÜ
+˜]JJB‚ˆYˆ™[[š×ÛYYXJÙ[‹Z\ÜÚ[™ÏS›Û™KX\[™ÏS›Û™K\™XÝÜžOS›Û™JN‚ˆˆˆ”™[[šÈÙ™›[™HÛÝ\˜Ù\Ë]]Ë[X]Ú[™È[š\]YHš[[˜[Y\È[ˆH›Û\‹ˆˆˆ‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›ˆ˜[ÙBˆZ\ÜÚ[™Ï[\Ý
+Z\ÜÚ[™ÈYˆZ\ÜÚ[™È\È›Ý›Û™H[ÙHÙ[‹›Z\ÜÚ[™×ÛYYXJBˆYˆ›ÝZ\ÜÚ[™Î‚ˆZ\ÜÚ[™Ï[Z\ÜÚ[™×Ü›Ú™XÝÛYYXJÙ[‹˜Û\ËÙ[‹˜\ÜÙ]ÊBˆYˆ›ÝZ\ÜÚ[™Î‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ð[HYYY[ˆÚ[™™\™Z]È™\šÛ°ï‰ËÌ
+Bˆ™]\›ˆ˜[ÙBˆYˆX\[™È\È›Û™N‚ˆ\™XÝÜžOY\™XÝÜžHÜˆQš[QX[ÙË™Ù]^\Ý[™Ñ\™XÝÜžJÙ[‹	ÓÜ™™\ˆZ][ˆ™Z[™[ˆYYY[ˆ]\Ýðé[‰Ë	ÉÊBˆYˆ›Ý\™XÝÜžN‚ˆ™]\›ˆ˜[ÙBˆØ[™Y]\ÏYš[™Ü™[[š×ØØ[™Y]\ÊZ\ÜÚ[™Ë\™XÝÜžJBˆX\[™Ï^ßBˆ[œ™\ÛÛ™YV×Bˆ›ÜˆÛ[ˆZ\ÜÚ[™Î‚ˆÚÚXÙ\ÏXØ[™Y]\Ë™Ù]
+ÝŠ]
+Û
+Kœ™\ÛÛ™J
+JK×JBˆYˆ[ŠÚÚXÙ\ÊOOLN‚ˆX\[™ÖÛÛOXÚÚXÙ\ÖÌBˆÛÛ[YBˆÝY™š^T]
+Û
+KœÝY™š^ˆÙ[XÝYÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[YJˆÙ[‹‰ÓYY][H™]H™\šÛ°ï™[ŽˆÔ]
+Û
+K›˜[Y_IË\™XÝÜžKˆ‰Ô\ÜÙ[™H]ZY[ˆ
+
+žÜÝY™š^JIÈYˆÝY™š^[ÙH	Ð[H]ZY[ˆ
+
+ŠIÊBˆYˆÙ[XÝY‚ˆX\[™ÖÛÛO\Ù[XÝYˆ[ÙN‚ˆ[œ™\ÛÛ™Y˜\[™
+Û
+BˆYˆ[œ™\ÛÛ™Y‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÞÛ[Š[œ™\ÛÛ™Y
+_HYYY[ˆ›ZX™[ˆÙ™›[™K‰ËL
+Bˆ™]\›ˆ˜[ÙBˆžN‚ˆÛ\Ë\ÜÙ]Ï\™[[š×Ü›Ú™XÝÛYYXJÙ[‹˜Û\ËÙ[‹˜\ÜÙ]ËX\[™ÊBˆ˜[Y]WÝ[Y[[™JÛ\ËÙ[‹˜XÚÜÊBˆ›Üˆ\ÜÙ][ˆ\ÜÙ]Î‚ˆ\ÜÙ]˜[Y]J
+BˆÙ[‹˜ÚXÚÜÚ[
+
+NÈÙ[‹˜Û\ÏXÛ\ÎÈÙ[‹˜\ÜÙ]ÏX\ÜÙ]ÂˆÙ[‹›Z\ÜÚ[™×ÛYYXO[Z\ÜÚ[™×Ü›Ú™XÝÛYYXJÙ[‹˜Û\ËÙ[‹˜\ÜÙ]ÊBˆÙ[‹œ›ÞWÛX\^ßNÈÙ[‹œ›ÞWÙ\™XÝÜžOS›Û™NÈÙ[‹œ›ÞWÙ[˜X›YQ˜[ÙBˆÙ[‹˜]]×Ü›ÞWÜÛÝ\˜Ù\Ï\Ù]
+
+BˆÙ[‹œ›ÞWØ›Þ˜›ØÚÔÚYÛ˜[ÊYJNÈÙ[‹œ›ÞWØ›ÞœÙ]ÚXÚÙY
+˜[ÙJNÈÙ[‹œ›ÞWØ›Þ˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆÙ[‹œ™\\™WÝš\ÝX[ÊÙ[‹˜\ÜÙ]ÊNÈÙ[‹œ™Yœ™\ÚÛYYXJ
+NÈÙ[‹˜Ú[™ÙY
+
+BˆYˆÙ[‹›Z\ÜÚ[™×ÛYYXN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÞÛ[ŠÙ[‹›Z\ÜÚ[™×ÛYYXJ_HYYY[ˆ›ZX™[ˆÙ™›[™K‰ËL
+Bˆ[ÙN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÞÛ[ŠX\[™Ê_HYYY[ˆ™]H™\šÛ°ï‰ËL
+Bˆ™]\›ˆYBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™\œ›ÜŠ^ÊBˆ™]\›ˆ˜[ÙB‚ˆYˆ\˜Ú]™WÜ›Ú™XÝÙX[ÙÊÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆYˆ›ÝÙ[‹˜Û\Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÑYH[Y[[™H\ÝY\‹‰ÊBˆ˜[YOT]
+Ù[‹œ›Ú™XÝÜ]
+KœÝ[HYˆÙ[‹œ›Ú™XÝÜ][ÙH]
+Ù[‹œÝYÙÙ\ÝYÛ˜[YJKœÝ[Bˆ]ÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJˆÙ[‹	Ô›Ú™ZÝZ]YYY[ˆ\˜Ú]šY\™[‰Ë˜[YJÉËžš\	Ëˆ	Ñœ˜[YXÝ]P\˜Ú]ˆ
+
+‹žš\
+NÎÐ[H]ZY[ˆ
+
+ŠIËÜ[ÛœÏTQš[QX[ÙË‘ÛÛÛ™š\›SÝ™\Üš]JBˆYˆ›Ý]‚ˆ™]\›‚ˆYˆ›Ý]›ÝÙ\Š
+K™[™ÝÚ]
+	Ëžš\	ÊN‚ˆ]
+ÏIËžš\	Âˆ\™Ù]T]
+]
+Kœ™\ÛÛ™J
+BˆYˆ\™Ù]™^\ÝÊ
+H[™SY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	Ð\˜Ú]ˆ\œÙ]™[ÉË‰ÞÝ\™Ù]W°ï™\œØÚ™ZX™[ÉËˆSY\ÜØYÙP›Þ–Y\ßSY\ÜØYÙP›Þ“›ËSY\ÜØYÙP›Þ“›ÊHOTSY\ÜØYÙP›Þ–Y\Î‚ˆ™]\›‚ˆÛ\ÏVÜ™\XÙJËÛÝ\˜ÙWÜ]Ï[\Ý
+ËœÛÝ\˜ÙWÜ]ÊJH›ÜˆÈ[ˆÙ[‹˜Û\×Bˆ\ÜÙ]ÏVÜ™\XÙJËÛÝ\˜ÙWÜ]Ï[\Ý
+ËœÛÝ\˜ÙWÜ]ÊJH›ÜˆÈ[ˆÙ[‹˜\ÜÙ]×Bˆ˜XÚÜÏ[\Ý
+Ù[‹˜XÚÜÊNÈÝ]\Ï^Ý˜XÚÎ™XÝ
+Ý]JH›Üˆ˜XÚËÝ]H[ˆÙ[‹˜XÚ×ÜÝ]\Ëš][\Ê
+_Bˆ˜[Y\ÏYXÝ
+Ù[‹˜XÚ×Û˜[Y\ÊNÈ™\Ù]\Ù[‹œ™\Ù]˜Ý\œ™[^
+
+NÈ›Ú™XÝÛ˜[YO[˜[YBˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆ™]\›ˆ\˜Ú]™WÜ›Ú™XÝ
+\™Ù]›Ú™XÝÛ˜[YKÛ\Ë™\Ù]˜XÚÜË\ÜÙ]Ëˆ˜XÚ×ÜÝ]\Ï\Ý]\Ë˜XÚ×Û˜[Y\Ï[˜[Y\Ë›ÙÜ™\ÜÏ\›ÙÜ™\ÜËØ[˜Ù[XØ[˜Ù[ˆX\šÙ\œÏVÙXÝ
+X\šÙ\ŠH›ÜˆX\šÙ\ˆ[ˆÙ[‹›X\šÙ\œ×KZ^\YXÝ
+Ù[‹›X\Ý\—ÛZ^\ŠJBˆYˆÛÛ\]J™\Ý[
+N‚ˆYˆ™\Ý[ÉÛÚÉ×N‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ð\˜Ú]ˆ\œÝ[0­ÈÜšYÚ[˜[YYY[ˆ›YX™[ˆ[™\°é™\	ËŒ
+BˆSY\ÜØYÙP›Þš[™›Ü›X][ÛŠÙ[‹	Ð\˜Ú]ˆ™\YÉË	Ô›Ú™ZÝ[™YYY[ˆ\˜Ú]šY\—‰ÊÜ™\Ý[ÉÝ˜[YI×JBˆ[ÙN‚ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆÙ[‹œÝ\Ú›ØŠ	Ô›Ú™ZÝ[™YYY[ˆÙ\™[ˆ\˜Ú]šY\8 )‰ËÜ\˜][Û‹ÛÛ\]JB‚ˆYˆ›ÞWÝÙÙÛY
+Ù[‹[˜X›Y
+N‚ˆÙ[‹œ›ÞWÙ[˜X›YX›ÛÛ
+[˜X›Y
+BˆYˆ›Ý[˜X›Y‚ˆÙ[‹œ›ÞWÛX\^ßBˆYˆÙ[‹—Ù\™XÝÜ™]šY]×ØÛ\Ê
+N‚ˆÙ[‹˜XÝ]˜]WÙ\™XÝÜ™]šY]Ê^O\Ù[‹œ^Y\‹œ^X˜XÚÔÝ]J
+OOTSYYXT^Y\‹”^Z[™ÔÝ]JBˆÙ[‹œ™]šY]×Ü]Y]YYUYBˆYˆÙ[‹˜Û\È[™Ù[‹›]™WÜ™]šY]×Ø›Þš\ÐÚXÚÙY
+
+N‚ˆÙ[‹›]™WÜ™]šY]×Ý[Y\‹œÝ\
+
+Bˆ™]\›‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆYˆÙ[‹—Ù\™XÝÜ™]šY]×ØÛ\Ê
+N‚ˆÙ[‹˜XÝ]˜]WÙ\™XÝÜ™]šY]Ê^O\Ù[‹œ^Y\‹œ^X˜XÚÔÝ]J
+OOTSYYXT^Y\‹”^Z[™ÔÝ]JBˆÙ[‹œÝ\Ü›ÞWÙÙ[™\˜][ÛŠ
+B‚ˆYˆX^X™WÜÝ\Ø]]×Ü›ÞJÙ[ŠN‚ˆˆˆ”™\\™HHÍŒ›ÞH[ˆH˜XÚÙÜ›Ý[™›Üˆ™\žH\™ÙHÛÝ\˜Ù\Ëˆˆˆ‚ˆYˆÙ[‹—ØÛÜÚ[™ÈÜˆÙ[‹ÛÜšÙ\ˆÜˆÙ[‹œ›ÞWÙ[˜X›YÜˆ	Ü›ÞIÈ[ˆÙ[‹š[™\[™[Ú›ØœÎ‚ˆ™]\›ˆ˜[ÙBˆ™\ÚÛLMŠŒL
+ŒLˆX]žOV×BˆÈØØ[ˆ[\ÜY\ÜÙ]È\ÈÙ[\È[Y[[™HÛ\Ëˆ\ÈÝ\ÈBˆÈ›ÞHÚ[HH\Ù\ˆ\ÈÝ[\œ˜[™Ú[™ÈHY]ÛÈ[œÙ\[™ÈBˆÈÛÝ\˜ÙH]\ˆ™]™\ˆ\ÈÈØZ]›Üˆ›ÞH™\\˜][Û‹‚ˆÙY[\Ù]
+
+Bˆ›ÜˆÛ\[ˆÙ[‹˜\ÜÙ]ÊÜÙ[‹˜Û\Î‚ˆYˆ
+Û\šÚ[™OH	ÝšY[ÉÈ[™Û\œÛÝ\˜ÙWÝ\HOH	ÝšY[ÉÈ[™Û\œ]ˆ[™]
+Û\œ]
+Kš\×Ùš[J
+JN‚ˆžN‚ˆÛÝ\˜ÙO\ÝŠ]
+Û\œ]
+Kœ™\ÛÛ™J
+JBˆYˆÛÝ\˜ÙH[ˆÙY[Ž‚ˆÛÛ[YBˆÙY[‹˜Y
+ÛÝ\˜ÙJBˆYˆ]
+ÛÝ\˜ÙJKœÝ]
+
+KœÝÜÚ^™HH™\ÚÛ‚ˆX]žK˜\[™
+ÛÝ\˜ÙJBˆ^Ù\ÔÑ\œ›ÜŽ‚ˆÛÛ[YBˆ™]×ÜÛÝ\˜Ù\Ï\Ù]
+X]žJK\Ù[‹˜]]×Ü›ÞWÜÛÝ\˜Ù\ÂˆYˆ›Ý™]×ÜÛÝ\˜Ù\Î‚ˆ™]\›ˆ˜[ÙBˆÙ[‹˜]]×Ü›ÞWÜÛÝ\˜Ù\Ë\]J™]×ÜÛÝ\˜Ù\ÊBˆÙ[‹œ›ÞWÙ[˜X›YUYBˆÙ[‹œ›ÞWØ›Þ˜›ØÚÔÚYÛ˜[ÊYJNÈÙ[‹œ›ÞWØ›ÞœÙ]ÚXÚÙY
+YJNÈÙ[‹œ›ÞWØ›Þ˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆÙ[‹˜XÝ]˜]WÙ\™XÝÜ™]šY]Ê^O\Ù[‹œ^Y\‹œ^X˜XÚÔÝ]J
+OOTSYYXT^Y\‹”^Z[™ÔÝ]JBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÑÜ›ðçÙH]Y[H\šØ[›0­ÈØÚ™[›ÜœØÚ]HÚ\™[H[\™Ü[™›Ü˜™\™Z]]ˆØÚ™ZY[ˆ[™XœÜY[[ˆ›ZX™[ˆÛÙ›Üpí™ÛXÚ‰ËŒ
+BˆÙ[‹œÝ\Ü›ÞWÙÙ[™\˜][ÛŠ
+Bˆ™]\›ˆYB‚ˆYˆ[œÝ\™WÛZ\ÜÚ[™×Ü›ÞY\ÊÙ[ŠN‚ˆˆˆ”Ý\]]ÛX]XÈ\™ÙKYš[H›ÞY\Ë[ˆ™\Z\ˆZ\ÜÚ[™ÈX[X[Û™\Ëˆˆˆ‚ˆYˆÙ[‹—ØÛÜÚ[™ÈÜˆÙ[‹ÛÜšÙ\Ž‚ˆ™]\›‚ˆYˆ›ÝÙ[‹œ›ÞWÙ[˜X›Y‚ˆÙ[‹›X^X™WÜÝ\Ø]]×Ü›ÞJ
+Bˆ™]\›‚ˆYˆ	Ü›ÞIÈ[ˆÙ[‹š[™\[™[Ú›ØœÎ‚ˆ™]\›‚ˆÛÝ\˜Ù\Ï^ÜÝŠ]
+Ëœ]
+Kœ™\ÛÛ™J
+JH›ÜˆÈ[ˆÙ[‹˜\ÜÙ]ÊÜÙ[‹˜Û\ÂˆYˆËœ][™ËšÚ[™[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊH[™ËœÛÝ\˜ÙWÝ\H›Ý[ˆ
+	Ú[XYÙIË	Ú[XYÙWÜÙ\]Y[˜ÙIÊ_BˆYˆÛÝ\˜Ù\Ë\Ù]
+Ù[‹œ›ÞWÛX\
+N‚ˆÙ[‹œÝ\Ü›ÞWÙÙ[™\˜][ÛŠ
+B‚ˆYˆÝ\Ü›ÞWÙÙ[™\˜][ÛŠÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹œ›ÞWÙ[˜X›Y‚ˆ™]\›‚ˆYˆ›Ý[žJËšÚ[™[ˆ
+	ÝšY[ÉË	Ø]Y[ÉÊH[™ËœÛÝ\˜ÙWÝ\H›Ý[ˆ
+	Ú[XYÙIË	Ú[XYÙWÜÙ\]Y[˜ÙIÊBˆ[™Ëœ]›ÜˆÈ[ˆÙ[‹˜\ÜÙ]ÊÜÙ[‹˜Û\ÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñ°ïˆY\ÙHYYY[ˆÙ\™[ˆÙZ[™H›ÞKQ]ZY[ˆ™[°íYÝ‰Ë
+Bˆ™]\›‚ˆYˆÙ[‹œ›Ú™XÝÜ]‚ˆ\™XÝÜžOT]
+Ù[‹œ›Ú™XÝÜ]
+KÚ]ÜÝY™š^
+	Ëœ›ÞY\ÉÊBˆ[ÙN‚ˆ\™XÝÜžO\Ù[‹œ›ÞWÙ\™XÝÜžHÜˆÙ[‹œÝ]WÙ\‹ÉÜ›ÞY\ÉËÝ]ZY]ZY
+
+Kš^ˆÙ[‹œ›ÞWÙ\™XÝÜžOY\™XÝÜžBˆÛ\ÏVÜ™\XÙJËÛÝ\˜ÙWÜ]Ï[\Ý
+ËœÛÝ\˜ÙWÜ]ÊJH›ÜˆÈ[ˆÙ[‹˜Û\×Bˆ\ÜÙ]ÏVÜ™\XÙJËÛÝ\˜ÙWÜ]Ï[\Ý
+ËœÛÝ\˜ÙWÜ]ÊJH›ÜˆÈ[ˆÙ[‹˜\ÜÙ]×Bˆ›Ùš[O\Ù[‹œ›ÞWÜ›Ùš[BˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆ™]\›ˆÜ™X]WÜ›ÞWÙš[\ÊÛ\Ë\ÜÙ]Ë\™XÝÜžK›Ùš[O\›Ùš[Kˆ›ÙÜ™\ÜÏ\›ÙÜ™\ÜËØ[˜Ù[XØ[˜Ù[
+BˆYˆÛÛ\]J™\Ý[
+N‚ˆYˆ›Ùš[HO\Ù[‹œ›ÞWÜ›Ùš[N‚ˆU[Y\‹œÚ[™ÛTÚÝ
+Ù[‹œÝ\Ü›ÞWÙÙ[™\˜][ÛŠNÈ™]\›‚ˆYˆ›Ý™\Ý[ÉÛÚÉ×N‚ˆÙ[‹œ›ÞWÙ[˜X›YQ˜[ÙBˆÙ[‹œ›ÞWØ›Þ˜›ØÚÔÚYÛ˜[ÊYJNÈÙ[‹œ›ÞWØ›ÞœÙ]ÚXÚÙY
+˜[ÙJNÈÙ[‹œ›ÞWØ›Þ˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆ™]\›ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆYˆ›ÝÙ[‹œ›ÞWÙ[˜X›Y‚ˆÙ[‹œ›ÞWÛX\^ßBˆ™]\›‚ˆÙ[‹œ›ÞWÛX\\™\Ý[ÉÝ˜[YI×NÈÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJˆ‰ÞÛ[ŠÙ[‹œ›ÞWÛX\
+_H›ÞKQ]ZY[ˆ
+Ô“ÖWÔ“Ñ’STÖÜÙ[‹œ›ÞWÜ›Ùš[WVÈ›X™[—_JH™\™Z]0­ÈÜšYÚ[˜[H›ZX™[ˆ°ïˆ[ˆ^ÜZÝ]‰ËL
+BˆÙ[‹œ™]šY]×Ü]Y]YYUYBˆYˆÙ[‹˜Û\Î‚ˆÙ[‹œ™[™\—Ü™]šY]Ê
+BˆÈH™]È[\ÜØ[ˆš[š\ÚÚ[H\È›Øˆ\È[›š[™Ëˆ™K\ØØ[ˆÛ˜ÙBˆÈÛÈ]Hš\œÝ›ÞH˜]Ú™]™\ˆÚ[[HZ\ÜÙ\È]ÛÝ\˜ÙK‚ˆU[Y\‹œÚ[™ÛTÚÝ
+Ù[‹™[œÝ\™WÛZ\ÜÚ[™×Ü›ÞY\ÊBˆÙ[‹œÝ\Ú[™\[™[Ú›ØŠ	Ü›ÞIË	Ô›ÞKQ]ZY[ˆÙ\™[ˆ\ž™]YÝ8 )‰ËÜ\˜][Û‹ÛÛ\]JB‚ˆYˆ\]WÜ™[™\—Ü]Y]YWØ]ÛŠÙ[ŠN‚ˆYˆ›Ý\Ø]ŠÙ[‹	Ü™[™\—Ü]Y]YWØ]Û‰ÊN‚ˆ™]\›‚ˆÛÝ[[[ŠÙ[‹œ™[™\—Ü]Y]YJJÊHYˆÙ[‹œ™[™\—ØÝ\œ™[[ÙH
+BˆÝY™š^IÈ0­È]\ÚY\	ÈYˆÙ[‹œ™[™\—Ü]Y]YWÜ]\ÙY[™Ù[‹œ™[™\—Ü]Y]YH[ÙH	ÉÂˆÙ[‹œ™[™\—Ü]Y]YWØ]Û‹œÙ]^
+‰Ô™[™\‹T]Y]YH
+ØÛÝ[J^ÜÝY™š^IÊB‚ˆYˆÚÝ×Ü™[™\—Ü]Y]YJÙ[ŠN‚ˆYˆ›ÝÙ[‹œ™[™\—Ü]Y]YH[™›ÝÙ[‹œ™[™\—ØÝ\œ™[‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ô™[™\‹T]Y]YH\ÝY\‹‰ËÌ
+Bˆ™]\›‚ˆX[ÙÏTQX[ÙÊÙ[ŠNÈX[ÙËœÙ]Ú[™ÝÕ]J	Ô™[™\‹T]Y]YIÊNÈX[ÙËœÙ]Z[š[][UÚY
+LŒ
+Bˆ^[Ý]TU›Þ^[Ý]
+X[ÙÊNÈ^[Ý]œÙ]ÛÛ[ÓX\™Ú[œÊNM‹NMŠNÈ^[Ý]œÙ]ÜXÚ[™ÊL
+Bˆ^[Ý]˜YÚYÙ]
+X™[
+	Ô‘S‘T‹TUQUQH0­ÈVÔ•ÈPÒRSS‘T‰Ë	ÚXY[™ÉÊJBˆ]Y]YWÛ\ÝTS\ÝÚYÙ]
+
+NÈ^[Ý]˜YÚYÙ]
+]Y]YWÛ\Ý
+BˆXÝ[ÛœÏTR›Þ^[Ý]
+
+NÈÝ\X]ÛŠ	Ô]Y]YHÝ\[‰Ë[X™N“›Û™KYJNÈÛX\X]ÛŠ	ÕØ\\ØÚ[™ÙHY\™[‰Ë[X™N“›Û™JNÈÛÜÙOX]ÛŠ	ÔØÚYpçÙ[‰ËX[ÙËœ™Z™XÝ
+BˆXÝ[ÛœË˜YÚYÙ]
+Ý\
+NÈXÝ[ÛœË˜YÚYÙ]
+ÛX\ŠNÈXÝ[ÛœË˜YÝ™]Ú
+
+NÈXÝ[ÛœË˜YÚYÙ]
+ÛÜÙJNÈ^[Ý]˜Y^[Ý]
+XÝ[ÛœÊB‚ˆYˆ™Yœ™\ÚÛ\Ý
+
+N‚ˆ]Y]YWÛ\Ý˜ÛX\Š
+BˆYˆÙ[‹œ™[™\—ØÝ\œ™[‚ˆ]Y]YWÛ\Ý˜Y][J	ø¥­ˆ0éYˆ	ÊÜÙ[‹œ™[™\—ØÝ\œ™[ÉÛX™[	×JBˆ›Üˆ[™^][H[ˆ[[Y\˜]JÙ[‹œ™[™\—Ü]Y]YKJN‚ˆ]Y]YWÛ\Ý˜Y][J‰ÞÚ[™^Kˆ	ÊÚ][VÉÛX™[	×JBˆÝ\œÙ][˜X›Y
+›ÛÛ
+Ù[‹œ™[™\—Ü]Y]YJH[™›ÝÙ[‹ÛÜšÙ\ŠBˆÛX\‹œÙ][˜X›Y
+›ÛÛ
+Ù[‹œ™[™\—Ü]Y]YJH[™›ÝÙ[‹ÛÜšÙ\ŠBˆYˆÝ\Ü]Y]YJ
+N‚ˆÙ[‹œ™[™\—Ü]Y]YWÜ]\ÙYQ˜[ÙNÈÙ[‹\]WÜ™[™\—Ü]Y]YWØ]ÛŠ
+NÈÙ[‹œ›ØÙ\Ü×Ü™[™\—Ü]Y]YJ
+NÈX[ÙË˜XØÙ\
+
+BˆYˆÛX\—Ü]Y]YJ
+N‚ˆÙ[‹œ™[™\—Ü]Y]YK˜ÛX\Š
+NÈÙ[‹\]WÜ™[™\—Ü]Y]YWØ]ÛŠ
+NÈ™Yœ™\ÚÛ\Ý
+
+BˆÝ\˜ÛXÚÙY˜ÛÛ›™XÝ
+Ý\Ü]Y]YJNÈÛX\‹˜ÛXÚÙY˜ÛÛ›™XÝ
+ÛX\—Ü]Y]YJNÈ™Yœ™\ÚÛ\Ý
+
+NÈX[ÙË™^XÊ
+B‚ˆYˆ›ØÙ\Ü×Ü™[™\—Ü]Y]YJÙ[ŠN‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆÙ[‹œ™[™\—ØÝ\œ™[ÜˆÙ[‹œ™[™\—Ü]Y]YWÜ]\ÙYÜˆ›ÝÙ[‹œ™[™\—Ü]Y]YN‚ˆÙ[‹\]WÜ™[™\—Ü]Y]YWØ]ÛŠ
+NÈ™]\›‚ˆ][O\Ù[‹œ™[™\—Ü]Y]YKœÜ
+
+NÈÙ[‹œ™[™\—ØÝ\œ™[Z][NÈÙ[‹\]WÜ™[™\—Ü]Y]YWØ]ÛŠ
+BˆYˆÜ\˜][ÛŠ›ÙÜ™\ÜËØ[˜Ù[
+N‚ˆ™[™\Š][VÉØÛ\É×K][VÉÝ˜XÚÜÉ×K][VÉÝ\™Ù]	×K][VÉÜÚ^™I×K›ÙÜ™\ÜËØ[˜Ù[˜[ÙKˆ][VÉÝ˜XÚ×ÜÝ]\É×K][VÉÜÙ][™ÜÉ×KX\Ý\—ÜÙ][™ÜÏZ][K™Ù]
+	ÛX\Ý\—ÜÙ][™ÜÉËÙ[‹›X\Ý\—ÛZ^\ŠKˆ\˜][Û—ÛÝ™\œšYOZ][K™Ù]
+	Ù\˜][Û‰ÊJBˆ™]\›ˆÝŠ][VÉÝ\™Ù]	×JBˆYˆÛÛ\]J™\Ý[
+N‚ˆÙ[‹œ™[™\—ØÝ\œ™[S›Û™NÈÙ[‹\]WÜ™[™\—Ü]Y]YWØ]ÛŠ
+BˆYˆ™\Ý[ÉÛÚÉ×N‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñ^Ü™\YÎˆ	ÊÜ™\Ý[ÉÝ˜[YI×KŒ
+Bˆ[Yˆ™\Ý[™Ù]
+	ØØ[˜Ù[Y	ÊN‚ˆÙ[‹œ™[™\—Ü]Y]YWÜ]\ÙYUYNÈÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJˆ	ÐZÝY[\ˆ^ÜX™ÙXœ›ØÚ[ˆ0­È™[™\‹T]Y]YH]\ÚY\	ËŒ
+Bˆ[ÙN‚ˆÙ[‹š›Ø—Ù\œ›ÜŠ™\Ý[
+BˆÙ[‹\]WÜ™[™\—Ü]Y]YWØ]ÛŠ
+BˆYˆÙ[‹œ™[™\—Ü]Y]YH[™›ÝÙ[‹œ™[™\—Ü]Y]YWÜ]\ÙY‚ˆU[Y\‹œÚ[™ÛTÚÝ
+Ù[‹œ›ØÙ\Ü×Ü™[™\—Ü]Y]YJBˆÙ[‹œÝ\Ú[™\[™[Ú›ØŠ	Ù^Ü	Ë][VÉÛX™[	×JÉÈÚ\™Ù\™[™\8 )‰ËÜ\˜][Û‹ÛÛ\]JB‚ˆYˆÝ\Ù^Ü
+Ù[ŠN‚ˆYˆÙ[‹ÛÜšÙ\Žœ™]\›‚ˆYˆ›ÝÙ[‹˜Û\Îœ™]\›ˆÙ[‹™\œ›ÜŠ	ÑYH[Y[[™H\ÝY\‹‰ÊBˆÛÜš×Ø\™XO\Ù[‹ÛÜš×Ø\™XWØ›Ý[™Ê
+HYˆ
+Ù[‹ÛÜš×Ú[ˆ\È›Ý›Û™HÜˆÙ[‹ÛÜš×ÛÝ]\È›Ý›Û™JH[ÙH›Û™BˆX[ÙÏQ^ÜX[ÙÊÙ[‹ÛÜš×Ø\™XJBˆYˆX[ÙË™^XÊ
+HOTQX[ÙËXØÙ\Yœ™]\›‚ˆ^ÜÜÙ][™ÜÏYX[ÙË™^ÜÜÙ][™ÜÂˆ›Ü›X]Ú[™›ÏQVÔ•Ñ“Ô“PUÖÙ^ÜÜÙ][™ÜÖÉÙ›Ü›X]	×WBˆ^[œÚ[ÛY›Ü›X]Ú[™›ÖÉÙ^[œÚ[Û‰×Bˆ]ÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJÙ[‹	ÕšY[È^ÜY\™[‰Ë	ÓYZ[‹Qš[IÊÙ^[œÚ[Û‹ˆˆžÙ›Ü›X]Ú[™›ÖÉÛX™[	×_H
+
+žÙ^[œÚ[ÛŸJNÎÐ[H]ZY[ˆ
+
+ŠH‹ˆÜ[ÛœÏTQš[QX[ÙË‘ÛÛÛ™š\›SÝ™\Üš]JBˆYˆ›Ý]œ™]\›‚ˆYˆ›Ý]›ÝÙ\Š
+K™[™ÝÚ]
+^[œÚ[ÛŠNœ]
+ÏY^[œÚ[Û‚ˆ\™Ù]T]
+]
+Kœ™\ÛÛ™J
+BˆÛÝ\˜ÙWÙš[\ÏVÜ]›ÜˆÛ\[ˆÙ[‹˜Û\ÊÜÙ[‹˜\ÜÙ]Âˆ›Üˆ][ˆ
+ØÛ\œ]JÛ\Ý
+Û\œÛÝ\˜ÙWÜ]ÊBˆ
+ÊØÛ\˜˜XÚÙÜ›Ý[™Ü™[[Ý™YÜ]HYˆÛ\˜˜XÚÙÜ›Ý[™Ü™[[Ý™YÜ][ÙH×JJWBˆYˆ[žJ]
+]
+Kœ™\ÛÛ™J
+OO]\™Ù]›Üˆ][ˆÛÝ\˜ÙWÙš[\ÈYˆ]
+Nœ™]\›ˆÙ[‹™\œ›ÜŠ	Ñ\ˆ^Ü\™ˆÙZ[™H]Y[]ZH0ï™\œØÚ™ZX™[‹‰ÊBˆYˆ›Ý\™Ù]œ\™[š\×Ù\Š
+HÜˆ›ÝÜË˜XØÙ\ÜÊ\™Ù]œ\™[ÜË•×ÓÒÊN‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÖšY[Ü™™\ˆšXÚ™\ØÚ™ZX˜˜\Žˆ	ÊÜÝŠ\™Ù]œ\™[
+JBˆYˆ\™Ù]™^\ÝÊ
+H[™SY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	Ñ]ZH\œÙ]™[ÉË‰ÞÝ\™Ù]W°ï™\œØÚ™ZX™[ÉËSY\ÜØYÙP›Þ–Y\ßSY\ÜØYÙP›Þ“›ËSY\ÜØYÙP›Þ“›ÊHOTSY\ÜØYÙP›Þ–Y\Îœ™]\›‚ˆÛ\Ï\Ù[‹œÛ˜\ÚÝ
+
+VÌBˆÙ[‹›\ÝÙ^ÜÜÙ][™ÜÏYXÝ
+^ÜÜÙ][™ÜÊBˆ^ÜÙ\˜][ÛS›Û™BˆYˆX[ÙË™^ÜÝÛÜš×Ø\™XH[™ÛÜš×Ø\™XN‚ˆžN‚ˆÛ\Ï]š[WÝ[Y[[™WÜ˜[™ÙJÛ\Ë
+ÛÜš×Ø\™XJBˆ^ÜÙ\˜][Û]ÛÜš×Ø\™XVÌWK]ÛÜš×Ø\™XVÌBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ^ÊBˆ˜XÚÜÏ[\Ý
+Ù[‹˜XÚÜÊNÝ˜XÚ×ÜÝ]\Ï^Ý˜XÚÎ™XÝ
+Ý]JH›Üˆ˜XÚËÝ]H[ˆÙ[‹˜XÚ×ÜÝ]\Ëš][\Ê
+_Bˆ›Ùš[WÜÚ^™OY^ÜÜÙ][™ÜË™Ù]
+	ÜÚ^™IÊBˆÚ^™O]\J›Ùš[WÜÚ^™JHYˆ›Ùš[WÜÚ^™H[ÙH‘TÑUÖÜÙ[‹œ™\Ù]˜Ý\œ™[^
+
+WBˆ[™[™×Ý\™Ù]ÏVÚ][VÉÝ\™Ù]	×H›Üˆ][H[ˆÙ[‹œ™[™\—Ü]Y]YWBˆYˆÙ[‹œ™[™\—ØÝ\œ™[ˆ[™[™×Ý\™Ù]Ë˜\[™
+Ù[‹œ™[™\—ØÝ\œ™[ÉÝ\™Ù]	×JBˆYˆ\™Ù][ˆ[™[™×Ý\™Ù]Î‚ˆ™]\›ˆÙ[‹™\œ›ÜŠ	ÑY\Ù\ÈšY[YYÝ™\™Z]È[ˆ\ˆ™[™\‹T]Y]YK‰ÊBˆÙ[‹œ™[™\—Ü]Y]YK˜\[™
+ÉÝ\™Ù]	Î\™Ù]	ØÛ\ÉÎ˜Û\Ë	Ý˜XÚÜÉÎ˜XÚÜË	Ý˜XÚ×ÜÝ]\ÉÎ˜XÚ×ÜÝ]\Ëˆ	ÜÚ^™IÎœÚ^™K	ÜÙ][™ÜÉÎ™^ÜÜÙ][™ÜË	ÛX\Ý\—ÜÙ][™ÜÉÎ™XÝ
+Ù[‹›X\Ý\—ÛZ^\ŠKˆ	Ù\˜][Û‰Î™^ÜÙ\˜][Û‹ˆ	ÛX™[	Î™ˆžÙ›Ü›X]Ú[™›ÖÉÛX™[	×_H0­ÈÝ\™Ù]›˜[Y_HŸJBˆÙ[‹\]WÜ™[™\—Ü]Y]YWØ]ÛŠ
+BˆYˆX[ÙËœ]Y]YWÛÛ›WØ›Þš\ÐÚXÚÙY
+
+N‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰Ñ^ÜZ[™Ù\™ZZ0­ÈÝ\™Ù]›˜[Y_IËL
+Bˆ™]\›‚ˆÙ[‹œ™[™\—Ü]Y]YWÜ]\ÙYQ˜[ÙNÈÙ[‹œ›ØÙ\Ü×Ü™[™\—Ü]Y]YJ
+B‚ˆYˆÝ\Ú›ØŠÙ[‹]KÜ\˜][Û‹Ø[˜XÚÊN‚ˆYˆÙ[‹ÛÜšÙ\Žˆ™]\›‚ˆÙ[‹˜Ø[˜Ù[Ü™]šY]ÊØZ]UYJBˆÙ[‹˜[œÜÜÜÝÜ
+
+BˆÙ[‹œ^Y\‹œ]\ÙJ
+BˆÙ[‹œ›ÙÜ™\ÜÏ\Ù[‹›™]×Ý\ÚÊ]JBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ð[˜[\ÙH0éY0­È˜]šYØ][Ûˆ›ZX™\™°ïØ˜\ŽÈÛ\pá™\[™Ù[ˆ˜XÚXœØÚ\ÜË‰ÊBˆÙ[‹ÛÜšÙ\R›ØŠÜ\˜][ÛŠNÜÙ[‹œ›ÙÜ™\ÜË˜Ø[˜Ù[Y˜ÛÛ›™XÝ
+Ù[‹ÛÜšÙ\‹˜Ø[˜Ù[œÙ]
+BˆÙ[‹ÛÜšÙ\‹œ›ÙÜ™\ÜË˜ÛÛ›™XÝ
+Ù[‹œ›ÙÜ™\ÜËœÙ]˜[YJBˆÙ[‹ÛÜšÙ\‹œ™\Ý[˜ÛÛ›™XÝ
+[X™H™\Ý[œÙ[‹™š[š\ÚÚ›ØŠ™\Ý[Ø[˜XÚÊJBˆÙ[‹ÛÜšÙ\‹œÝ\
+
+NÜÙ[‹œ›ÙÜ™\ÜËœÚÝÊ
+B‚ˆYˆš[š\ÚÚ›ØŠÙ[‹™\Ý[Ø[˜XÚÊN‚ˆÙ[‹ÛÜšÙ\‹ØZ]
+
+NÜÙ[‹ÛÜšÙ\‹™[]S]\Š
+NÜÙ[‹ÛÜšÙ\S›Û™BˆÙ[‹œ›ÙÜ™\ÜË˜ÛÜÙJ
+NÜÙ[‹œ›ÙÜ™\ÜË™[]S]\Š
+BˆYˆ›ÝÙ[‹š[™\[™[Ú›ØœÎˆÙ[‹\ÚÜ×ÚÜÝšYJ
+BˆØ[˜XÚÊ™\Ý[
+B‚ˆYˆ›Ø—Ù\œ›ÜŠÙ[‹™\Ý[
+N‚ˆYˆ™\Ý[™Ù]
+	ØØ[˜Ù[Y	ÊNœÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÐX™ÙXœ›ØÚ[ˆ0­ÈÙZ[™HšY[]ZH\œÙ]	ËŒ
+Bˆ[ÙNœÙ[‹™\œ›ÜŠ™\Ý[™Ù]
+	Ù\œ›Ü‰Ë	Õ[˜™ZØ[›\ˆ™Z\‰ÊJB‚ˆYˆÚXÚ×Ù›Ü—Ý\]\ÊÙ[‹Ú[[Q˜[ÙJN‚ˆYˆÙ[‹—ØÛÜÚ[™ÈÜˆÙ[‹\]WÚ›ØˆÜˆÙ[‹\]WÙÝÛ›ØYÚ›ØŽ‚ˆ™]\›‚ˆX[šY™\ÝÝ\›XÛÛ™šYÝ\™YÛX[šY™\ÝÝ\›
+
+BˆYˆ›ÝX[šY™\ÝÝ\›‚ˆYˆ›ÝÚ[[‚ˆYˆ\]WØÚXÚÜ×Ù\ØX›Y
+
+N‚ˆSY\ÜØYÙP›Þš[™›Ü›X][ÛŠÙ[‹	Õ\]\ÉË	ÑYH\]KT°ï[™È\ÝXZÝ]šY\——‘[™\›™H”SQPÕUÑTÐP“WÕTUWÐÒPÒÈÙ\ˆÙ]™HYH˜\šXX›H]Yˆ[HÚYHÚYY\ˆZ[ž\ØÚ[[‹‰ÊBˆ[ÙN‚ˆSY\ÜØYÙP›Þš[™›Ü›X][ÛŠÙ[‹	Õ\]\ÉË	Ñ\È\ÝÙZ[™H\]KT]Y[H™\™°ïØ˜\‹——”Ù]™H”SQPÕUÕTUWÓPS’Q‘TÕÕT“]YˆZ[™H™\°í™™™[XÚH\]\ËšœÛÛ‹‰ÊBˆ™]\›‚ˆÙ[‹\]WØ]Û‹œÙ][˜X›Y
+˜[ÙJNÈÙ[‹\]WØ]Û‹œÙ]^
+	Õ\]\ÈÙ\™[ˆÙ\°ï8 )‰ÊBˆÙ[‹\]WÚ›ØU\]PÚXÚÒ›ØŠX[šY™\ÝÝ\›TÕ‘T”ÒSÓŠBˆÙ[‹\]WÚ›Ø‹œ™\Ý[˜ÛÛ›™XÝ
+[X™H™\Ý[œÙ[‹™š[š\ÚÝ\]WØÚXÚÊ™\Ý[Ú[[
+JBˆÙ[‹\]WÚ›Ø‹™š[š\ÚY˜ÛÛ›™XÝ
+Ù[‹\]WÚ›Ø‹™[]S]\ŠBˆÙ[‹\]WÚ›Ø‹œÝ\
+
+B‚ˆYˆš[š\ÚÝ\]WØÚXÚÊÙ[‹™\Ý[Ú[[Q˜[ÙJN‚ˆÙ[‹\]WÚ›ØS›Û™BˆÙ[‹\]WØ]Û‹œÙ][˜X›Y
+YJNÈÙ[‹\]WØ]Û‹œÙ]^
+	Ó˜XÚ\]\ÈÝXÚ[‰ÊBˆYˆ›Ý™\Ý[™Ù]
+	ÛÚÉÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Õ\]KT°ï[™ÈšXÚpí™ÛXÚˆ	ÊÜ™\Ý[™Ù]
+	Ù\œ›Ü‰Ë	Õ[˜™ZØ[›\ˆ™Z\‰ÊKÌ
+BˆYˆ›ÝÚ[[‚ˆSY\ÜØYÙP›ÞØ\›š[™ÊÙ[‹	Õ\]KT°ï[™ÉË™\Ý[™Ù]
+	Ù\œ›Ü‰Ë	Õ[˜™ZØ[›\ˆ™Z\‰ÊJBˆ™]\›‚ˆ\Y˜XÝ\™\Ý[™Ù]
+	Ø\Y˜XÝ	ÊBˆYˆ›Ý\Y˜XÝ‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ñœ˜[YXÝ]\Ý]Yˆ[HZÝY[[ˆÝ[™‰ËL
+BˆYˆ›ÝÚ[[‚ˆSY\ÜØYÙP›Þš[™›Ü›X][ÛŠÙ[‹	Õ\]\ÉË	Ñœ˜[YXÝ]\Ý™\™Z]ÈZÝY[‰ÊBˆ™]\›‚ˆÙ[‹\]WØ\Y˜XÝX\Y˜XÝˆÙ[‹\]WØ]Û‹œÙ]^
+ˆ•\]HØ\Y˜XÝÉÝ™\œÚ[Û‰×_H™\™°ïØ˜\ˆŠBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJˆ•\]H™\™°ïØ˜\Žˆœ˜[YXÝ]Ø\Y˜XÝÉÝ™\œÚ[Û‰×_H0­ÈØ\Y˜XÝÉÚÚ[™	×_H‹L
+BˆYˆ›ÝÚ[[‚ˆÙ[‹›Ù™™\—Ý\]J\Y˜XÝ
+B‚ˆYˆÙ™™\—Ý\]JÙ[‹\Y˜XÝ
+N‚ˆ›Ý\ÏI×‰Ëš›Ú[Š‰ø (ˆÛ›Ý_IÈ›Üˆ›ÝH[ˆ\Y˜XÝ™Ù]
+	Ü™[X\ÙWÛ›Ý\ÉË×JJHÜˆ	ÒÙZ[™H™[X\ÙKS›Ý^™[‹‰ÂˆYˆ\Y˜XÝÉÚÚ[™	×OOIØ\[XYÙIÈ[™ÜË™[š\›Û‹™Ù]
+	ÐTSPQÑIÊN‚ˆY\ÜØYÙOYˆ‘œ˜[YXÝ]Ø\Y˜XÝÉÝ™\œÚ[Û‰×_H\Ý™\™°ïØ˜\‹——žÛ›Ý\ßW—‘\È™\šYš^šY\H\[XYÙHÚ\™\[\™Ù[Y[ˆ[™\œÙ]YHZÝY[H]ZKˆœ˜[YXÝ]]\ÜÈ[˜XÚ™]HÙ\Ý\]Ù\™[‹ˆ‚ˆ[Yˆ\Y˜XÝÉÚÚ[™	×OOIÙX‰Î‚ˆY\ÜØYÙOYˆ‘œ˜[YXÝ]Ø\Y˜XÝÉÝ™\œÚ[Û‰×_H\Ý™\™°ïØ˜\‹——žÛ›Ý\ßW—‘\ÈZÙ]Ú\™™\šYš^šY\\[\™Ù[Y[‹ˆYH[œÝ[][Ûˆ\È™Xˆ\™›ÛÝ[œØÚYpçÙ[™Z][H[™Ù^™ZYÝ[ˆÝYËP™Y™Zˆ‚ˆ[ÙN‚ˆY\ÜØYÙOYˆ‘œ˜[YXÝ]Ø\Y˜XÝÉÝ™\œÚ[Û‰×_H\Ý™\™°ïØ˜\‹——žÛ›Ý\ßW—‘\È\[XYÙHÚ\™™\šYš^šY\\[\™Ù[Y[ˆ[™Ø[›ˆ[˜XÚ\™ZÝÙ\Ý\]Ù\™[‹ˆ‚ˆYˆSY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	Ñœ˜[YXÝ]U\]IËY\ÜØYÙKSY\ÜØYÙP›Þ–Y\ßSY\ÜØYÙP›Þ“›ËSY\ÜØYÙP›Þ–Y\ÊHOTSY\ÜØYÙP›Þ–Y\Î‚ˆ™]\›‚ˆÝ\œ™[Ü][ÜË™[š\›Û‹™Ù]
+	ÐTSPQÑIÊHYˆ\Y˜XÝÉÚÚ[™	×OOIØ\[XYÙIÈ[ÙH›Û™Bˆ[œÝ[X›ÛÛ
+Ý\œ™[Ü][™\Y˜XÝÉÚÚ[™	×OOIØ\[XYÙIÊBˆÙ[‹\]WÙÝÛ›ØYÚ›ØU\]QÝÛ›ØY›ØŠ\Y˜XÝ[œÝ[Ý\œ™[Ü]
+BˆÙ[‹\]WØ]Û‹œÙ][˜X›Y
+˜[ÙJNÈÙ[‹\]WØ]Û‹œÙ]^
+	Õ\]HÚ\™Ù[Y[ˆ8 )‰ÊBˆÙ[‹\]WÙÝÛ›ØYÚ›Ø‹œ™\Ý[˜ÛÛ›™XÝ
+Ù[‹™š[š\ÚÝ\]WÙÝÛ›ØY
+BˆÙ[‹\]WÙÝÛ›ØYÚ›Ø‹™š[š\ÚY˜ÛÛ›™XÝ
+Ù[‹\]WÙÝÛ›ØYÚ›Ø‹™[]S]\ŠBˆÙ[‹\]WÙÝÛ›ØYÚ›Ø‹œÝ\
+
+B‚ˆYˆš[š\ÚÝ\]WÙÝÛ›ØY
+Ù[‹™\Ý[
+N‚ˆÙ[‹\]WÙÝÛ›ØYÚ›ØS›Û™BˆÙ[‹\]WØ]Û‹œÙ][˜X›Y
+YJNÈÙ[‹\]WØ]Û‹œÙ]^
+	Ó˜XÚ\]\ÈÝXÚ[‰ÊBˆYˆ›Ý™\Ý[™Ù]
+	ÛÚÉÊN‚ˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Õ\]H™ZÙ\ØÚYÙ[Žˆ	ÊÜ™\Ý[™Ù]
+	Ù\œ›Ü‰Ë	Õ[˜™ZØ[›\ˆ™Z\‰ÊK
+BˆSY\ÜØYÙP›ÞØ\›š[™ÊÙ[‹	Õ\]H™ZÙ\ØÚYÙ[‰Ë™\Ý[™Ù]
+	Ù\œ›Ü‰Ë	Õ[˜™ZØ[›\ˆ™Z\‰ÊJBˆ™]\›‚ˆY\ÜØYÙO\™\Ý[™Ù]
+	ÛY\ÜØYÙIË	Õ\]H™\šYš^šY\\[\™Ù[Y[‹‰ÊBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJY\ÜØYÙKL
+BˆYˆ™\Ý[™Ù]
+	Ú[œÝ[Y	ÊN‚ˆSY\ÜØYÙP›Þš[™›Ü›X][ÛŠÙ[‹	Õ\]H™\™Z]	Ë	Ñ\È™]YH\[XYÙH\Ý[œÝ[Y\ˆš]Hœ˜[YXÝ]™]HÝ\[‹‰ÊBˆ[YˆÙ[‹\]WØ\Y˜XÝ[™Ù[‹\]WØ\Y˜XÝ™Ù]
+	ÚÚ[™	ÊOOIÙX‰Î‚ˆ]\™\Ý[™Ù]
+	Ü]	Ë	ÉÊBˆSY\ÜØYÙP›Þš[™›Ü›X][ÛŠÙ[‹	Õ\]H\[\™Ù[Y[‰ËY\ÜØYÙJÙˆ——’[œÝ[][Ûˆ[H\›Z[˜[—œÝYÈÙÈZH	ÞÜ]IÈŠBˆ[ÙN‚ˆ]\™\Ý[™Ù]
+	Ü]	Ë	ÉÊBˆSY\ÜØYÙP›Þš[™›Ü›X][ÛŠÙ[‹	Õ\]H\[\™Ù[Y[‰ËY\ÜØYÙJÙˆ——”Ý\[ˆZ]—˜Ú[Ù
+Þ	ÞÜ]I×‰ÞÜ]IÈŠB‚ˆYˆ™\Ý[YWØ]]ÜØ]™JÙ[ŠN‚ˆYˆÙ[‹™\NœÙ[‹˜]]ÜØ]™WÝ[Y\‹œÝ\
+
+B‚ˆYˆ]]ÜØ]™JÙ[ŠN‚ˆYˆ›ÝÙ[‹œ™XÛÝ™\žWÙ[˜X›YÜˆ›ÝÙ[‹™\Nœ™]\›‚ˆYˆÙ[‹˜]]ÜØ]™WÜ™]š\Ú[ÛO\Ù[‹œ™]š\Ú[ÛŽœ™]\›‚ˆYˆÙ[‹[Y[[™K™˜YÎ‚ˆÙ[‹˜]]ÜØ]™WÝ[Y\‹œÝ\
+
+NÜ™]\›‚ˆžN‚ˆ˜XÚÝ\\Ù[‹œÝ]WÙ\‹ÉÜ™XÛÝ™\žK\™]š[Ý\Ë™œ˜[YXÝ]	ÂˆYˆÙ[‹œ™XÛÝ™\žWÜ]š\×Ùš[J
+N‚ˆžN‚ˆØYÜ›Ú™XÝ
+Ù[‹œ™XÛÝ™\žWÜ][Ý×ÛZ\ÜÚ[™ÏUYJBˆÝYÙYX˜XÚÝ\Ú]ÜÝY™š^
+	Ë\	ÊNÈÚ][˜ÛÜLŠÙ[‹œ™XÛÝ™\žWÜ]ÝYÙY
+NÈÜËœ™\XÙJÝYÙY˜XÚÝ\
+Bˆ^Ù\
+ÔÑ\œ›Ü‹˜[YQ\œ›ÜŠNˆ\ÜÂˆØ]™WÜ›Ú™XÝ
+Ù[‹œ™XÛÝ™\žWÜ]Ù[‹˜Û\ËÙ[‹œ™\Ù]˜Ý\œ™[^
+
+KÙ[‹˜XÚÜËÙ[‹˜\ÜÙ]ËÙ[‹œ›Ú™XÝÜ]Ù[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚ×Û˜[Y\ËÙ[‹›X\šÙ\œËÙ[‹›X\Ý\—ÛZ^\ŠBˆÙ[‹›\ÝØ]]ÜØ]™O][YK[YJ
+NÈÙ[‹˜]]ÜØ]™WÜ™]š\Ú[Û\Ù[‹œ™]š\Ú[Û‚ˆÙ[‹˜]]ÜØ]™WÛX™[œÙ]^
+	Ð]]ÜØ]™H8§$ÉÊNÜÙ[‹˜]]ÜØ]™WÛX™[œÙ]ÛÛ\
+ÝŠÙ[‹œ™XÛÝ™\žWÜ]
+JNÈÙ[‹\]WÜ›Ú™XÝÚY[]J
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹˜]]ÜØ]™WÛX™[œÙ]^
+	Ð]]ÜØ]™H™ZÙ\ØÚYÙ[‰ÊNÜÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJÝŠ^ÊJNÈÙ[‹\]WÜ›Ú™XÝÚY[]J
+B‚ˆYˆÛX\—Ü™XÛÝ™\žJÙ[ŠN‚ˆÙ[‹˜]]ÜØ]™WÝ[Y\‹œÝÜ
+
+BˆYˆÙ[‹œ™XÛÝ™\žWÙ[˜X›Y‚ˆžNœÙ[‹œ™XÛÝ™\žWÜ][›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆ^Ù\ÔÑ\œ›ÜŽœ\ÜÂˆžNŠÙ[‹œÝ]WÙ\‹ÉÜ™XÛÝ™\žK\™]š[Ý\Ë™œ˜[YXÝ]	ÊK[›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆ^Ù\ÔÑ\œ›ÜŽœ\ÜÂ‚ˆYˆÙ™™\—Ü™XÛÝ™\žJÙ[ŠN‚ˆ™]š[Ý\Ï\Ù[‹œÝ]WÙ\‹ÉÜ™XÛÝ™\žK\™]š[Ý\Ë™œ˜[YXÝ]	ÂˆYˆ›ÝÙ[‹œ™XÛÝ™\žWÜ]™^\ÝÊ
+H[™›Ý™]š[Ý\Ë™^\ÝÊ
+Nœ™]\›‚ˆ[œÝÙ\TSY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	Õ[™Ù\ÜZXÚ\[ˆØÚš]ÚYY\š\œÝ[[ÉËˆ	Ñ\ÈÚXZ[™H]]ÛX]\ØÚHÚXÚ\[™È\ˆ][ˆÚ][™ËˆÚYY\š\œÝ[[ÉËSY\ÜØYÙP›Þ–Y\ßSY\ÜØYÙP›Þ“›ËSY\ÜØYÙP›Þ–Y\ÊBˆYˆ[œÝÙ\ˆOTSY\ÜØYÙP›Þ–Y\ÎœÙ[‹˜ÛX\—Ü™XÛÝ™\žJ
+NÜ™]\›‚ˆžN‚ˆžNˆ]O[ØYÜ›Ú™XÝ
+Ù[‹œ™XÛÝ™\žWÜ][Ý×ÛZ\ÜÚ[™ÏUYJBˆ^Ù\
+ÔÑ\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆYˆ›Ý™]š[Ý\Ëš\×Ùš[J
+Nˆ˜Z\ÙBˆYˆÙ[‹œ™XÛÝ™\žWÜ]š\×Ùš[J
+NˆÚ][˜ÛÜLŠÙ[‹œ™XÛÝ™\žWÜ]Ù[‹œÝ]WÙ\‹Ù‰Ü™XÛÝ™\žK][œ™XYX›K^Ý]ZY]ZY
+
+Kš^ÎŽ_K™œ˜[YXÝ]	ÊBˆ]O[ØYÜ›Ú™XÝ
+™]š[Ý\Ë[Ý×ÛZ\ÜÚ[™ÏUYJBˆÙ[‹˜\WÜ›Ú™XÝ
+]K]K™Ù]
+	ÛÜšYÚ[‰ÊJNÜÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	Ð]]ÜØ]™HÚYY\š\™Ù\Ý[ˆš]H[È›Ú™ZÝÜZXÚ\›‹‰ÊBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÈÙY\[œ™XYX›H™XÛÝ™\žH]H]™[ˆYˆH™]ÈÙ\ÜÚ[Ûˆ\ÈÝXœÙ\]Y[HØ]™Y‚ˆ˜XÚÝ\\Ù[‹œÝ]WÙ\‹Ù‰Ü™XÛÝ™\žK][œ™XYX›K^Ý]ZY]ZY
+
+Kš^ÎŽ_K™œ˜[YXÝ]	ÂˆžN‚ˆÚ][˜ÛÜLŠÙ[‹œ™XÛÝ™\žWÜ]˜XÚÝ\
+BˆÙ[‹™\œ›ÜŠ‰ÔÚXÚ\[™ÈÛÛ›HšXÚÙ[Y[ˆÙ\™[‹ˆZ[™HÛÜYHYYÝ[\Ž—žØ˜XÚÝ\W—žÙ^ßIÊBˆ^Ù\ÔÑ\œ›ÜŽ‚ˆÙ[‹œ™XÛÝ™\žWÙ[˜X›YQ˜[ÙBˆÙ[‹™\œ›ÜŠ	ÔÚXÚ\[™ÈÛÛ›HšXÚÙ[Y[ˆÙ\™[ŽÈ]]ÜØ]™H›ZX[HØÚ]ˆY\Ù\ˆ]ZHXZÝ]šY\—‰ÊÜÝŠ^ÊJB‚ˆYˆØ]™JÙ[‹Ø]™WØ\ÏQ˜[ÙJN‚ˆYˆÙ[‹ÛÜšÙ\Žœ™]\›ˆ˜[ÙBˆ]S›Û™HYˆØ]™WØ\È[ÙHÙ[‹œ›Ú™XÝÜ]ˆYˆ›Ý]‚ˆ]ÏTQš[QX[ÙË™Ù]Ø]™Qš[S˜[YJÙ[‹	Ô›Ú™ZÝÜZXÚ\›‰ËÙ[‹œ›Ú™XÝÜ]ÜˆÙ[‹œÝYÙÙ\ÝYÛ˜[YK	Ñœ˜[YXÝ]
+
+‹™œ˜[YXÝ]
+IËÜ[ÛœÏTQš[QX[ÙË‘ÛÛÛ™š\›SÝ™\Üš]JBˆYˆ›Ý]œ™]\›ˆ˜[ÙBˆYˆ›Ý]›ÝÙ\Š
+K™[™ÝÚ]
+	Ë™œ˜[YXÝ]	ÊNœ]
+ÏIË™œ˜[YXÝ]	ÂˆYˆ]
+]
+K™^\ÝÊ
+H[™SY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	Ô›Ú™ZÝ\œÙ]™[ÉË‰ÞÜ]W°ï™\œØÚ™ZX™[ÉËSY\ÜØYÙP›Þ–Y\ßSY\ÜØYÙP›Þ“›ËSY\ÜØYÙP›Þ“›ÊHOTSY\ÜØYÙP›Þ–Y\Îœ™]\›ˆ˜[ÙBˆžN‚ˆØ]™WÜ›Ú™XÝ
+]Ù[‹˜Û\ËÙ[‹œ™\Ù]˜Ý\œ™[^
+
+KÙ[‹˜XÚÜËÙ[‹˜\ÜÙ]Ë›Û™KÙ[‹˜XÚ×ÜÝ]\ËÙ[‹˜XÚ×Û˜[Y\ËÙ[‹›X\šÙ\œËÙ[‹›X\Ý\—ÛZ^\ŠBˆÙ[‹œ›Ú™XÝÜ]\ÝŠ]
+]
+Kœ™\ÛÛ™J
+JNÜÙ[‹™\OQ˜[ÙNÜÙ[‹˜ÛX\—Ü™XÛÝ™\žJ
+BˆÙ[‹œÙ]Ú[™ÝÕ]J‰Ñœ˜[YXÝ]ÐTÕ‘T”ÒSÓŸH0­È	ÊÔ]
+]
+KœÝ[JNÜÙ[‹˜]]ÜØ]™WÛX™[œÙ]^
+	Ô›Ú™ZÝÙ\ÜZXÚ\8§$ÉÊNÜÙ[‹\]WÜ›Ú™XÝÚY[]J
+NÜ™]\›ˆYBˆ^Ù\^Ù\[Ûˆ\È^ÎœÙ[‹™\œ›ÜŠ^ÊNÜ™]\›ˆ˜[ÙB‚ˆYˆØ[—Ù\ØØ\™
+Ù[ŠN‚ˆYˆ›ÝÙ[‹™\Nœ™]\›ˆYBˆ[œÝÙ\TSY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	Ô›Ú™ZÝÜZXÚ\›ÉË	Ñ\ÈÚX[™Ù\ÜZXÚ\H0á™\[™Ù[‹‰ËSY\ÜØYÙP›Þ”Ø]™_SY\ÜØYÙP›Þ‘\ØØ\™SY\ÜØYÙP›ÞØ[˜Ù[SY\ÜØYÙP›Þ”Ø]™JBˆ™]\›ˆÙ[‹œØ]™J
+HYˆ[œÝÙ\OTSY\ÜØYÙP›Þ”Ø]™H[ÙH[œÝÙ\OTSY\ÜØYÙP›Þ‘\ØØ\™‚ˆYˆ\WÜ›Ú™XÝ
+Ù[‹]K]
+N‚ˆÙ[‹œ›Ú™XÝÜÙ\ÜÚ[ÛYÙ]]ŠÙ[‹	Ü›Ú™XÝÜÙ\ÜÚ[Û‰Ë
+JÌBˆÙ[‹˜Ø[˜Ù[Ú[\˜XÝ[ÛŠ
+Bˆ›ÜˆÙ^K
+›Ø‹ÊH[ˆÙ[‹š[™\[™[Ú›ØœËš][\Ê
+N‚ˆYˆÙ^HOIÙ^Ü	Îˆ›Ø‹˜Ø[˜Ù[œÙ]
+
+BˆÙ[‹˜Ø[˜Ù[Ü™]šY]ÊØZ]UYJNÈÙ[‹œ™]šY]×Ü]Y]YYQ˜[ÙNÈÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYQ˜[ÙBˆÙ[‹˜[œÜÜÜÝÜ
+
+BˆÙ[‹œ^Y\‹œÝÜ
+
+NÜÙ[‹œ[™[™×ÜÙYZÏS›Û™NÜÙ[‹œ^Y\‹œÙ]ÛÝ\˜ÙJU\›
+
+JNÜÙ[‹šY[×ÜÝXÚËœÙ]Ý\œ™[[™^
+
+BˆÙ[‹˜Û\ÏY]VÉØÛ\É×NÜÙ[‹˜XÚÜÏY]VÉÝ˜XÚÜÉ×NÜÙ[‹˜XÚ×ÜÝ]\Ï[›Ü›X[^™WÝ˜XÚ×ÜÝ]\Ê]K™Ù]
+	Ý˜XÚ×ÜÝ]\ÉÊKÙ[‹˜XÚÜÊNÜÙ[‹˜XÚ×Û˜[Y\Ï[›Ü›X[^™WÝ˜XÚ×Û˜[Y\Ê]K™Ù]
+	Ý˜XÚ×Û˜[Y\ÉÊKÙ[‹˜XÚÜÊNÜÙ[‹›X\Ý\—ÛZ^\[›Ü›X[^™WÛX\Ý\—ÛZ^\Š]K™Ù]
+	ÛZ^\‰ÊJNÜÙ[‹˜\ÜÙ]ÏY]VÉØ\ÜÙ]É×NÜÙ[‹›X\šÙ\œÏ[›Ü›X[^™WÛX\šÙ\œÊ]K™Ù]
+	ÛX\šÙ\œÉÊK[™Ý
+Ù[‹˜Û\ÊJNÜÙ[‹œ›Ú™XÝÜ]\]ˆÙ[‹›Z\ÜÚ[™×ÛYYXO[\Ý
+]K™Ù]
+	ÛZ\ÜÚ[™×ÛYYXIË×JJNÜÙ[‹œ›ÞWÙ[˜X›YQ˜[ÙNÜÙ[‹œ›ÞWÛX\^ßNÜÙ[‹œ›ÞWÙ\™XÝÜžOS›Û™NÜÙ[‹˜]]×Ü›ÞWÜÛÝ\˜Ù\Ï\Ù]
+
+BˆÙ[‹œ›ÞWØ›Þ˜›ØÚÔÚYÛ˜[ÊYJNÜÙ[‹œ›ÞWØ›ÞœÙ]ÚXÚÙY
+˜[ÙJNÜÙ[‹œ›ÞWØ›Þ˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆÙ[‹˜Ý\œ™[\Ù[‹˜Û\ÖÌKZYYˆÙ[‹˜Û\È[ÙH›Û™NÜÙ[‹œÙ[XÝ[ÛVÜÙ[‹˜Ý\œ™[HYˆÙ[‹˜Ý\œ™[[ÙH×NÜÙ[‹œ^ZXYLˆÙ[‹œÛÝ\˜ÙWØÛ\ÝZYS›Û™NÜÙ[‹œÛÝ\˜ÙWÚ[S›Û™NÜÙ[‹œÛÝ\˜ÙWÛÝ]S›Û™BˆÙ[‹ÛÜš×Ú[S›Û™NÜÙ[‹ÛÜš×ÛÝ]S›Û™BˆÙ[‹š\ÝÜžK˜ÛX\Š
+NÜÙ[‹™]\™K˜ÛX\Š
+NÜÙ[‹œ™]š\Ú[ÛŠÏLNÜÙ[‹œ™]šY]×Ü™]š\Ú[ÛKLNÜÙ[‹œ™]šY]×ÜÚYÛ˜]\™OS›Û™NÜÙ[‹œ™]šY]×Ü]S›Û™BˆÙ[‹™\™XÝÜ™]šY]ÏQ˜[ÙNÜÙ[‹™\™XÝÜ™]šY]×Ü™]š\Ú[ÛKLNÜÙ[‹™\™XÝÜ™]šY]×ÜÚYÛ˜]\™OS›Û™NÜÙ[‹™\™XÝØÛ\ÝZYS›Û™BˆÙ[‹š\ÝÜžWÛX™[Ë˜ÛX\Š
+NÜÙ[‹™]\™WÛX™[Ë˜ÛX\Š
+NÜÙ[‹œ™Yœ™\ÚÚ\ÝÜžJ
+BˆÙ[‹›\ÝØ]]ÜØ]™OS›Û™NÜÙ[‹˜]]ÜØ]™WÜ™]š\Ú[ÛKLBˆÙ[‹œ™\Ù]˜›ØÚÔÚYÛ˜[ÊYJNÜÙ[‹œ™\Ù]œÙ]Ý\œ™[^
+]VÉÜ™\Ù]	×HYˆ]VÉÜ™\Ù]	×H[ˆ‘TÑUÈ[ÙH™^
+]\Š‘TÑUÊJJNÜÙ[‹œ™\Ù]˜›ØÚÔÚYÛ˜[Ê˜[ÙJBˆÙ[‹›[ÙOIÝ[Y[[™IÎÜÙ[‹™\OQ˜[ÙNÜÙ[‹œ™\\™WÝš\ÝX[ÊÙ[‹˜\ÜÙ]ÊNÜÙ[‹œ™Yœ™\ÚÛYYXJ
+NÜÙ[‹œ™Yœ™\Ú
+
+BˆÙ[‹œXÙZÛ\‹œÙ]^
+	ø¥­ˆ[Y[[™H™\™XÚ™]YHYZœÜ\‹U›ÜœØÚ]K—¸ 'Û\[œÙZ[¸ '™ZYÝÛÙ›ÜYH]Y[K‰ÊBˆÙ[‹œ™]šY]×ÜÝ]\ËœÙ]^
+	Õ[Y[[™HÙ[Y[ˆ0­È›ÜœØÚ]H›ØÚšXÚ™\™XÚ™]	ÊBˆÙ[‹œÙ]Ú[™ÝÕ]J‰Ñœ˜[YXÝ]ÐTÕ‘T”ÒSÓŸH0­È	ÊÊ]
+]
+KœÝ[HYˆ][ÙH	Ó™]Y\È›Ú™ZÝ	ÊJNÈÙ[‹\]WÜ›Ú™XÝÚY[]J
+BˆÈ™K[Ü[™Y›Ú™XÝÈÚÝ[Ù]HØ[YH[œÝ[\^X˜XÚÈ[™\™ÙKYš[BˆÈ›ÞH™X]Y[\È™]ÛHY]Y[Y[[™\ËÚ]Ý]ØZ][™È›ÜˆBˆÈš\œÝ^H]Ûˆ™\ÜË‚ˆU[Y\‹œÚ[™ÛTÚÝ
+Ù[‹™[œÝ\™WÛZ\ÜÚ[™×Ü›ÞY\ÊB‚ˆYˆÜ[—Ü›Ú™XÝÜ]
+Ù[‹]
+N‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹˜Ø[—Ù\ØØ\™
+
+Nœ™]\›‚ˆžN‚ˆÙ[XÝYT]
+]
+Kœ™\ÛÛ™J
+Bˆ›Ú™XÝÜ]\Ù[XÝYˆYˆÙ[XÝYœÝY™š^›ÝÙ\Š
+OOIËžš\	Î‚ˆ^˜XÝY\Ù[‹œÝ]WÙ\‹ÉØ\˜Ú]™\ÉËÝ]ZY]ZY
+
+Kš^ˆ›Ú™XÝÜ]T]
+^˜XÝÜ›Ú™XÝØ\˜Ú]™JÙ[XÝY^˜XÝY
+JBˆ]O[ØYÜ›Ú™XÝ
+›Ú™XÝÜ][Ý×ÛZ\ÜÚ[™ÏUYJBˆÙ[‹˜ÛX\—Ü™XÛÝ™\žJ
+NÜÙ[‹˜\WÜ›Ú™XÝ
+]K›Û™HYˆ]VÉÛZYÜ˜]Y	×H[ÙHÝŠ›Ú™XÝÜ]
+JBˆYˆ]VÉÛZYÜ˜]Y	×N‚ˆÙ[‹œÝYÙÙ\ÝYÛ˜[YO\ÝŠ]
+]
+KÚ]Û˜[YJ]
+]
+KœÝ[JÉË]Œ‹™œ˜[YXÝ]	ÊJNÜÙ[‹˜Ú[™ÙY
+
+BˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ	ÌŒKT›Ú™ZÝ0ï™\››Û[Y[‹ˆÜZXÚ\›ˆYÝZ[™H™]YHŒ‹Q]ZH[‹‰ÊBˆ[Yˆ]K™Ù]
+	ÛZ\ÜÚ[™×ÛYYXIÊN‚ˆZ\ÜÚ[™Ï[\Ý
+]VÉÛZ\ÜÚ[™×ÛYYXI×JBˆÙ[‹œÝ]\Ð˜\Š
+KœÚÝÓY\ÜØYÙJ‰ÞÛ[ŠZ\ÜÚ[™Ê_HYYY[ˆ™Z[ˆ0­È8 '“YYY[ˆ™]H™\šÛ°ï™[¸ )¸ 'ðé[‰ËŒ
+BˆU[Y\‹œÚ[™ÛTÚÝ
+[X™HZ\ÜÚ[™Ï[Z\ÜÚ[™ÎœÙ[‹œ™[[š×ÛYYXJZ\ÜÚ[™ÊJBˆ™]\›ˆYBˆ^Ù\^Ù\[Ûˆ\È^ÎœÙ[‹™\œ›ÜŠ^ÊNÜ™]\›ˆ˜[ÙB‚ˆYˆÜ[—Ü›Ú™XÝ
+Ù[ŠN‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹˜Ø[—Ù\ØØ\™
+
+Nœ™]\›‚ˆ]ÏTQš[QX[ÙË™Ù]Ü[‘š[S˜[YJÙ[‹	Ô›Ú™ZÝ0í™™›™[‰Ë	ÉË	Ñœ˜[YXÝ]
+
+‹™œ˜[YXÝ]
+‹žš\
+NÎÑœ˜[YXÝ]T›Ú™ZÝ
+
+‹™œ˜[YXÝ]
+NÎÑœ˜[YXÝ]P\˜Ú]ˆ
+
+‹žš\
+IÊBˆYˆ]œÙ[‹›Ü[—Ü›Ú™XÝÜ]
+]
+B‚ˆYˆ™]×Ü›Ú™XÝ
+Ù[ŠN‚ˆYˆÙ[‹ÛÜšÙ\ˆÜˆ›ÝÙ[‹˜Ø[—Ù\ØØ\™
+
+Nœ™]\›‚ˆÙ[‹˜ÛX\—Ü™XÛÝ™\žJ
+NÜÙ[‹˜\WÜ›Ú™XÝ
+ÉØÛ\ÉÎ–×K	Ø\ÜÙ]ÉÎ–×K	Ý˜XÚÜÉÎ–Ì‹KLKL—K	Ý˜XÚ×ÜÝ]\ÉÎžßK	Ý˜XÚ×Û˜[Y\ÉÎžßK	ÛX\šÙ\œÉÎ–×K	ÛZ^\‰Î››Ü›X[^™WÛX\Ý\—ÛZ^\Š›Û™JK	Ü™\Ù]	Î›™^
+]\Š‘TÑUÊJ_K›Û™JBˆÙ[‹œÝYÙÙ\ÝYÛ˜[YOIÓYZ[‹Qš[K™œ˜[YXÝ]	ÎÜÙ[‹˜]]ÜØ]™WÛX™[œÙ]^
+	Ð]]ÜØ]™H™\™Z]	ÊNÈÙ[‹\]WÜ›Ú™XÝÚY[]J
+B‚ˆYˆÛÜÙQ]™[
+Ù[‹]™[
+N‚ˆYˆÙ[‹ÛÜšÙ\Ž‚ˆÙ[‹™\œ›ÜŠ	Ðš]H[ˆ]Y™[™[ˆ›Ü™Ø[™ÈY\œÝXœØÚYpçÙ[ˆÙ\ˆX˜œ™XÚ[‹‰ÊNÙ]™[šYÛ›Ü™J
+NÜ™]\›‚ˆYˆÙ[‹š[™\[™[Ú›ØœÎ‚ˆ[œÝÙ\TSY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	Ò[\™Ü[™]Y™ØX™[ˆX˜œ™XÚ[ÉËˆ	Ò[\Ü›ÞKQ\ž™]YÝ[™ÈÙ\ˆ^Ü]Y™[ˆ›ØÚˆÚXÚ\ˆX˜œ™XÚ[ˆ[™ØÚYpçÙ[ÉËˆSY\ÜØYÙP›Þ–Y\ßSY\ÜØYÙP›Þ“›ËSY\ÜØYÙP›Þ“›ÊBˆYˆ[œÝÙ\ˆOTSY\ÜØYÙP›Þ–Y\Îˆ]™[šYÛ›Ü™J
+NÈ™]\›‚ˆYˆÙ[‹œ™[™\—Ü]Y]YN‚ˆ[œÝÙ\TSY\ÜØYÙP›Þœ]Y\Ý[ÛŠÙ[‹	Ô™[™\‹T]Y]YHØÚYpçÙ[ÉËˆ‰ÞÛ[ŠÙ[‹œ™[™\—Ü]Y]YJ_H^ÜHÚ[™›ØÚZ[™Ù\™ZZ[™Ù\™[ˆ™Z[HØÚYpçÙ[ˆ™\ÛÜ™™[‹‰ËˆSY\ÜØYÙP›Þ–Y\ßSY\ÜØYÙP›Þ“›ËSY\ÜØYÙP›Þ“›ÊBˆYˆ[œÝÙ\ˆOTSY\ÜØYÙP›Þ–Y\Î‚ˆ]™[šYÛ›Ü™J
+NÜ™]\›‚ˆÙ[‹œ™[™\—Ü]Y]YK˜ÛX\Š
+NÈÙ[‹\]WÜ™[™\—Ü]Y]YWØ]ÛŠ
+BˆYˆÙ[‹˜Ø[—Ù\ØØ\™
+
+N‚ˆÙ[‹˜ÛÛ\\™WÜ™[X\ÙY
+
+BˆÙ[‹—ØÛÜÚ[™ÏUYBˆÙ[‹˜ÛÜÙWÜÛ[ÛÝ
+
+BˆYˆÙ[‹˜Ú[™[XWÙX[ÙÈ\È›Ý›Û™N‚ˆÙ[‹˜Ú[™[XWÙX[ÙË˜ÛÜÙJ
+BˆÙ[‹˜]]ÜØ]™WÝ[Y\‹œÝÜ
+
+NÈÙ[‹›]™WÜ™]šY]×Ý[Y\‹œÝÜ
+
+NÈÙ[‹˜[œÜÜÝ[Y\‹œÝÜ
+
+BˆÙ[‹œ™]šY]×Ü]Y]YYQ˜[ÙNÈÙ[‹œ™]šY]×Ü^WÜ™\]Y\ÝYQ˜[ÙBˆÙ[‹˜[œÜÜÜÝÜ
+
+BˆÙ[‹˜Ø[˜Ù[Ü™]šY]ÊØZ]UYJBˆ›Üˆ]šX]H[ˆ
+	Ý\]WÚ›Ø‰Ë	Ý\]WÙÝÛ›ØYÚ›Ø‰ÊN‚ˆ›ØYÙ]]ŠÙ[‹]šX]K›Û™JBˆYˆ›Øˆ\È›Ý›Û™N‚ˆ›Ø‹œ™\]Y\Ý[\œ\[ÛŠ
+NÈ›Ø‹ØZ]
+
+NÈÙ]]ŠÙ[‹]šX]K›Û™JNÈ›Ø‹™[]S]\Š
+BˆÙ[‹˜ÛX\—Ü™XÛÝ™\žJ
+NÜÙ[‹œ^Y\‹œÝÜ
+
+NÜÙ[‹œ^Y\‹œÙ]ÛÝ\˜ÙJU\›
+
+JNÜÙ[‹˜ØXÚK˜ÛX[\
+
+NÙ]™[˜XØÙ\
+
+Bˆ[ÙN™]™[šYÛ›Ü™J
+B‚‚™YˆXZ[Š
+N‚ˆ\TP\XØ][ÛŠÞ\Ë˜\™ÝŠNØ\œÙ]\XØ][Û“˜[YJ	Ñœ˜[YXÝ]	ÊNØ\œÙ]Ý[J	Ñ\Ú[Û‰ÊNØ\œÙ]Ý[TÚY]
+ÕSJBˆXÛÛX\ÚXÛÛ—Ü]
+
+BˆYˆXÛÛ‹š\×Ùš[J
+N‚ˆ\œÙ]Ú[™ÝÒXÛÛŠRXÛÛŠÝŠXÛÛŠJJBˆYˆ\Ø]Š\	ÜÙ]\ÚÝÜš[S˜[YIÊN‚ˆ\œÙ]\ÚÝÜš[S˜[YJ	Ùœ˜[YXÝ]	ÊBˆYˆ›ÝÚ][ÚXÚ
+	Ù™›\YÉÊHÜˆ›ÝÚ][ÚXÚ
+	Ù™œ›Ø™IÊN‚ˆSY\ÜØYÙP›Þ˜Üš]XØ[
+›Û™K	Ñ‘›\YÈ™Z	Ë	Ðš]H[œÝ[Y\™[ŽˆÝYÈ\[œÝ[™›\YÉÊNÜ™]\›ˆBˆÝ]O\Ý]WÙ\™XÝÜžJ
+NÛØÚÏTSØÚÑš[JÝŠÝ]KÉÙY]Ü‹›ØÚÉÊJNÛØÚËœÙ]Ý[SØÚÕ[YJ
+BˆYˆ›ÝØÚËžSØÚÊL
+N‚ˆSY\ÜØYÙP›ÞØ\›š[™Ê›Û™K	Ñœ˜[YXÝ]0éY™\™Z]ÉË‰Ðš]H]™H\È™\™Z]ÈÙpí™™›™]Hœ˜[YXÝ]^ÐTÕ‘T”ÒSÓŸKQ™[œÝ\‹‰ÊNÜ™]\›ˆBˆÚ[™ÝÏQY]ÜŠÝ]JNÝÚ[™ÝËœÚÝÊ
+Bˆ›Ú™XÝØ\™Ý[Y[[™^
+
+\™Ý[Y[›Üˆ\™Ý[Y[[ˆÞ\Ë˜\™Ý–ÌN—HYˆ]
+\™Ý[Y[
+KœÝY™š^›ÝÙ\Š
+H[ˆ
+	Ë™œ˜[YXÝ]	Ë	Ëžš\	ÊJK›Û™JBˆYˆ›Ú™XÝØ\™Ý[Y[‚ˆU[Y\‹œÚ[™ÛTÚÝ
+[X™H]\›Ú™XÝØ\™Ý[Y[Ú[™ÝË›Ü[—Ü›Ú™XÝÜ]
+]
+JBˆ™\Ý[X\™^XÊ
+NÛØÚË[›ØÚÊ
+NÜ™]\›ˆ™\Ý[‚‚šYˆ×Û˜[YW×ÏOI××ÛXZ[—×ÉÎœÞ\Ë™^]
+XZ[Š
+JB

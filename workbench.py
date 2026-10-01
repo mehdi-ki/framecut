@@ -294,15 +294,34 @@ class SmoothWorkbench:
 
     def ensure_missing_proxies(self):
         if self._closing or self.worker or not self.proxy_enabled or 'proxy' in self.independent_jobs: return
-        sources={str(Path(c.path).resolve()) for c in self.clips
+        sources={str(Path(c.path).resolve()) for c in getattr(self,'assets',[])+self.clips
                  if c.path and c.kind in ('video','audio') and c.source_type not in ('image','image_sequence')}
         if sources-set(self.proxy_map): self.start_proxy_generation()
+
+    @staticmethod
+    def visual_key(path):
+        """Return one canonical key for posters and waveforms.
+
+        Projects created before the media-bin refresh could contain a relative
+        or differently-normalized path. Keeping one key here prevents a
+        generated waveform from being stored under a name the timeline cannot
+        find later.
+        """
+        if not path:
+            return ''
+        try:
+            return str(Path(path).expanduser().resolve())
+        except (OSError, RuntimeError, TypeError):
+            return str(path)
 
     def queue_visuals(self,assets):
         if not hasattr(self,'visual_pending'): return
         for asset in assets:
-            if asset.path and (asset.path not in self.thumbnails or (asset.has_audio and asset.path not in self.waveforms)):
-                self.visual_pending[asset.path]=replace(asset)
+            source_path=self.visual_key(asset.path)
+            if source_path and (source_path not in self.thumbnails
+                                or ((asset.has_audio or asset.kind == 'audio')
+                                    and source_path not in self.waveforms)):
+                self.visual_pending[source_path]=replace(asset,path=source_path)
         if self.visual_job or not self.visual_pending or self._closing: return
         assets=list(self.visual_pending.values()); self.visual_pending.clear(); root=self.thumbnail_cache
         thumbnails=dict(self.thumbnails); waveforms=dict(self.waveforms)
@@ -311,8 +330,9 @@ class SmoothWorkbench:
             for index,asset in enumerate(assets):
                 if cancel.is_set(): break
                 try:
-                    stat=Path(asset.path).stat(); key=f'{asset.path}:{stat.st_mtime_ns}:{stat.st_size}'
-                    if asset.kind=='video' and asset.path not in thumbnails:
+                    source_path=self.visual_key(asset.path)
+                    stat=Path(source_path).stat(); key=f'{source_path}:{stat.st_mtime_ns}:{stat.st_size}'
+                    if asset.kind=='video' and source_path not in thumbnails:
                         target=root/(uuid.uuid5(uuid.NAMESPACE_URL,key).hex+'.jpg')
                         if asset.source_type in ('image','image_sequence'):
                             image=QImage(asset.source_paths[0] if asset.source_paths else asset.path)
@@ -321,15 +341,15 @@ class SmoothWorkbench:
                                 subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-ss',str(min(.5,asset.duration*.08)),
                                     '-i',asset.path,'-frames:v','1','-vf','scale=320:-2','-threads','1',str(target)],check=True,timeout=12,capture_output=True)
                             image=QImage(str(target))
-                        if not image.isNull(): posters[asset.path]=image.scaled(320,180,Qt.KeepAspectRatio,Qt.SmoothTransformation)
-                    if (asset.has_audio or asset.kind=='audio') and asset.path not in waveforms:
+                        if not image.isNull(): posters[source_path]=image.scaled(320,180,Qt.KeepAspectRatio,Qt.SmoothTransformation)
+                    if (asset.has_audio or asset.kind=='audio') and source_path not in waveforms:
                         target=root/(uuid.uuid5(uuid.NAMESPACE_URL,key+'-wave-v3').hex+'.png')
                         if not target.exists():
                             subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-i',asset.path,
                                 '-filter_complex','showwavespic=s=1200x180:colors=63ead4:scale=sqrt:draw=full:filter=peak',
                                 '-frames:v','1','-threads','1',str(target)],check=True,timeout=20,capture_output=True)
                         image=QImage(str(target))
-                        if not image.isNull(): waves[asset.path]=image
+                        if not image.isNull(): waves[source_path]=image
                 except (OSError,subprocess.SubprocessError): pass
                 progress(round((index+1)/len(assets)*100))
             return posters,waves

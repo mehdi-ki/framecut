@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 import unittest
+import wave
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from PySide6.QtGui import QImage, QDragEnterEvent, QDragMoveEvent, QDropEvent, Q
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 from app import Editor, ExportDialog, MixerDialog
+from asset_library import LIBRARY_MIME, library_items, library_sound_path
 from core import Clip, import_clip, load_project, save_project, render, probe
 from timeline import ASSET_MIME
 from ux import error_guidance, load_preferences, line_icon, without_visual_effects
@@ -144,6 +146,86 @@ class SmoothWorkflowTest(unittest.TestCase):
         self.assertIsNotNone(w.timeline.drop_preview); self.assertFalse(w.timeline.ghost_valid)
         drop=QDropEvent(QPointF(point),Qt.CopyAction,mime,Qt.LeftButton,Qt.NoModifier)
         QApplication.sendEvent(w.timeline,drop); self.assertFalse(drop.isAccepted()); self.assertEqual(len(w.clips),1)
+
+    def test_asset_library_filters_and_generates_offline_sound(self):
+        w=self.w
+        items=library_items()
+        self.assertGreaterEqual(len(items),20)
+        self.assertEqual({item.category for item in items}, {'sounds','effects','animations','transitions'})
+        sound=library_sound_path('sound_pop',self.root)
+        self.assertTrue(sound.is_file())
+        with wave.open(str(sound),'rb') as stream:
+            self.assertEqual(stream.getnchannels(),1)
+            self.assertEqual(stream.getsampwidth(),2)
+            self.assertGreater(stream.getnframes(),1000)
+        w.open_library_panel(); self.assertEqual(w.asset_library_panel.list.count(),len(items))
+        w.asset_library_panel.search.setText('cinematic')
+        self.assertEqual(w.asset_library_panel.list.count(),2)  # Look + Dip to Black
+        w.asset_library_panel.search.clear(); w.asset_library_panel.category.setCurrentIndex(1)
+        self.assertEqual(w.asset_library_panel.list.count(),6)
+
+    def test_asset_library_applies_effect_animation_and_transition(self):
+        w=self.w; clip=self.add_video(end=3)
+        w.use_library_item('effect_cinematic')
+        self.assertEqual(w.current_clip().effect_preset,'cinematic')
+        self.assertEqual(w.current_clip().filter_preset,'cinematic')
+        w.use_library_item('animation_zoom_in')
+        self.assertEqual(len(w.current_clip().keyframes),2)
+        self.assertEqual(w.current_clip().keyframes[-1]['curve'],'ease_in_out')
+        second=self.add_video(position=3)
+        w.set_selection([second.uid],second.uid); w.refresh()
+        w.use_library_item('transition_dissolve')
+        self.assertEqual(w.current_clip().transition_type,'dissolve')
+        self.assertAlmostEqual(w.current_clip().transition_duration,.5)
+        self.assertFalse(self.errors)
+
+    def test_asset_library_sound_button_and_timeline_drag(self):
+        w=self.w
+        w.use_library_item('sound_pop')
+        self.assertEqual(len(w.clips),1)
+        self.assertEqual(w.current_clip().display_name,'Pop')
+        self.assertTrue(Path(w.current_clip().path).is_file())
+        w.undo(); self.assertFalse(w.clips)
+        mime=QMimeData(); mime.setData(LIBRARY_MIME,b'sound_click')
+        point=QPoint(w.timeline.LEFT+240,w.timeline.TOP+3*w.timeline.ROW+20)
+        enter=QDragEnterEvent(point,Qt.CopyAction,mime,Qt.LeftButton,Qt.NoModifier)
+        QApplication.sendEvent(w.timeline,enter); self.assertTrue(enter.isAccepted())
+        drop=QDropEvent(QPointF(point),Qt.CopyAction,mime,Qt.LeftButton,Qt.NoModifier)
+        QApplication.sendEvent(w.timeline,drop)
+        self.assertTrue(drop.isAccepted()); self.assertEqual(len(w.clips),1)
+        self.assertEqual(w.clips[0].track,-2); self.assertEqual(w.clips[0].display_name,'Click')
+        self.assertFalse(self.errors)
+
+    def test_plain_video_uses_direct_preview_after_cut(self):
+        w=self.w; clip=self.add_video(end=3)
+        w.changed()
+        self.assertTrue(w.direct_preview_is_current())
+        self.assertIsNone(w.preview_worker)
+        with patch('app.render') as render_mock:
+            w.toggle_play()
+            render_mock.assert_not_called()
+        w.transport_stop(); w.set_playhead(1.0); w.split()
+        self.assertEqual(len(w.clips),2)
+        self.assertTrue(w.direct_preview_is_current())
+        self.assertIsNone(w.preview_worker)
+        self.assertFalse(self.errors)
+
+    def test_large_source_starts_proxy_without_blocking_direct_preview(self):
+        w=self.w; original=self.add_video(end=3)
+        large=self.root/'large-source.mp4'
+        large.write_bytes(Path(original.path).read_bytes())
+        with large.open('r+b') as handle:
+            handle.seek(256*1024*1024)
+            handle.write(b'\0')
+        clip=replace(original,path=str(large),source_paths=[str(large)])
+        w.clips=[clip]; w.assets=[clip]; w.refresh_media(); w.refresh()
+        with patch.object(w,'start_proxy_generation') as start_proxy:
+            self.assertTrue(w.maybe_start_auto_proxy())
+            start_proxy.assert_called_once()
+        self.assertTrue(w.proxy_enabled)
+        self.assertTrue(w.direct_preview_is_current())
+        self.assertIn(str(large.resolve()),w.auto_proxy_sources)
+        self.assertFalse(self.errors)
 
     def test_middle_pan_and_follow_suspension(self):
         w=self.w; self.add_video(position=50); QTest.qWait(30)

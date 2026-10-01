@@ -1,4 +1,4 @@
-"""Framecut 3.23.0 — native Linux multitrack editor."""
+"""Framecut 3.24.0 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -30,6 +30,8 @@ from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_
                   trim_timeline_range,close_track_gaps,copy_keyframe_bundle,paste_keyframe_bundle,
                   write_chapter_file,capture_frame)
 from timeline import Timeline,MediaList
+from asset_library import (AssetLibraryPanel, get_library_item, library_items,
+                           library_sound_path)
 from style import STYLE
 from ux import FineDoubleSpinBox as QDoubleSpinBox, line_icon
 from workbench import SmoothWorkbench, HISTORY_NAMES
@@ -41,9 +43,9 @@ from ai_tools import (AIToolError, remove_background_media, track_motion, auto_r
                        analyze_beats, detect_scene_changes, detect_audio_onset)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.23.0'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.24.0'
 except OSError:
-    APP_VERSION = '3.23.0'
+    APP_VERSION = '3.24.0'
 
 
 def label(text,name=None):
@@ -972,7 +974,14 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.history=[]; self.future=[]; self.dirty=False; self.revision=0
         self.preview_revision=-1; self.preview_signature=None; self.preview_path=None
         self.preview_worker=None; self.preview_queued=False; self.preview_play_requested=False
+        # A plain, contiguous video timeline does not need an FFmpeg
+        # composition render just to cut and play it.  The direct backend
+        # keeps the source in QMediaPlayer and switches only when the playhead
+        # crosses a cut.  Complex timelines still use the rendered backend.
+        self.direct_preview=False; self.direct_preview_revision=-1
+        self.direct_preview_signature=None; self.direct_clip_uid=None
         self.missing_media=[]; self.proxy_enabled=False; self.proxy_map={}; self.proxy_directory=None; self.proxy_profile='360p'
+        self.auto_proxy_sources=set()
         self.gpu_preview_info=preview_acceleration_info()
         self.render_queue=[]; self.render_current=None; self.render_queue_paused=False
         self.mode='timeline'; self.playhead=0.0
@@ -992,6 +1001,10 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.setWindowTitle(f'Framecut {APP_VERSION} · Neues Projekt')
         self.resize(1460,980); self.setMinimumSize(1120,740)
         self.player=QMediaPlayer(self); self.audio=QAudioOutput(self); self.player.setAudioOutput(self.audio)
+        # Library previews use a separate player so they never disturb the
+        # timeline/source monitor state.
+        self.library_player=QMediaPlayer(self); self.library_audio=QAudioOutput(self)
+        self.library_audio.setVolume(.8); self.library_player.setAudioOutput(self.library_audio)
         self.player.positionChanged.connect(self.position_changed)
         self.player.mediaStatusChanged.connect(self.media_ready)
         self.player.errorOccurred.connect(lambda *_:self.statusBar().showMessage('Vorschau: '+self.player.errorString()))
@@ -1081,7 +1094,8 @@ class Editor(SmoothWorkbench,QMainWindow):
                 if callback: callback()
             tab.clicked.connect(activate); mode_layout.addWidget(tab)
             return tab
-        mode_tab('Medien',lambda:self.media_search.setFocus(),True,'Medienablage öffnen')
+        mode_tab('Medien',self.open_media_panel,True,'Medienablage öffnen')
+        mode_tab('Bibliothek',self.open_library_panel,tooltip='Starter-Bibliothek mit Sounds, Effekten und Animationen öffnen')
         mode_tab('Audio',self.open_mixer,tooltip='Audio-Mixer öffnen')
         mode_tab('Text',self.add_text,tooltip='Textclip am Spurende anlegen')
         mode_tab('Sticker',lambda:self.statusBar().showMessage('Sticker-Bereich · eigene Medien lassen sich über Import hinzufügen'))
@@ -1115,13 +1129,14 @@ class Editor(SmoothWorkbench,QMainWindow):
         top.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
         media,ml=panel(); self.media_panel=media; media.setObjectName('mediaPanel'); media.setMinimumWidth(250)
         media_header=QHBoxLayout(); media_header.setContentsMargins(0,0,0,0); media_header.setSpacing(6)
-        media_header.addWidget(label('MEDIEN','heading')); media_header.addStretch()
+        self.media_heading=label('MEDIEN','heading'); media_header.addWidget(self.media_heading); media_header.addStretch()
         self.media_count=label('0 Medien','muted'); media_header.addWidget(self.media_count); ml.addLayout(media_header)
         import_row=QHBoxLayout(); import_row.setContentsMargins(0,0,0,0); import_row.setSpacing(5)
         import_row.addWidget(button('+ Medien importieren',self.import_dialog,True),1)
         import_more=QToolButton(); import_more.setText('⋯'); import_more.setObjectName('panelMenuButton'); import_more.setToolTip('Weitere Importoptionen'); import_more.setAccessibleName('Weitere Importoptionen')
         import_menu=QMenu(self); import_menu.addAction('Bildsequenz importieren',self.import_sequence_dialog); import_menu.addAction('Untertitel importieren (SRT/VTT)',self.import_subtitle_dialog); import_menu.addAction('Automatische Untertitel',self.automatic_subtitle_dialog)
-        import_more.setMenu(import_menu); import_more.setPopupMode(QToolButton.InstantPopup); import_row.addWidget(import_more); ml.addLayout(import_row)
+        import_more.setMenu(import_menu); import_more.setPopupMode(QToolButton.InstantPopup); import_row.addWidget(import_more)
+        self.media_import_container=QWidget(); self.media_import_container.setLayout(import_row); ml.addWidget(self.media_import_container)
         self.media_search=QLineEdit(); self.media_search.setPlaceholderText('Medien durchsuchen …'); self.media_search.setClearButtonEnabled(True)
         self.media_search.setToolTip('Suche nach Dateiname, Pfad oder Medientyp')
         ml.addWidget(self.media_search)
@@ -1134,7 +1149,8 @@ class Editor(SmoothWorkbench,QMainWindow):
         for value,title in (('order','Import-Reihenfolge'),('name','Name'),('type','Typ'),('duration','Dauer')):
             self.media_sort.addItem(title,value)
         self.media_sort.setToolTip('Reihenfolge der Medienablage')
-        media_filter_row.addWidget(self.media_filter,1); media_filter_row.addWidget(self.media_sort,1); ml.addLayout(media_filter_row)
+        media_filter_row.addWidget(self.media_filter,1); media_filter_row.addWidget(self.media_sort,1)
+        self.media_filter_container=QWidget(); self.media_filter_container.setLayout(media_filter_row); ml.addWidget(self.media_filter_container)
         library_tools=QHBoxLayout(); library_tools.setContentsMargins(0,0,0,0); library_tools.setSpacing(5)
         self.media_view_combo=QComboBox(); self.media_view_combo.setObjectName('mediaViewCombo')
         self.media_view_combo.addItem('Karten','cards'); self.media_view_combo.addItem('Liste','list')
@@ -1144,8 +1160,9 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.media_favorites_only.setToolTip('Nur markierte Medien anzeigen')
         self.media_favorites_only.toggled.connect(lambda *_: self.refresh_media())
         self.media_favorite_button=QToolButton(); self.media_favorite_button.setObjectName('mediaFavoriteButton'); self.media_favorite_button.setText('☆'); self.media_favorite_button.setToolTip('Ausgewähltes Medium als Favorit markieren'); self.media_favorite_button.setAccessibleName('Medium als Favorit markieren'); self.media_favorite_button.clicked.connect(self.toggle_asset_favorite)
-        library_tools.addWidget(self.media_view_combo); library_tools.addWidget(self.media_favorites_only); library_tools.addStretch(); library_tools.addWidget(self.media_favorite_button); ml.addLayout(library_tools)
-        media_hint=label('Ziehen zum Einfügen · Doppelklick zum Anhängen','subtle'); media_hint.setWordWrap(True); ml.addWidget(media_hint)
+        library_tools.addWidget(self.media_view_combo); library_tools.addWidget(self.media_favorites_only); library_tools.addStretch(); library_tools.addWidget(self.media_favorite_button)
+        self.media_tools_container=QWidget(); self.media_tools_container.setLayout(library_tools); ml.addWidget(self.media_tools_container)
+        self.media_hint=label('Ziehen zum Einfügen · Doppelklick zum Anhängen','subtle'); self.media_hint.setWordWrap(True); ml.addWidget(self.media_hint)
         self.media_empty_hint=label('Noch keine Medien\nImportiere ein Video, Audio oder Bild, um zu starten.','emptyState'); self.media_empty_hint.setAlignment(Qt.AlignCenter); self.media_empty_hint.setWordWrap(True); self.media_empty_hint.setVisible(False); ml.addWidget(self.media_empty_hint)
         self.media_list=MediaList(); self.media_list.setObjectName('mediaList'); self.media_list.setViewMode(QListWidget.IconMode)
         self.media_list.setResizeMode(QListWidget.Adjust); self.media_list.setWrapping(True); self.media_list.setSpacing(4)
@@ -1154,7 +1171,14 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.media_list.currentItemChanged.connect(lambda *_: self.update_media_favorite_button())
         self.media_search.textChanged.connect(self.refresh_media); self.media_filter.currentIndexChanged.connect(self.refresh_media); self.media_sort.currentIndexChanged.connect(self.refresh_media)
         ml.addWidget(self.media_list,1)
-        ml.addWidget(button('＋ Zur Timeline hinzufügen',self.add_selected_asset))
+        self.add_timeline_button=button('＋ Zur Timeline hinzufügen',self.add_selected_asset); ml.addWidget(self.add_timeline_button)
+        self.asset_library_panel=AssetLibraryPanel(); self.asset_library_panel.hide()
+        self.asset_library_panel.use_requested.connect(self.use_library_item)
+        self.asset_library_panel.preview_requested.connect(self.preview_library_item)
+        ml.addWidget(self.asset_library_panel,1)
+        self._media_controls=(self.media_import_container,self.media_search,self.media_filter_container,
+                              self.media_tools_container,self.media_hint,self.media_empty_hint,
+                              self.media_list,self.add_timeline_button)
         top.addWidget(media)
         preview,pl=panel(); self.preview_panel=preview; preview.setObjectName('previewPanel')
         preview_header=QHBoxLayout(); preview_header.setContentsMargins(0,0,0,0)
@@ -1167,7 +1191,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.live_preview_box.toggled.connect(self.preview_option_changed); self.quick_preview_box.toggled.connect(self.preview_option_changed); self.gpu_preview_box.toggled.connect(self.preview_option_changed)
         preview_options.addWidget(self.live_preview_box); preview_options.addWidget(self.quick_preview_box); preview_options.addWidget(self.gpu_preview_box); preview_options.addStretch()
         performance_options=QHBoxLayout(); self.proxy_box=QCheckBox('Proxy-Vorschau'); self.proxy_box.setEnabled(False)
-        self.proxy_box.setToolTip('Erzeugt lokale, kleinere Vorschau-Dateien und lässt die Originale für den Export unverändert')
+        self.proxy_box.setToolTip('Erzeugt lokale, kleinere Vorschau-Dateien. Bei sehr großen Quellen startet Framecut die Schnellvorschau automatisch im Hintergrund; Originale bleiben für den Export aktiv.')
         self.proxy_profile_combo=QComboBox()
         for value,info in PROXY_PROFILES.items(): self.proxy_profile_combo.addItem(info['label'],value)
         self.proxy_profile_combo.setCurrentIndex(self.proxy_profile_combo.findData(self.proxy_profile)); self.proxy_profile_combo.setEnabled(False)
@@ -1589,11 +1613,12 @@ class Editor(SmoothWorkbench,QMainWindow):
         zoom_icon=timeline_icon_label('⌕','Timeline-Zoom')
         self.zoom_slider=QSlider(Qt.Horizontal); self.zoom_slider.setToolTip('Timeline-Zoom'); self.zoom_slider.setRange(2,200); self.zoom_slider.setValue(60); self.zoom_slider.setFixedWidth(120); self.zoom_slider.valueChanged.connect(self.zoom)
         row.addWidget(timeline_tool_group('ANSICHT',[fit_button,zoom_icon,self.zoom_slider])); bl.addLayout(row)
-        self.timeline=Timeline(); self.timeline.selection_changed.connect(self.timeline_selection_changed); self.timeline.seek.connect(self.set_playhead)
+        self.timeline=Timeline(); self.timeline.library_catalog={item.item_id:item for item in library_items()}
+        self.timeline.selection_changed.connect(self.timeline_selection_changed); self.timeline.seek.connect(self.set_playhead)
         self.timeline.context_requested.connect(self.show_context_menu)
         self.timeline.track_context_requested.connect(self.show_track_context_menu)
         self.timeline.marker_context_requested.connect(self.show_marker_context_menu)
-        self.timeline.commit.connect(self.commit_drag); self.timeline.add_asset.connect(self.drop_asset); self.timeline.delete_selected.connect(self.remove)
+        self.timeline.commit.connect(self.commit_drag); self.timeline.add_asset.connect(self.drop_asset); self.timeline.library_action.connect(self.handle_library_drop); self.timeline.delete_selected.connect(self.remove)
         self.timeline.track_mute_requested.connect(self.toggle_track_mute); self.timeline.track_lock_requested.connect(self.toggle_track_lock)
         self.timeline.zoom_request.connect(lambda n:self.zoom_slider.setValue(self.zoom_slider.value()+n*5))
         self.timeline.gesture_done.connect(self.resume_autosave)
@@ -1859,6 +1884,8 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.proxy_profile=profile
         if self.proxy_enabled and not self.worker:
             self.proxy_map={}; self.preview_queued=True
+            if self._direct_preview_clips():
+                self.activate_direct_preview(play=self.player.playbackState()==QMediaPlayer.PlayingState)
             self.start_proxy_generation()
 
     def preview_signature_for_current(self):
@@ -1868,7 +1895,146 @@ class Editor(SmoothWorkbench,QMainWindow):
                 tuple(sorted((track, tuple(sorted(state.items()))) for track,state in self.track_states.items())),
                 tuple(sorted(self.master_mixer.items())))
 
+    @staticmethod
+    def _direct_value(value, expected, tolerance=1e-7):
+        try:
+            return abs(float(value)-float(expected)) <= tolerance
+        except (TypeError, ValueError):
+            return value == expected
+
+    def _direct_clip_is_plain(self, clip):
+        """Whether a clip can be decoded directly without a composition render."""
+        if (not clip.enabled or clip.kind != 'video' or clip.source_type != 'video'
+                or not clip.path or not Path(clip.path).is_file()):
+            return False
+        if not all((self._direct_value(getattr(clip, name), expected)
+                    for name, expected in (
+                        ('speed', 1.0), ('volume', 1.0), ('fade_in', 0.0), ('fade_out', 0.0),
+                        ('video_scale', 1.0), ('video_x', .5), ('video_y', .5),
+                        ('crop_left', 0.0), ('crop_top', 0.0), ('crop_right', 0.0), ('crop_bottom', 0.0),
+                        ('rotation', 0.0), ('brightness', 0.0), ('contrast', 1.0), ('saturation', 1.0),
+                        ('color_exposure', 0.0), ('color_temperature', 0.0), ('color_tint', 0.0),
+                        ('color_vibrance', 0.0), ('color_lift_r', 0.0), ('color_lift_g', 0.0),
+                        ('color_lift_b', 0.0), ('color_gamma_r', 0.0), ('color_gamma_g', 0.0),
+                        ('color_gamma_b', 0.0), ('color_gain_r', 0.0), ('color_gain_g', 0.0),
+                        ('color_gain_b', 0.0), ('opacity', 1.0), ('blur', 0.0), ('sharpen', 0.0),
+                        ('stabilization', 0.0), ('chroma_key_similarity', .1),
+                        ('chroma_key_blend', .1), ('mask_x', 0.0), ('mask_y', 0.0),
+                        ('mask_width', 1.0), ('mask_height', 1.0), ('mask_feather', 0.0),
+                        ('audio_noise_reduction', 0.0), ('audio_eq_low', 0.0),
+                        ('audio_eq_mid', 0.0), ('audio_eq_high', 0.0),
+                        ('audio_compressor_threshold', -18.0), ('audio_compressor_ratio', 4.0),
+                        ('audio_ducking', 0.0), ('audio_voice_isolation', 0.0),
+                        ('audio_pan', 0.0), ('audio_normalize_target', -16.0))
+                    )):
+            return False
+        if (clip.freeze_frame or clip.reverse or clip.flip_horizontal or clip.flip_vertical
+                or clip.chroma_key_enabled or clip.background_removal_enabled
+                or clip.object_removal_enabled or clip.auto_reframe_enabled
+                or clip.mask_type != 'none' or clip.effect_preset != 'clean'
+                or clip.filter_preset != 'none' or clip.lut_path
+                or clip.transition_type != 'none' or clip.transition_duration > 1e-7
+                or clip.audio_compressor_enabled or clip.audio_normalize
+                or clip.audio_channel_mode != 'stereo'
+                or clip.speed_keyframes or clip.keyframes or clip.volume_keyframes
+                or clip.tracking_keyframes or clip.auto_reframe_keyframes
+                or clip.mask_points or clip.mask_path_keyframes):
+            return False
+        return True
+
+    def _direct_preview_clips(self):
+        """Return a contiguous, single-track timeline suitable for direct play."""
+        if not self.clips:
+            return ()
+        tracks={clip.track for clip in self.clips}
+        if len(tracks) != 1:
+            return ()
+        track=next(iter(tracks))
+        if track <= 0:
+            return ()
+        state=self.track_states.get(track, {})
+        if (state.get('muted') or state.get('solo')
+                or not self._direct_value(state.get('volume',1.0),1.0)
+                or not self._direct_value(state.get('pan',0.0),0.0)):
+            return ()
+        if (not self._direct_value(self.master_mixer.get('volume',1.0),1.0)
+                or not self._direct_value(self.master_mixer.get('pan',0.0),0.0)
+                or self.master_mixer.get('loudness_normalization',False)):
+            return ()
+        ordered=tuple(sorted(self.clips,key=lambda clip:(clip.position,clip.uid)))
+        expected=0.0
+        for clip in ordered:
+            if abs(float(clip.position)-expected) > 1e-5 or not self._direct_clip_is_plain(clip):
+                return ()
+            expected=clip.finish
+        return ordered
+
+    def direct_preview_signature_for_current(self):
+        return (self.revision, bool(self.proxy_enabled), self.proxy_profile,
+                tuple(sorted(self.proxy_map.items())))
+
+    def direct_preview_is_current(self):
+        return bool(self.direct_preview and self.direct_preview_revision == self.revision
+                    and self.direct_preview_signature == self.direct_preview_signature_for_current())
+
+    def _direct_clip_at(self, position, clips=None):
+        clips=clips or self._direct_preview_clips()
+        if not clips:
+            return None
+        position=float(position)
+        for index, clip in enumerate(clips):
+            if clip.position-1e-6 <= position < clip.finish-1e-6:
+                return index,clip
+            if index == len(clips)-1 and clip.position-1e-6 <= position <= clip.finish+1e-6:
+                return index,clip
+        return None
+
+    def _direct_source_path(self, clip):
+        if self.proxy_enabled and clip.path:
+            return self.proxy_map.get(str(Path(clip.path).resolve()),clip.path)
+        return clip.path
+
+    def _load_direct_clip_at_playhead(self, play=False):
+        clips=self._direct_preview_clips()
+        selected=self._direct_clip_at(self.playhead,clips)
+        if selected is None:
+            self.direct_clip_uid=None
+            self.player.pause()
+            return
+        _,clip=selected
+        self.direct_clip_uid=clip.uid
+        source=self._direct_source_path(clip)
+        source_time=clip.start+max(0.0,min(clip.length,self.playhead-clip.position))
+        self.mode='timeline'; self.video_stack.setCurrentIndex(1)
+        self.pending_seek=(round(source_time*1000),bool(play))
+        url=QUrl.fromLocalFile(str(source))
+        if self.player.source()==url:
+            self.pending_seek=None
+            self.player.setPosition(round(source_time*1000))
+            if play:
+                self.player.play()
+        else:
+            self.player.stop(); self.player.setSource(url)
+
+    def activate_direct_preview(self, play=None):
+        """Switch to instant source playback when the timeline needs no render."""
+        clips=self._direct_preview_clips()
+        if not clips:
+            self.direct_preview=False; self.direct_preview_revision=-1
+            self.direct_preview_signature=None; self.direct_clip_uid=None
+            return False
+        if play is None:
+            play=self.player.playbackState()==QMediaPlayer.PlayingState
+        self.direct_preview=True; self.direct_preview_revision=self.revision
+        self.direct_preview_signature=self.direct_preview_signature_for_current()
+        self.mode='timeline'; self.audio.setVolume(1); self.player.setPlaybackRate(1.0)
+        self.preview_status.setText('DIRECT-SCHNITT · sofort abspielbar · keine Neu-Berechnung nötig')
+        self._load_direct_clip_at_playhead(bool(play))
+        return True
+
     def preview_is_current(self):
+        if self.direct_preview_is_current():
+            return True
         return bool(self.preview_path and self.preview_signature == self.preview_signature_for_current()
                     and Path(self.preview_path).is_file())
 
@@ -2940,6 +3106,7 @@ class Editor(SmoothWorkbench,QMainWindow):
 
     def changed(self):
         self.compare_released()
+        direct_was_playing=self.direct_preview_is_current() and self.player.playbackState()==QMediaPlayer.PlayingState
         self.dirty=True; self.revision+=1; self.preview_revision=-1; self.preview_signature=None
         self.preview_queued=True; self.preview_play_requested=False
         if self.preview_worker:
@@ -2947,6 +3114,7 @@ class Editor(SmoothWorkbench,QMainWindow):
             # the newer render is prepared in the background.
             self.preview_worker.cancel.set()
         self.transport_timer.stop(); self.transport_rate=0.0; self.transport_rate_pending=None
+        self.direct_preview=False; self.direct_preview_revision=-1; self.direct_preview_signature=None
         self.player.pause(); self.player.setPlaybackRate(1.0); self.mode='timeline'; self.pending_seek=None
         self.source_clip_uid=None; self.source_in=None; self.source_out=None
         if self.preview_path and Path(self.preview_path).is_file():
@@ -2959,7 +3127,11 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.autosave_label.setText('Änderungen · Autosave folgt …'); self.autosave_timer.start()
         self.update_project_identity()
         self.update_source_monitor_controls()
-        if hasattr(self,'live_preview_box') and self.live_preview_box.isChecked() and self.clips:
+        direct_ready=self.activate_direct_preview(play=direct_was_playing)
+        if direct_ready:
+            self.preview_queued=False
+            self.live_preview_timer.stop()
+        elif hasattr(self,'live_preview_box') and self.live_preview_box.isChecked() and self.clips:
             self.live_preview_timer.start()
         self.refresh()
         self.refresh_history()
@@ -4641,6 +4813,205 @@ class Editor(SmoothWorkbench,QMainWindow):
         if added and self.performance_combo.currentData()=='smooth': QTimer.singleShot(0,self.performance_changed)
         if errors:self.error('\n'.join(errors))
 
+    def open_media_panel(self):
+        """Show the project media bin and keep the library panel out of the way."""
+        if not hasattr(self, 'asset_library_panel'):
+            return
+        self.media_heading.setText('MEDIEN')
+        for widget in self._media_controls:
+            if widget is self.media_empty_hint:
+                continue
+            widget.show()
+        self.asset_library_panel.hide()
+        self.media_empty_hint.setVisible(self.media_list.count() == 0)
+        self.refresh_media()
+
+    def open_library_panel(self):
+        """Replace the media bin with the compact offline starter library."""
+        if not hasattr(self, 'asset_library_panel'):
+            return
+        for widget in self._media_controls:
+            widget.hide()
+        self.media_heading.setText('BIBLIOTHEK')
+        self.media_count.setText(f'{len(library_items())} Starter-Assets')
+        self.asset_library_panel.show()
+        self.asset_library_panel.refresh()
+
+    def preview_library_item(self, item_id):
+        item=get_library_item(item_id)
+        if item is None:
+            return
+        if item.kind != 'sound':
+            self.statusBar().showMessage('Dieses Preset wird direkt auf den ausgewählten Clip angewendet.',3000)
+            return
+        try:
+            path=library_sound_path(item.item_id,self.state_dir)
+            self.library_player.stop()
+            self.library_player.setSource(QUrl.fromLocalFile(str(path)))
+            self.library_player.play()
+            self.statusBar().showMessage(f'Vorschau: {item.title}',2000)
+        except Exception as exc:
+            self.error(exc)
+
+    def _library_audio_track(self, preferred=None):
+        """Choose an unlocked audio track, creating one only when necessary."""
+        audio_tracks=[track for track in self.tracks if track < 0]
+        if preferred in audio_tracks and not self.track_locked(preferred):
+            return preferred
+        available=[track for track in audio_tracks if not self.track_locked(track)]
+        if available:
+            return min(available, key=abs)
+        # The caller adds this track together with the rest of the edit so a
+        # single undo step can remove it again if all existing audio tracks
+        # were locked.
+        return min(audio_tracks or [0])-1
+
+    def _library_insert_position(self, track, duration, preferred=None):
+        """Find the first free slot on a target track from the playhead onward."""
+        position=max(0.0,float(self.playhead if preferred is None else preferred))
+        for clip in sorted((value for value in self.clips if value.track == track), key=lambda value:value.position):
+            if clip.finish <= position + 1e-7:
+                continue
+            if clip.position >= position + duration - 1e-7:
+                break
+            position=clip.finish
+        return position
+
+    def _commit_library_clip(self, candidate, title):
+        proposed=[candidate if item.uid==candidate.uid else item for item in self.clips]
+        validate_timeline(proposed,self.tracks)
+        self.checkpoint(title)
+        self.clips=proposed; self.selection=[candidate.uid]; self.current=candidate.uid; self.changed()
+
+    def _apply_library_effect(self, item):
+        clip=self.current_clip()
+        if not clip or clip.kind != 'video' or self.worker:
+            return self.statusBar().showMessage('Wähle zuerst einen Video- oder Adjustment-Clip aus.',3000)
+        if not self.require_unlocked(clip):
+            return
+        parameters=dict(item.parameters)
+        preset_name=parameters.pop('effect_preset', 'clean')
+        values=dict(EFFECT_PRESETS.get(preset_name, {}))
+        values.update(parameters)
+        candidate=replace(clip,effect_preset=preset_name,**values)
+        try:
+            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
+            self.statusBar().showMessage(f'Effekt „{item.title}“ angewendet.',3000)
+        except Exception as exc:
+            self.error(exc)
+
+    def _apply_library_animation(self, item):
+        clip=self.current_clip()
+        if not clip or self.worker:
+            return self.statusBar().showMessage('Wähle zuerst einen Clip für die Animation aus.',3000)
+        if not self.require_unlocked(clip):
+            return
+        animation=item.parameters.get('animation')
+        if clip.kind == 'text':
+            text_animation={'text_fade':'fade','text_slide':'slide_left'}.get(animation)
+            if text_animation is None:
+                return self.statusBar().showMessage('Diese Animation ist für Textclips vorgesehen.',3000)
+            candidate=replace(clip,text_animation=text_animation,
+                              text_animation_duration=min(.8,max(.05,clip.length)))
+        elif clip.kind == 'video' and clip.source_type != 'adjustment':
+            duration=max(.1,float(clip.length))
+            edge=min(.65,max(.05,duration*.35))
+            start_scale=clip.video_scale; end_scale=clip.video_scale
+            start_x=clip.video_x; end_x=clip.video_x
+            start_y=clip.video_y; end_y=clip.video_y
+            if animation == 'zoom_in':
+                start_scale=max(.1,clip.video_scale*.84)
+            elif animation == 'zoom_out':
+                end_scale=max(.1,clip.video_scale*.84)
+            elif animation == 'slide_left':
+                start_x=.08
+            elif animation == 'slide_up':
+                start_y=.08
+            else:
+                return self.statusBar().showMessage('Diese Animation ist für Textclips vorgesehen.',3000)
+            frames=[dict(time=0.0,scale=start_scale,x=start_x,y=start_y,
+                         rotation=clip.rotation,opacity=clip.opacity,blur=clip.blur,curve='ease_out'),
+                    dict(time=duration,scale=end_scale,x=end_x,y=end_y,
+                         rotation=clip.rotation,opacity=clip.opacity,blur=clip.blur,curve='ease_in_out')]
+            candidate=replace(clip,keyframes=frames)
+        else:
+            return self.statusBar().showMessage('Wähle einen normalen Video- oder Textclip aus.',3000)
+        try:
+            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
+            self.statusBar().showMessage(f'Animation „{item.title}“ angewendet.',3000)
+        except Exception as exc:
+            self.error(exc)
+
+    def _apply_library_transition(self, item):
+        clip=self.current_clip()
+        if not clip or clip.kind not in ('video','audio') or clip.source_type == 'adjustment' or self.worker:
+            return self.statusBar().showMessage('Wähle einen Video- oder Audioclip für den Übergang aus.',3000)
+        if not self.require_unlocked(clip):
+            return
+        transition=item.parameters.get('transition_type','dissolve')
+        duration=min(float(item.parameters.get('duration',.5)),max(0.0,clip.length))
+        candidate=replace(clip,transition_type=transition,transition_duration=duration)
+        try:
+            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
+            self.statusBar().showMessage(f'Übergang „{item.title}“ angewendet.',3000)
+        except Exception as exc:
+            self.error(exc)
+
+    def _insert_library_sound(self, item, position=None, track=None):
+        if self.worker:
+            return
+        try:
+            path=library_sound_path(item.item_id,self.state_dir)
+            existing=next((asset for asset in self.assets
+                           if asset.path and Path(asset.path).resolve()==path.resolve()),None)
+            if existing is None:
+                asset=replace(import_clip(str(path)),display_name=item.title)
+            else:
+                asset=existing
+                if not asset.display_name:
+                    asset=replace(asset,display_name=item.title)
+            target_track=self._library_audio_track(track)
+            target_tracks=list(self.tracks)
+            if target_track not in target_tracks:
+                target_tracks.append(target_track)
+            target_position=self._library_insert_position(target_track,asset.length,position)
+            candidate=replace(asset,uid=uuid.uuid4().hex,position=target_position,track=target_track)
+            validate_timeline(self.clips+[candidate],target_tracks)
+            self.checkpoint('Bibliothek: Sound einfügen')
+            if target_tracks != self.tracks:
+                self.tracks=target_tracks
+                self.track_states=normalize_track_states(self.track_states,self.tracks)
+                self.track_names=normalize_track_names(self.track_names,self.tracks)
+            if existing is not None and asset.uid != existing.uid:
+                self.assets=[asset if value.uid==existing.uid else value for value in self.assets]
+            if existing is None:
+                self.assets.append(asset)
+            self.clips.append(candidate); self.selection=[candidate.uid]; self.current=candidate.uid
+            self.prepare_visuals([asset]); self.changed()
+            self.statusBar().showMessage(f'Sound „{item.title}“ eingefügt.',3000)
+        except Exception as exc:
+            self.error(exc)
+
+    def use_library_item(self, item_id):
+        """Apply a preset or insert a generated sound using existing editor data."""
+        item=get_library_item(item_id)
+        if item is None:
+            return
+        if item.kind == 'sound':
+            self._insert_library_sound(item)
+        elif item.kind == 'effect':
+            self._apply_library_effect(item)
+        elif item.kind == 'animation':
+            self._apply_library_animation(item)
+        elif item.kind == 'transition':
+            self._apply_library_transition(item)
+
+    def handle_library_drop(self, item_id, position, track):
+        item=get_library_item(item_id)
+        if item is None or item.kind != 'sound':
+            return
+        self._insert_library_sound(item,position=float(position),track=int(track))
+
     def refresh_media(self):
         self.missing_media=missing_project_media(self.clips,self.assets)
         selected_item=self.media_list.currentItem() if hasattr(self,'media_list') else None
@@ -4953,7 +5324,9 @@ class Editor(SmoothWorkbench,QMainWindow):
     def set_playhead(self,time):
         self.playhead=max(0,min(length(self.clips),float(time))); self.timeline.set_playhead(self.playhead); self.update_time()
         self.refresh_view_geometry()
-        if self.mode=='timeline' and self.preview_is_current():
+        if self.mode=='timeline' and self.direct_preview_is_current():
+            self._load_direct_clip_at_playhead(self.player.playbackState()==QMediaPlayer.PlayingState)
+        elif self.mode=='timeline' and self.preview_is_current():
             self.player.setPosition(int(min(self.playhead,length(self.clips))*1000))
         elif self.mode=='source' and self.current_clip():
             c=self.current_clip()
@@ -4981,6 +5354,26 @@ class Editor(SmoothWorkbench,QMainWindow):
     def position_changed(self,ms):
         if self.pending_seek or self.compare_active:return
         if self.mode=='timeline':
+            if self.direct_preview_is_current():
+                clips=self._direct_preview_clips()
+                clip=next((value for value in clips if value.uid==self.direct_clip_uid),None)
+                if clip is None:
+                    selected=self._direct_clip_at(self.playhead,clips)
+                    clip=selected[1] if selected else None
+                if clip is None:
+                    return
+                local=max(0.0,min(clip.length,ms/1000.0-clip.start))
+                self.playhead=clip.position+local
+                if self.playhead>=clip.finish-.04:
+                    index=next((index for index,value in enumerate(clips) if value.uid==clip.uid),-1)
+                    if index+1<len(clips):
+                        self.playhead=clips[index+1].position
+                        self._load_direct_clip_at_playhead(True)
+                    else:
+                        self.playhead=length(self.clips); self.player.pause()
+                self.timeline.set_playhead(self.playhead); self.update_time()
+                self.follow_playhead(); self.refresh_view_geometry(); self.update_source_monitor_controls()
+                return
             if not self.preview_is_current():return
             self.playhead=ms/1000
         else:
@@ -5039,6 +5432,11 @@ class Editor(SmoothWorkbench,QMainWindow):
         if self.player.playbackState()==QMediaPlayer.PlayingState:
             self.player.pause();return
         if not self.clips:return self.error('Füge zuerst Medien zur Timeline hinzu.')
+        if self.direct_preview_is_current():
+            if self.playhead>=length(self.clips)-.02:
+                self.playhead=0.0
+            self._load_direct_clip_at_playhead(True)
+            return
         if self.preview_worker:
             # A render may already be running because of live preview. Reuse
             # that render instead of starting a second FFmpeg process.
@@ -5065,6 +5463,8 @@ class Editor(SmoothWorkbench,QMainWindow):
 
     def preview_option_changed(self,*_):
         if self.clips and self.live_preview_box.isChecked():
+            if self.direct_preview_is_current():
+                return
             self.preview_queued=True
             if self.preview_worker:self.preview_worker.cancel.set()
             self.live_preview_timer.start()
@@ -5072,6 +5472,14 @@ class Editor(SmoothWorkbench,QMainWindow):
     def render_preview(self,auto=False):
         if self.compare_active: return
         if self.preview_is_current():
+            return
+        if self._direct_preview_clips():
+            if self.preview_worker:
+                self.preview_worker.cancel.set()
+            requested=self.preview_play_requested
+            self.activate_direct_preview(play=requested or self.player.playbackState()==QMediaPlayer.PlayingState)
+            self.preview_play_requested=False
+            self.preview_queued=False
             return
         if self.preview_worker:
             if getattr(self.preview_worker,'preview_signature',None) != self.preview_signature_for_current():
@@ -5196,6 +5604,7 @@ class Editor(SmoothWorkbench,QMainWindow):
             self.checkpoint(); self.clips=clips; self.assets=assets
             self.missing_media=missing_project_media(self.clips,self.assets)
             self.proxy_map={}; self.proxy_directory=None; self.proxy_enabled=False
+            self.auto_proxy_sources=set()
             self.proxy_box.blockSignals(True); self.proxy_box.setChecked(False); self.proxy_box.blockSignals(False)
             self.prepare_visuals(self.assets); self.refresh_media(); self.changed()
             if self.missing_media:
@@ -5244,13 +5653,56 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.proxy_enabled=bool(enabled)
         if not enabled:
             self.proxy_map={}
+            if self._direct_preview_clips():
+                self.activate_direct_preview(play=self.player.playbackState()==QMediaPlayer.PlayingState)
             self.preview_queued=True
             if self.clips and self.live_preview_box.isChecked():
                 self.live_preview_timer.start()
             return
         if self.worker:
             return
+        if self._direct_preview_clips():
+            self.activate_direct_preview(play=self.player.playbackState()==QMediaPlayer.PlayingState)
         self.start_proxy_generation()
+
+    def maybe_start_auto_proxy(self):
+        """Prepare a 360p proxy in the background for very large sources."""
+        if self._closing or self.worker or self.proxy_enabled or 'proxy' in self.independent_jobs:
+            return False
+        threshold=256*1024*1024
+        heavy=[]
+        for clip in self.clips:
+            if (clip.kind == 'video' and clip.source_type == 'video' and clip.path
+                    and Path(clip.path).is_file()):
+                try:
+                    if Path(clip.path).stat().st_size >= threshold:
+                        heavy.append(str(Path(clip.path).resolve()))
+                except OSError:
+                    continue
+        new_sources=set(heavy)-self.auto_proxy_sources
+        if not new_sources:
+            return False
+        self.auto_proxy_sources.update(new_sources)
+        self.proxy_enabled=True
+        self.proxy_box.blockSignals(True); self.proxy_box.setChecked(True); self.proxy_box.blockSignals(False)
+        self.activate_direct_preview(play=self.player.playbackState()==QMediaPlayer.PlayingState)
+        self.statusBar().showMessage('Große Quelle erkannt · Schnellvorschau wird im Hintergrund vorbereitet. Schneiden und Abspielen bleiben sofort möglich.',6000)
+        self.start_proxy_generation()
+        return True
+
+    def ensure_missing_proxies(self):
+        """Start automatic large-file proxies, then repair missing manual ones."""
+        if self._closing or self.worker:
+            return
+        if not self.proxy_enabled:
+            self.maybe_start_auto_proxy()
+            return
+        if 'proxy' in self.independent_jobs:
+            return
+        sources={str(Path(c.path).resolve()) for c in self.clips
+                 if c.path and c.kind in ('video','audio') and c.source_type not in ('image','image_sequence')}
+        if sources-set(self.proxy_map):
+            self.start_proxy_generation()
 
     def start_proxy_generation(self):
         if self.worker or not self.proxy_enabled:
@@ -5566,12 +6018,13 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.transport_stop()
         self.player.stop();self.pending_seek=None;self.player.setSource(QUrl());self.video_stack.setCurrentIndex(0)
         self.clips=data['clips'];self.tracks=data['tracks'];self.track_states=normalize_track_states(data.get('track_states'),self.tracks);self.track_names=normalize_track_names(data.get('track_names'),self.tracks);self.master_mixer=normalize_master_mixer(data.get('mixer'));self.assets=data['assets'];self.markers=normalize_markers(data.get('markers'),length(self.clips));self.project_path=path
-        self.missing_media=list(data.get('missing_media',[]));self.proxy_enabled=False;self.proxy_map={};self.proxy_directory=None
+        self.missing_media=list(data.get('missing_media',[]));self.proxy_enabled=False;self.proxy_map={};self.proxy_directory=None;self.auto_proxy_sources=set()
         self.proxy_box.blockSignals(True);self.proxy_box.setChecked(False);self.proxy_box.blockSignals(False)
         self.current=self.clips[0].uid if self.clips else None;self.selection=[self.current] if self.current else [];self.playhead=0
         self.source_clip_uid=None;self.source_in=None;self.source_out=None
         self.work_in=None;self.work_out=None
         self.history.clear();self.future.clear();self.revision+=1;self.preview_revision=-1;self.preview_signature=None;self.preview_path=None
+        self.direct_preview=False;self.direct_preview_revision=-1;self.direct_preview_signature=None;self.direct_clip_uid=None
         self.history_labels.clear();self.future_labels.clear();self.refresh_history()
         self.last_autosave=None;self.autosave_revision=-1
         self.preset.blockSignals(True);self.preset.setCurrentText(data['preset'] if data['preset'] in PRESETS else next(iter(PRESETS)));self.preset.blockSignals(False)
@@ -5579,6 +6032,10 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.placeholder.setText('▶ Timeline berechnet die Mehrspur-Vorschau.\n„Clip ansehen“ zeigt sofort die Quelle.')
         self.preview_status.setText('Timeline geladen · Vorschau noch nicht berechnet')
         self.setWindowTitle(f'Framecut {APP_VERSION} · '+(Path(path).stem if path else 'Neues Projekt')); self.update_project_identity()
+        # Re-opened projects should get the same instant-playback and large-file
+        # proxy treatment as newly edited timelines, without waiting for the
+        # first play button press.
+        QTimer.singleShot(0,self.ensure_missing_proxies)
 
     def open_project_path(self,path):
         if self.worker or not self.can_discard():return

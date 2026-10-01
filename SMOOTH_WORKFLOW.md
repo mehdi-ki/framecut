@@ -1,4 +1,4 @@
-# Framecut 3.23.0 — Smooth Workflow
+# Framecut 3.24.0 — Smooth Workflow
 
 Dieses Update verbessert den vorhandenen Schnittworkflow in 30 Punkten.
 Projekte bleiben kompatibel; neue Clip-Metadaten werden mit neutralen Vorgaben geladen.
@@ -6,7 +6,7 @@ Projekte bleiben kompatibel; neue Clip-Metadaten werden mit neutralen Vorgaben g
 | Nr. | Verbesserung | Bedienung und Verhalten |
 | --- | --- | --- |
 | 1 | Autosave und Wiederherstellung | Zusätzlich zur verzögerten Sicherung prüft ein 30-Sekunden-Takt offene Änderungen. Die letzte lesbare Sicherung bleibt als Rückfall erhalten. |
-| 2 | Vorschau-Leistung | „Flüssig“ nutzt 360p-Proxys, „Detail“ Originale. Neu hinzugefügte Timeline-Medien erhalten bei aktivierten Proxys automatisch Ableitungen; Export nutzt Originale. |
+| 2 | Vorschau-Leistung | Einfache, zusammenhängende Videospuren werden direkt aus der Quelle geschnitten und abgespielt. Große Quellen erhalten automatisch 360p-Proxys im Hintergrund; komplexe Timelines nutzen den gerenderten Mehrspurpfad. Export nutzt Originale. |
 | 3 | Hintergrundaufgaben | Import, Proxy-Erstellung und Export zeigen abbrechbare Fortschrittszeilen. Thumbnails und Wellenformen entstehen im Hintergrund. Export verwendet einen unveränderlichen Projektstand. Exklusive Analysen sperren Bearbeitungen, lassen Navigation zu. |
 | 4 | Einrast-Vorschau | Beim Verschieben zeigt eine Führungslinie das Einrastziel; ungültige Positionen sind rot markiert. |
 | 5 | Bearbeitungsverlauf | Strg+Alt+Z oder ⋯ → Verlauf. Benannte Schritte, Doppelklick zum Zurück-/Vorwärtsspringen. |

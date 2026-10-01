@@ -1,4 +1,4 @@
-# Framecut 3.23.0 — Smooth Workflow
+# Framecut 3.24.0 — Smooth Workflow
 
 Native Linux-Videoschnitt-App mit einer CapCut-ähnlichen Anordnung. Eigener Code,
 keine CapCut-Kopie. Python/PySide6 mit lokalem FFmpeg-Export und optionaler lokaler
@@ -16,11 +16,37 @@ Bewegung. **Strg+Alt+Z** zeigt den Verlauf. In der Timeline: **Strg+Mausrad** zo
 **Mitteltaste** oder **Umschalt+Mausrad** verschiebt die Ansicht, **Esc** verwirft eine
 laufende Mausgeste. **B gedrückt halten** vergleicht die Timeline ohne Bild-Effekte.
 
+## Neu in 3.24: Asset-Bibliothek
+
+Der neue Tab **Bibliothek** links stellt 22 offline nutzbare Starter-Assets bereit:
+sechs Sounds, sechs Videoeffekt-Presets, sechs Animationen und vier Übergänge.
+Suche und Kategorien filtern die Liste sofort. Sounds können angehört, mit
+**Verwenden** auf einer freien Audiospur eingefügt oder direkt auf die Timeline
+gezogen werden. Effekte, Animationen und Übergänge werden auf den ausgewählten
+Clip angewendet und verwenden dabei die vorhandene Framecut-Engine.
+
+Die Starter-Sounds werden beim ersten Einsatz lokal als kleine WAV-Dateien im
+Framecut-Benutzerordner erzeugt. Es gibt keinen Cloud-Upload und keinen Download
+von Drittanbieter-Paketen. Details stehen in [ASSET_LIBRARY.md](ASSET_LIBRARY.md).
+
+## Schneller Player für große Videodateien
+
+Einfache, zusammenhängende Videospuren werden im **Direct-Schnittmodus** direkt
+aus der Quelldatei abgespielt. Ein Schnitt löst dabei keinen neuen FFmpeg-Render
+aus; Framecut wechselt beim Abspielkopf nur zwischen den geschnittenen Bereichen.
+Sobald mehrere Spuren, Effekte, Übergänge oder Mischungen aktiv sind, bleibt der
+gerenderte Mehrspurmodus erhalten.
+
+Bei Videodateien ab 256 MB startet Framecut zusätzlich automatisch eine lokale
+360p-Proxy-Erzeugung im Hintergrund. Währenddessen bleiben Schnitt und direkte
+Wiedergabe verfügbar. Nach Fertigstellung wird der Proxy für die Vorschau
+verwendet; beim Export bleibt die Originaldatei unverändert.
+
 ## Update und Start auf deinem Linux Mint
 
 1. Framecut schließen und die bisherigen Projekte speichern.
 2. Dieses ZIP in einen **neuen Ordner** entpacken. Die bisherige Version als Rückfall behalten.
-3. Den Ordner `Framecut-3.23.0` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
+3. Den Ordner `Framecut-3.24.0` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
 4. Rechtsklick auf eine freie Stelle → „Im Terminal öffnen“.
 5. Ausführen:
 
@@ -29,14 +55,14 @@ laufende Mausgeste. **B gedrückt halten** vergleicht die Timeline ohne Bild-Eff
    ```
 
 Für eine Desktop-Installation kannst du stattdessen `bash install.sh` ausführen.
-Der Installer legt Framecut unter `~/.local/share/framecut/3.23.0` ab und erstellt
+Der Installer legt Framecut unter `~/.local/share/framecut/3.24.0` ab und erstellt
 den Starter `~/.local/bin/framecut` sowie einen Eintrag im Anwendungsmenü.
 
-## Linux-Auslieferung 3.23.0
+## Linux-Auslieferung 3.24.0
 
 Das Quellpaket enthält jetzt drei reproduzierbare Auslieferungswege:
 
-- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.23.0_amd64.deb`. Installation mit `sudo apt install ./framecut_3.23.0_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.23.0/.venv` an; FFmpeg und Python bleiben systemweit.
+- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.24.0_amd64.deb`. Installation mit `sudo apt install ./framecut_3.24.0_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.24.0/.venv` an; FFmpeg und Python bleiben systemweit.
 - **AppImage:** `bash build_appimage.sh` erzeugt aus der vorbereiteten `Framecut.AppDir` ein echtes Type-2-AppImage, sobald das offizielle `appimagetool` über `PATH` oder `APPIMAGETOOL=/pfad/appimagetool` verfügbar ist. Der Builder bricht ohne dieses Werkzeug bewusst ab und erzeugt keine Datei, die nur fälschlich `.AppImage` heißt.
 - **Komplettes Release:** `bash build_release.sh` erstellt das Linux-ZIP, das `.deb`, Prüfsummen und – falls `appimagetool` vorhanden ist – das AppImage. Ohne Tool bleibt eine kurze Build-Hinweisdatei neben den übrigen Artefakten.
 
@@ -75,7 +101,7 @@ neu gestartet werden. Die Manifest-Datei selbst wird nie automatisch verändert.
 
 ### GitHub-Release-Automation
 
-`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.23.0` automatisch
+`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.24.0` automatisch
 die getesteten ZIP-, `.deb`- und AppImage-Dateien sowie `updates.json`. Die Version
 kommt aus der Datei `VERSION`; Tag und Versionsdatei müssen übereinstimmen. Dadurch
 werden Prüfsummen und Download-Adressen für den Update-Checker bei jedem Release
@@ -463,15 +489,19 @@ Zeitwerte im Inspector: **Position** ist die Lage im Projekt, **Quellstart** und
 
 ## Vorschau — wichtige Änderung gegenüber 0.1
 
-**▶ Timeline** berechnet beim ersten Start bzw. nach einer Schnittänderung eine
-kleine Vorschau der **gesamten** Timeline. Sie enthält alle Bild- und Tonspuren
-und benutzt denselben Kompositionsweg wie der Export. Die Berechnung läuft im
+**▶ Timeline** spielt eine einfache, zusammenhängende Videospur direkt aus den
+Quelldateien ab. Schnitte wechseln nur das Quellfenster; ein neuer FFmpeg-
+Kompositionsrender ist dafür nicht nötig. Bei großen Quellen wird zusätzlich
+automatisch ein 360p-Proxy im Hintergrund vorbereitet. Mehrspur-Timelines mit
+Audio-Mix, Effekten, Übergängen oder anderen Kompositionen berechnen weiterhin
+eine kleine Vorschau der **gesamten** Timeline. Diese Berechnung läuft im
 Hintergrund; währenddessen bleibt die Oberfläche bedienbar und der letzte
 gültige Vorschauframe sichtbar. Nach einer kurzen Bearbeitungspause werden
 mehrere Änderungen gemeinsam verarbeitet.
 
-Das ist noch **keine Live-Mehrspur-Engine**: Bei langen Videos kann die Berechnung
-spürbar dauern. Für einen ersten Test bitte 2–3 kurze Clips verwenden.
+Das ist noch **keine Live-Mehrspur-Engine**: Bei komplexen langen Timelines kann
+die Berechnung spürbar dauern. Reine Schnittprojekte bleiben dagegen direkt
+abspielbar, auch während der Proxy im Hintergrund entsteht.
 Die Vorschau ist höchstens 480 Pixel hoch; Hochformat ist entsprechend schmal.
 Das Exportvideo verwendet die oben ausgewählte Auflösung, nicht die Vorschau.
 

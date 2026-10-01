@@ -44,7 +44,7 @@ if [[ -n "${FRAMECUT_RELEASE_BASE_URL:-}" ]]; then
     appimage_file="$APPIMAGE_OUTPUT"
     {
         printf '{\n  "product": "Framecut",\n  "version": "%s",\n' "$APP_VERSION"
-        printf '  "release_notes": ["Framecut %s: Smooth Workflow mit 30 Verbesserungen, Hintergrundaufgaben, gespeichertem Arbeitsplatz, besserem Trimmen, Bearbeitungsverlauf und einfacherem Export."],\n' "$APP_VERSION"
+        printf '  "release_notes": ["Framecut %s: Direkter Player für schnelle Schnitte, automatische 360p-Proxys für große Quellen und Offline-Asset-Bibliothek mit Sounds, Effekt-Presets, Animationen und Übergängen."],\n' "$APP_VERSION"
         printf '  "artifacts": {\n'
         if [[ -f "$appimage_file" ]]; then
             printf '    "appimage": {"filename": "%s", "url": "%s/%s", "sha256": "%s"},\n' \

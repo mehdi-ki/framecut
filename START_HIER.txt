@@ -1,4 +1,4 @@
-FRAMECUT 3.23.0 — START
+FRAMECUT 3.24.0 — START
 
 NEU: Smooth Workflow mit 30 Verbesserungen an der vorhandenen Bedienung.
 Oben im ⋯-Menü: Bearbeitungsverlauf, Projektstatus, UI-Größe, reduzierte Bewegung.
@@ -31,8 +31,10 @@ NEU IN 3.20.0: Export-Presets für YouTube/Shorts/Reels/Instagram, Arbeitsbereic
 NEU IN 3.20.1: Flache Symboltoolbar ohne doppelte Gruppenkästen, einheitliche Icon-Aktionen für Quelle und Arbeitsbereich, zuverlässiger Timeline-Rechtsklick und kompakte Kurztipps im Inspector.
 NEU IN 3.21.0: Neues Workspace-Redesign mit Medien links, größerer Vorschau in der Mitte, aufklappbarem Inspector rechts, kompakterem Header und überarbeiteter Timeline-Optik.
 NEU IN 3.22.0: Einfach-/Pro-Modus, Schnitt-/Shorts-/Audio-/Farb-/Untertitel-Layouts, Fokusansicht, kontextabhängige Clip-Aktionen, Medienfavoriten, Karten-/Listenansicht, bessere leere Zustände und Timeline-Badges.
+NEU IN 3.24.0: Offline-Starter-Bibliothek mit Sounds, Videoeffekt-Presets, Clip-Animationen und Übergängen. Suche, Kategorien, Sound-Vorschau, direkte Anwendung und Sound-Drag-and-drop sind integriert.
+PLAYER IN 3.24.0: Einfache Videospuren werden direkt aus der Quelle abgespielt. Schnitte brauchen keinen neuen Vorschau-Render; große Quellen erhalten zusätzlich automatisch einen lokalen 360p-Proxy im Hintergrund.
 
-VORSCHAU: ▶ Timeline berechnet den Mix nach kurzer Bearbeitungspause im Hintergrund. Der letzte gültige Frame bleibt sichtbar.
+VORSCHAU: ▶ Einfache Schnittspuren spielen direkt; komplexe Timeline-Mixe werden nach kurzer Bearbeitungspause im Hintergrund berechnet. Der letzte gültige Frame bleibt sichtbar.
 Clip ansehen zeigt sofort die einzelne Quelle.
 
 Details und Grenzen stehen in README.md.

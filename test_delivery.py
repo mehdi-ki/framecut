@@ -72,6 +72,7 @@ class DeliveryTest(unittest.TestCase):
         self.assertTrue((root/'framecut.svg').is_file())
         self.assertTrue((root/'transcription.py').is_file())
         self.assertTrue((root/'ai_tools.py').is_file())
+        self.assertTrue((root/'asset_library.py').is_file())
         for module in ('ux.py','workbench.py'):
             self.assertTrue((root/module).is_file())
             for script in ('build_deb.sh','build_appimage.sh'):
@@ -83,6 +84,8 @@ class DeliveryTest(unittest.TestCase):
         self.assertIn('transcription.py', (root/'build_appimage.sh').read_text(encoding='utf-8'))
         self.assertIn('ai_tools.py', (root/'build_deb.sh').read_text(encoding='utf-8'))
         self.assertIn('ai_tools.py', (root/'build_appimage.sh').read_text(encoding='utf-8'))
+        self.assertIn('asset_library.py', (root/'build_deb.sh').read_text(encoding='utf-8'))
+        self.assertIn('asset_library.py', (root/'build_appimage.sh').read_text(encoding='utf-8'))
         self.assertIn('application/x-framecut', (root/'application-x-framecut.xml').read_text(encoding='utf-8'))
         desktop=(root/'framecut.desktop').read_text(encoding='utf-8')
         self.assertIn('Icon=framecut',desktop)

@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, Signal, QRectF, QMimeData, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QDrag, QImage, QPolygonF
 from PySide6.QtWidgets import QWidget, QListWidget
 from core import edited_clip, snap_time, length, validate_timeline
+from asset_library import LIBRARY_MIME, library_preview_clip
 
 ASSET_MIME = 'application/x-framecut-asset'
 
@@ -49,6 +50,7 @@ class Timeline(QWidget):
     seek = Signal(float)
     commit = Signal(object)
     add_asset = Signal(int, float, int)
+    library_action = Signal(str, float, int)
     delete_selected = Signal()
     track_mute_requested = Signal(int)
     track_lock_requested = Signal(int)
@@ -84,6 +86,7 @@ class Timeline(QWidget):
         self.ghost = None
         self.snapline = None
         self.assets = []
+        self.library_catalog = {}
         self.drop_preview = None
         self.ghost_valid = True
         self.gesture_origin = None
@@ -770,17 +773,51 @@ class Timeline(QWidget):
         event.accept()
 
     def dragEnterEvent(self,event):
-        if event.mimeData().hasFormat(ASSET_MIME):
+        if event.mimeData().hasFormat(ASSET_MIME) or event.mimeData().hasFormat(LIBRARY_MIME):
             event.acceptProposedAction()
 
     def dragMoveEvent(self,event):
-        candidate=self.asset_drop_candidate(event)
+        candidate=(self.library_drop_candidate(event)
+                   if event.mimeData().hasFormat(LIBRARY_MIME)
+                   else self.asset_drop_candidate(event))
         self.drop_preview=candidate
         if candidate is not None and self.ghost_valid:
             event.acceptProposedAction()
         else:
             event.ignore()
         self.update()
+
+    def library_drop_candidate(self,event):
+        """Return a validated ghost for a sound dragged from the library."""
+        self.ghost_valid=False; self.snapline=None
+        self.feedback='Bibliotheks-Presets über „Verwenden“ auf einen Clip anwenden'
+        if not event.mimeData().hasFormat(LIBRARY_MIME):
+            return None
+        item_id=bytes(event.mimeData().data(LIBRARY_MIME)).decode('utf-8', 'replace')
+        item=self.library_catalog.get(item_id)
+        if item is None or item.kind != 'sound':
+            return None
+        track=self.track_at(event.position().y())
+        if track is None or track >= 0:
+            self.feedback='Bibliotheks-Sounds gehören auf eine Audio-Spur'
+            return None
+        position=self.time_at(event.position().x())
+        if self.snap and not(event.modifiers() & Qt.ShiftModifier):
+            target=snap_time(position,self.snap_targets(),8/self.scale)
+            if abs(target-position)>1e-9: self.snapline=target
+            position=target
+        candidate=library_preview_clip(item,position,track)
+        if candidate is None:
+            return None
+        if self.track_locked(track):
+            return candidate
+        try:
+            validate_timeline(self.clips+[candidate],self.tracks,files=False)
+            self.ghost_valid=True
+            self.feedback=f'Einfügen · {item.title} · {position:.2f} s · {self.track_names.get(track,track)}'
+        except (ValueError,IndexError):
+            self.feedback='Nicht einfügbar: Überlappung oder ungültige Position'
+        return candidate
 
     def asset_drop_candidate(self,event):
         self.ghost_valid=False; self.snapline=None
@@ -810,9 +847,20 @@ class Timeline(QWidget):
         self.drop_preview=None; self.snapline=None; self.feedback=''; self.ghost_valid=True; self.update()
 
     def dropEvent(self,event):
-        candidate=self.asset_drop_candidate(event)
-        if candidate is not None and self.ghost_valid:
-            index=int(bytes(event.mimeData().data(ASSET_MIME)).decode())
-            self.add_asset.emit(index,candidate.position,candidate.track); event.acceptProposedAction()
-        else: event.ignore()
+        if event.mimeData().hasFormat(LIBRARY_MIME):
+            candidate=self.library_drop_candidate(event)
+            if candidate is not None and self.ghost_valid:
+                item_id=bytes(event.mimeData().data(LIBRARY_MIME)).decode('utf-8', 'replace')
+                self.library_action.emit(item_id,candidate.position,candidate.track)
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+        elif event.mimeData().hasFormat(ASSET_MIME):
+            candidate=self.asset_drop_candidate(event)
+            if candidate is not None and self.ghost_valid:
+                index=int(bytes(event.mimeData().data(ASSET_MIME)).decode())
+                self.add_asset.emit(index,candidate.position,candidate.track); event.acceptProposedAction()
+            else: event.ignore()
+        else:
+            event.ignore()
         self.drop_preview=None; self.snapline=None; self.feedback=''; self.ghost_valid=True; self.update()

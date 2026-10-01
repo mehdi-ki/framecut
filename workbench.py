@@ -9,7 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QByteArray
 from PySide6.QtGui import QFont, QFontMetricsF, QImage, QPixmap, QAction
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout,
     QDialog, QLabel, QPushButton, QToolButton, QLineEdit, QCheckBox, QComboBox,
     QMenu, QListWidget, QListWidgetItem, QMessageBox, QDoubleSpinBox)
 from PySide6.QtMultimedia import QMediaPlayer
@@ -62,7 +62,7 @@ class SmoothWorkbench:
         self.video.transform_started.connect(self.player.pause)
         self.video.transform_committed.connect(self.commit_view_transform)
 
-        bar=QWidget(); row=QHBoxLayout(bar); row.setContentsMargins(8,2,8,3)
+        bar=QWidget(); bar.setObjectName('timelineInlineBar'); row=QHBoxLayout(bar); row.setContentsMargins(6,1,6,1); row.setSpacing(4)
         row.addWidget(QLabel('CLIP'))
         self.inline_name=QLineEdit(); self.inline_name.setMaxLength(200); self.inline_name.setPlaceholderText('Clipname')
         self.inline_name.setAccessibleName('Clipname direkt bearbeiten'); self.inline_name.setMaximumWidth(260)
@@ -101,7 +101,8 @@ class SmoothWorkbench:
             self.performance_combo.addItem(title,value)
         self.performance_combo.setToolTip('Vorschau-Leistung · Export verwendet immer Originalmedien')
         self.performance_combo.currentIndexChanged.connect(self.performance_changed)
-        preview_row=QHBoxLayout(); preview_row.addWidget(self.performance_combo,1)
+        performance_bar=QFrame(); performance_bar.setObjectName('previewPerformanceBar')
+        preview_row=QHBoxLayout(performance_bar); preview_row.setContentsMargins(0,1,0,1); preview_row.setSpacing(4); preview_row.addWidget(self.performance_combo,1)
         self.compare_button=QPushButton('Original vergleichen · B halten')
         self.compare_button.setToolTip('Gedrückt halten: Timeline ohne Bild-Effekte. Ton, Timing und Bildposition bleiben erhalten.')
         self.compare_button.pressed.connect(self.compare_pressed); self.compare_button.released.connect(self.compare_released)
@@ -109,7 +110,7 @@ class SmoothWorkbench:
         options=QToolButton(); options.setText('⋯'); options.setCheckable(True)
         options.setToolTip('Erweiterte Vorschauoptionen · Proxys, GPU und Cache')
         options.toggled.connect(self.preview_tools.setVisible); preview_row.addWidget(options)
-        self.preview_tools.hide(); self.video_stack.parentWidget().layout().addLayout(preview_row)
+        self.preview_tools.hide(); self.video_stack.parentWidget().layout().addWidget(performance_bar)
 
         for name,value in vars(self).copy().items():
             if isinstance(value,FineDoubleSpinBox):
@@ -168,7 +169,8 @@ class SmoothWorkbench:
         self.ui_scale=percent
         self.setStyleSheet(scaled_style(STYLE,percent))
         self.timeline.ui_scale=percent/100
-        self.timeline.ROW=round(70*percent/100); self.timeline.LEFT=round(150*percent/100)
+        # Keep the compact CapCut-like density at every supported UI scale.
+        self.timeline.ROW=round(58*percent/100); self.timeline.LEFT=round(118*percent/100)
         for control in self.findChildren(QToolButton):
             if control.objectName() in ('headerToolButton','timelineToolButton','timelineToolToggle','timelineToolDanger','sourceToolButton','sourceToolDanger','contextAction','timelineMenuButton'):
                 control.setFixedSize(round(34*percent/100),round(30*percent/100))
@@ -343,10 +345,10 @@ class SmoothWorkbench:
                             image=QImage(str(target))
                         if not image.isNull(): posters[source_path]=image.scaled(320,180,Qt.KeepAspectRatio,Qt.SmoothTransformation)
                     if (asset.has_audio or asset.kind=='audio') and source_path not in waveforms:
-                        target=root/(uuid.uuid5(uuid.NAMESPACE_URL,key+'-wave-v4').hex+'.png')
+                        target=root/(uuid.uuid5(uuid.NAMESPACE_URL,key+'-wave-v5').hex+'.png')
                         if not target.exists():
                             subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-i',asset.path,
-                                '-filter_complex','[0:a]showwavespic=s=1600x180:colors=63ead4:scale=sqrt:draw=scale:filter=peak[v]',
+                                '-filter_complex','[0:a]showwavespic=s=1600x180:colors=2b9ed8|f0a94a:scale=sqrt:draw=scale:filter=peak[v]',
                                 '-map','[v]','-frames:v','1','-threads','1',str(target)],check=True,timeout=20,capture_output=True)
                         image=QImage(str(target))
                         if not image.isNull(): waves[source_path]=image

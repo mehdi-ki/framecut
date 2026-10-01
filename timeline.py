@@ -62,7 +62,11 @@ class Timeline(QWidget):
     navigation_started = Signal()
     trim_preview = Signal(object, str)
     gesture_done = Signal()
-    LEFT, TOP, ROW = 150, 36, 70
+    # CapCut keeps the track header narrow and gives the actual edit surface
+    # most of the width.  These values also make the timeline feel denser
+    # without changing any hit-testing semantics (all callers use the class
+    # constants when they synthesize input in tests).
+    LEFT, TOP, ROW = 118, 34, 58
 
     def __init__(self):
         super().__init__()
@@ -272,7 +276,7 @@ class Timeline(QWidget):
         center=rect.center().y()
         bars=max(10,min(96,int(rect.width()/6)))
         seed=sum(ord(value) for value in str(getattr(clip,'uid','audio')))
-        color=QColor(197,255,219,80 if ghost else 150)
+        color=QColor(52,176,232,85 if ghost else 175)
         painter.setPen(QPen(color,1.2))
         for index in range(bars):
             phase=(seed % 37)/11.0 + index*.73
@@ -343,13 +347,13 @@ class Timeline(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), QColor('#0c131b'))
+        p.fillRect(self.rect(), QColor('#171717'))
         ruler = QRectF(0, 0, self.width(), self.TOP)
-        p.fillRect(ruler, QColor('#111d28'))
-        p.fillRect(QRectF(0, 0, self.LEFT, self.TOP), QColor('#15232e'))
-        p.setPen(QColor('#8ea6b5'))
+        p.fillRect(ruler, QColor('#202020'))
+        p.fillRect(QRectF(0, 0, self.LEFT, self.TOP), QColor('#242424'))
+        p.setPen(QColor('#929292'))
         p.setFont(self.ui_font( 8, QFont.Bold))
-        p.drawText(QRectF(14, 0, self.LEFT-24, self.TOP), Qt.AlignLeft|Qt.AlignVCenter, 'TRACKS')
+        p.drawText(QRectF(12, 0, self.LEFT-24, self.TOP), Qt.AlignLeft|Qt.AlignVCenter, 'TRACKS')
         p.setFont(self.ui_font(9))
         viewport = QRectF(event.rect())
         steps = [.1,.25,.5,1,2,5,10,15,30,60,120,300,600]
@@ -358,38 +362,40 @@ class Timeline(QWidget):
         end = int((viewport.right()-self.LEFT)/self.scale/step)+2
         for k in range(begin,end):
             t=k*step; x=self.LEFT+t*self.scale
-            p.setPen(QColor('#22323f')); p.drawLine(int(x),self.TOP,int(x),self.height())
-            p.setPen(QColor('#9ab0bd'))
+            p.setPen(QColor('#2b2b2b')); p.drawLine(int(x),self.TOP,int(x),self.height())
+            p.setPen(QColor('#a3a3a3'))
             p.drawText(int(x)+5,22,f'{int(t)//60:02}:{t%60:04.1f}' if step<1 else f'{int(t)//60:02}:{int(t)%60:02}')
-        p.fillRect(0,self.TOP,self.LEFT,self.height()-self.TOP,QColor('#111b25'))
-        p.setPen(QPen(QColor('#304451'),1)); p.drawLine(self.LEFT,0,self.LEFT,self.height())
+        p.fillRect(0,self.TOP,self.LEFT,self.height()-self.TOP,QColor('#202020'))
+        p.setPen(QPen(QColor('#363636'),1)); p.drawLine(self.LEFT,0,self.LEFT,self.height())
         p.setFont(self.ui_font(9))
         for i, track in enumerate(self.tracks):
             y=self.TOP+i*self.ROW
-            row_color = QColor('#101a23' if i % 2 == 0 else '#0e1720')
+            row_color = QColor('#1a1a1a' if i % 2 == 0 else '#171717')
             p.fillRect(QRectF(0,y,self.width(),self.ROW), row_color)
-            p.setPen(QColor('#233541')); p.drawLine(0,y,self.width(),y)
-            p.setPen(QColor('#8bd9c5' if track < 0 else '#8fc9e1'))
+            p.setPen(QColor('#2e2e2e')); p.drawLine(0,y,self.width(),y)
+            p.setPen(QColor('#62c5ee' if track > 0 else '#4baff0'))
             p.setFont(self.ui_font(9,QFont.Bold))
             name=self.track_names.get(track, f'VIDEO {track}' if track>0 else f'AUDIO {-track}')
-            track_icon='▣' if track > 0 else '♫'
-            p.drawText(QRectF(12,y+9,self.LEFT-64,22),Qt.AlignLeft|Qt.AlignVCenter,f'{track_icon}  {name}')
+            track_icon='V' if track > 0 else 'A'
+            short_name=str(name).replace('VIDEO ','V').replace('AUDIO ','A')[:12]
+            p.drawText(QRectF(10,y+7,self.LEFT-54,20),Qt.AlignLeft|Qt.AlignVCenter,f'{track_icon}  {short_name}')
             p.setFont(self.ui_font(8))
-            p.setPen(QColor('#6f8797'))
-            p.drawText(QRectF(12,y+32,self.LEFT-24,18),Qt.AlignLeft|Qt.AlignVCenter,'Bild + Ton' if track>0 else 'Musik / Ton')
+            p.setPen(QColor('#777777'))
+            p.drawText(QRectF(10,y+29,self.LEFT-24,16),Qt.AlignLeft|Qt.AlignVCenter,'Video' if track>0 else 'Audio')
             state = self.track_states.get(track, {})
-            mute_color = QColor('#ff9ca6' if state.get('muted') else '#78909e')
-            lock_color = QColor('#f4c86b' if state.get('locked') else '#78909e')
-            for box_x, letter, color in ((self.LEFT-53,'M',mute_color),(self.LEFT-29,'L',lock_color)):
-                p.setBrush(QColor('#26333d') if ((letter == 'M' and state.get('muted')) or (letter == 'L' and state.get('locked'))) else QColor('#192630'))
-                p.setPen(QPen(QColor('#334957'),1)); p.drawRoundedRect(QRectF(box_x,y+16,20,20),5,5)
-                p.setPen(color); p.setFont(self.ui_font(8,QFont.Bold)); p.drawText(QRectF(box_x,y+16,20,20),Qt.AlignCenter,letter)
+            mute_color = QColor('#ff8795' if state.get('muted') else '#8b8b8b')
+            lock_color = QColor('#f2c45c' if state.get('locked') else '#8b8b8b')
+            for box_x, letter, color in ((self.LEFT-48,'M',mute_color),(self.LEFT-24,'L',lock_color)):
+                active = (letter == 'M' and state.get('muted')) or (letter == 'L' and state.get('locked'))
+                p.setBrush(QColor('#3b292d' if active else '#292929'))
+                p.setPen(QPen(QColor('#454545'),1)); p.drawRoundedRect(QRectF(box_x,y+17,20,20),3,3)
+                p.setPen(color); p.setFont(self.ui_font(8,QFont.Bold)); p.drawText(QRectF(box_x,y+17,20,20),Qt.AlignCenter,letter)
         for marker in self.markers:
             marker_time = float(marker.get('time', 0.0))
             x = self.LEFT + marker_time * self.scale
             if x < viewport.left()-12 or x > viewport.right()+12:
                 continue
-            color = QColor(marker.get('color', '#63ead4'))
+            color = QColor(marker.get('color', '#36b6e8'))
             p.setPen(QPen(color, 1, Qt.DashLine)); p.drawLine(int(x), 4, int(x), self.height())
             p.setPen(Qt.NoPen); p.setBrush(color)
             p.drawPolygon(QPolygonF([QPointF(x, 4), QPointF(x+6, 4), QPointF(x, 11)]))
@@ -413,15 +419,16 @@ class Timeline(QWidget):
             p.drawText(feedback_rect.adjusted(8,0,-5,0),Qt.AlignVCenter,self.feedback)
         if self.marquee_active and self.marquee_start is not None and self.marquee_current is not None:
             rect = QRectF(self.marquee_start, self.marquee_current).normalized()
-            p.setPen(QPen(QColor('#63ead4'), 1, Qt.DashLine)); p.setBrush(QColor(99,234,212,35)); p.drawRect(rect)
+            p.setPen(QPen(QColor('#36b6e8'), 1, Qt.DashLine)); p.setBrush(QColor(54,182,232,35)); p.drawRect(rect)
         if not self.clips:
             p.setPen(QColor('#8794a6')); p.setFont(self.ui_font(10,QFont.Bold)); p.drawText(self.LEFT+24,self.TOP+40,'Timeline leer · Medien hierher ziehen oder mit + hinzufügen')
         if self.snapline is not None:
             p.setPen(QPen(QColor('#f8c86f'),1,Qt.DashLine))
             x=int(self.LEFT+self.snapline*self.scale); p.drawLine(x,28,x,self.height())
-        p.setPen(QPen(QColor('#f2fffc'),2))
+        p.setPen(QPen(QColor('#f4f4f4'),2))
         x=int(self.LEFT+self.playhead*self.scale); p.drawLine(x,24,x,self.height())
-        p.fillRect(x-4,24,8,10,QColor('#f2fffc'))
+        p.setBrush(QColor('#f4f4f4')); p.setPen(Qt.NoPen)
+        p.drawPolygon(QPolygonF([QPointF(x-5,24),QPointF(x+5,24),QPointF(x,31)]))
 
     def draw_clip(self,p,c,ghost,viewport=None):
         r=self.rect_for(c)
@@ -429,17 +436,17 @@ class Timeline(QWidget):
             return
         selected=c.uid in self.selection
         p.setOpacity(.7 if ghost else 1)
-        border = QColor('#8cebdd' if selected else '#4b7381' if c.track>0 else '#3f806e')
-        fill = QColor('#4b3d20' if c.source_type=='adjustment' else '#3a2b50' if c.kind=='text' else '#1d3b48' if c.track>0 else '#1b3a32')
+        border = QColor('#52d9ff' if selected else '#2c8ba5' if c.track>0 else '#287fc0')
+        fill = QColor('#5c4321' if c.source_type=='adjustment' else '#3b2c61' if c.kind=='text' else '#1d5b70' if c.track>0 else '#07598a')
         p.setPen(QPen(border,2 if selected else 1))
         p.setBrush(fill)
-        p.drawRoundedRect(r,7,7)
-        accent = QColor('#e6bf67' if c.source_type=='adjustment' else '#c898ed' if c.kind=='text' else '#70c8e2' if c.track>0 else '#72d0ac')
+        p.drawRoundedRect(r,3,3)
+        accent = QColor('#e8b34f' if c.source_type=='adjustment' else '#b78cf1' if c.kind=='text' else '#2eaeca' if c.track>0 else '#1a8fcb')
         if c.label_color:
             accent = QColor(c.label_color)
-        p.setPen(Qt.NoPen); p.setBrush(accent); p.drawRoundedRect(QRectF(r.left()+1,r.top()+1,r.width()-2,3),2,2)
+        p.setPen(Qt.NoPen); p.setBrush(accent); p.drawRect(QRectF(r.left()+1,r.top()+1,r.width()-2,3))
         if selected:
-            p.setBrush(QColor(116,226,208,36)); p.setPen(Qt.NoPen); p.drawRoundedRect(r.adjusted(3,4,-3,-3),5,5)
+            p.setBrush(QColor(82,217,255,30)); p.setPen(Qt.NoPen); p.drawRoundedRect(r.adjusted(2,3,-2,-3),2,2)
         if c.kind == 'text':
             p.setPen(QColor('#f5e8ff')); p.setFont(self.ui_font(9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),'T  '+c.text[:24])
             p.setPen(QColor('#d8b9ef')); p.setFont(self.ui_font(8)); p.drawText(int(r.left()+10),int(r.top()+43),f'{c.length:.2f} s  ·  Text')
@@ -453,7 +460,7 @@ class Timeline(QWidget):
                     p.setOpacity((.45 if ghost else .72) if not selected else (.55 if ghost else .82))
                     p.drawImage(x, int(r.top()+2), image)
                     x += tile_w
-                p.fillRect(r.adjusted(2,2,-2,-2), QColor(8,14,20,105 if not selected else 75))
+                p.fillRect(r.adjusted(2,2,-2,-2), QColor(6,13,20,90 if not selected else 55))
                 p.restore()
         if c.source_type == 'adjustment':
             p.save(); p.setClipRect(r.adjusted(8,2,-7,-2))
@@ -464,8 +471,10 @@ class Timeline(QWidget):
             image = self._waveform(c, r.width()-6, r.height()-6)
             if image is not None:
                 p.save(); p.setClipRect(r.adjusted(3,3,-3,-3))
-                p.setOpacity(.72 if not ghost else .35)
+                p.setOpacity(.88 if not ghost else .38)
                 p.drawImage(int(r.left()+3), int(r.top()+3), image)
+                p.setPen(QPen(QColor('#f2a653',105 if not ghost else 45),1))
+                p.drawLine(QPointF(r.left()+3,r.center().y()),QPointF(r.right()-3,r.center().y()))
                 p.restore()
             else:
                 self._draw_waveform_placeholder(p,c,r,ghost)
@@ -484,9 +493,9 @@ class Timeline(QWidget):
         p.restore()
         if selected and r.width()>18:
             p.setOpacity(1)
-            p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor('#b7fff4'),2)); p.drawRoundedRect(r,7,7)
-            p.fillRect(QRectF(r.left()+3,r.top()+15,3,max(2,r.height()-30)),QColor('#8de7da'))
-            p.fillRect(QRectF(r.right()-6,r.top()+15,3,max(2,r.height()-30)),QColor('#8de7da'))
+            p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor('#52d9ff'),2)); p.drawRoundedRect(r,3,3)
+            p.fillRect(QRectF(r.left()+2,r.top()+12,3,max(2,r.height()-24)),QColor('#52d9ff'))
+            p.fillRect(QRectF(r.right()-5,r.top()+12,3,max(2,r.height()-24)),QColor('#52d9ff'))
         if c.kind == 'video' and c.keyframes and r.width() > 18:
             p.setOpacity(.95 if not ghost else .45)
             p.setPen(Qt.NoPen); p.setBrush(QColor('#f8c86f'))
@@ -519,8 +528,8 @@ class Timeline(QWidget):
             for text,color in reversed(badges):
                 width=25 if text != 'VOL' else 31
                 badge_x-=width
-                p.setPen(Qt.NoPen); p.setBrush(QColor(color)); p.drawRoundedRect(QRectF(badge_x,r.top()+8,width,16),4,4)
-                p.setPen(QColor('#12202a')); p.setFont(self.ui_font(7,QFont.Bold)); p.drawText(QRectF(badge_x,r.top()+8,width,16),Qt.AlignCenter,text)
+                p.setPen(Qt.NoPen); p.setBrush(QColor(color)); p.drawRoundedRect(QRectF(badge_x,r.top()+7,width,15),3,3)
+                p.setPen(QColor('#12202a')); p.setFont(self.ui_font(7,QFont.Bold)); p.drawText(QRectF(badge_x,r.top()+7,width,15),Qt.AlignCenter,text)
                 badge_x-=3
             p.restore()
         if self.track_states.get(c.track, {}).get('muted'):
@@ -541,7 +550,7 @@ class Timeline(QWidget):
             p.restore()
         if ghost:
             p.setPen(QPen(QColor('#8dffdf' if self.ghost_valid else '#ff8d97'),2,Qt.DashLine))
-            p.setBrush(Qt.NoBrush); p.drawRoundedRect(r,7,7)
+            p.setBrush(Qt.NoBrush); p.drawRoundedRect(r,3,3)
         p.setOpacity(1)
 
     def _group_ids(self, clip):

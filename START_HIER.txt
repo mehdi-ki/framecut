@@ -1,4 +1,4 @@
-FRAMECUT 3.26.0 — START
+FRAMECUT 3.27.0 — START
 
 NEU: Smooth Workflow mit 32 Verbesserungen an der vorhandenen Bedienung.
 Oben im ⋯-Menü: Bearbeitungsverlauf, Projektstatus, UI-Größe, reduzierte Bewegung.
@@ -34,6 +34,7 @@ NEU IN 3.22.0: Einfach-/Pro-Modus, Schnitt-/Shorts-/Audio-/Farb-/Untertitel-Layo
 NEU IN 3.24.0: Offline-Starter-Bibliothek mit Sounds, Videoeffekt-Presets, Clip-Animationen und Übergängen. Suche, Kategorien, Sound-Vorschau, direkte Anwendung und Sound-Drag-and-drop sind integriert.
 NEU IN 3.26.0: Sound-Bereich statt Sammel-Bibliothek, eigener Animationsbereich, eigene Sound-/Preset-Imports und ein sichtbar getrennter Einfach-/Pro-Modus.
 PLAYER IN 3.26.0: Extrahierte Audiospuren bleiben bei unveränderten Schnitten direkt abspielbar; Audio-Wellenformen werden korrekt grafisch gezeichnet und blockieren den Player nicht.
+NEU IN 3.27.0: CapCut-inspirierter Player und Timeline mit flachen Graphitflächen, kompakter Symbolsteuerung, schmaleren Spurköpfen, türkisfarbenem Abspielkopf und kontrastreicher blau/oranger Audiowellenform.
 
 VORSCHAU: ▶ Einfache Schnittspuren spielen direkt; komplexe Timeline-Mixe werden nach kurzer Bearbeitungspause im Hintergrund berechnet. Der letzte gültige Frame bleibt sichtbar.
 Clip ansehen zeigt sofort die einzelne Quelle.

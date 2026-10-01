@@ -1,4 +1,9 @@
-# Framecut 3.26.0 — Smooth Workflow
+# Framecut 3.27.0 — CapCut-inspired Player & Timeline
+
+Dieses Release übernimmt die bewährte Player-/Timeline-Hierarchie aus modernen
+Schnittprogrammen: flache Graphitflächen, kompakte Symbolleisten, mehr Platz für
+die Vorschau, schmalere Spurköpfe sowie kontrastreiche Video- und Audioclips.
+Die bisherigen 32 Smooth-Workflow-Verbesserungen bleiben vollständig erhalten.
 
 Dieses Update verbessert den vorhandenen Schnittworkflow in 32 Punkten.
 Projekte bleiben kompatibel; neue Clip-Metadaten werden mit neutralen Vorgaben geladen.

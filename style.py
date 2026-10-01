@@ -788,4 +788,266 @@ QToolTip {
     border: 1px solid #7195a5;
     padding: 6px;
 }
+
+/* CapCut-inspired player/timeline surface: flatter graphite panels, a
+   brighter cyan action color, and almost no decorative rounding.  The rest
+   of the editor keeps its existing dark theme so the redesign stays focused
+   on the two areas where editing happens. */
+QFrame#modebar {
+    background: #1a1a1a;
+    border: 1px solid #2b2b2b;
+    border-radius: 3px;
+}
+
+QPushButton#modeTab,
+QPushButton#modeTabActive {
+    color: #9a9a9a;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    padding: 5px 9px;
+    min-height: 22px;
+}
+
+QPushButton#modeTab:hover {
+    color: #e9e9e9;
+    background: #292929;
+}
+
+QPushButton#modeTabActive {
+    color: #43c9f2;
+    background: #233b48;
+    border-color: #2f94b5;
+    font-weight: 800;
+}
+
+QFrame#previewPanel,
+QFrame#timelinePanel {
+    background: #171717;
+    border: 1px solid #2b2b2b;
+    border-radius: 3px;
+}
+
+QFrame#previewHeader {
+    background: #1e1e1e;
+    border-bottom: 1px solid #2b2b2b;
+    padding: 1px 5px;
+}
+
+QFrame#previewPanel QLabel#heading {
+    color: #d8d8d8;
+    font-size: 10px;
+    letter-spacing: .7px;
+}
+
+QLabel#previewStatus {
+    color: #777777;
+    font-size: 10px;
+    padding: 0 2px;
+    min-height: 14px;
+    max-height: 16px;
+}
+
+QLabel#previewModePill {
+    color: #50c9ee;
+    background: #203846;
+    border: 1px solid #2d7591;
+    border-radius: 2px;
+    padding: 2px 6px;
+    font-size: 9px;
+}
+
+QStackedWidget#previewCanvas {
+    background: #050505;
+    border: 1px solid #303030;
+    border-radius: 2px;
+}
+
+QSlider#previewSeek {
+    min-height: 8px;
+    max-height: 8px;
+}
+
+QSlider#previewSeek::groove:horizontal {
+    height: 3px;
+    background: #3a3a3a;
+    border-radius: 1px;
+}
+
+QSlider#previewSeek::sub-page:horizontal {
+    background: #2db4df;
+    border-radius: 1px;
+}
+
+QSlider#previewSeek::handle:horizontal {
+    width: 8px;
+    height: 8px;
+    margin: -3px 0;
+    background: #f2f2f2;
+    border: 1px solid #41c8ef;
+    border-radius: 4px;
+}
+
+QFrame#playerTransport {
+    background: #1d1d1d;
+    border-top: 1px solid #282828;
+    border-bottom: 1px solid #282828;
+    padding: 2px 4px;
+}
+
+QPushButton#previewPlayButton,
+QPushButton#previewControlButton {
+    color: #d9d9d9;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    padding: 2px 6px;
+    min-width: 28px;
+    min-height: 24px;
+    font-size: 14px;
+}
+
+QPushButton#previewPlayButton {
+    color: #55d0f3;
+    background: #243a45;
+    border-color: #2f7289;
+}
+
+QPushButton#previewPlayButton:hover,
+QPushButton#previewControlButton:hover {
+    color: #ffffff;
+    background: #2b3a42;
+    border-color: #4a9ab4;
+}
+
+QLabel#previewTimecode,
+QLabel#previewTimeLabel {
+    color: #9a9a9a;
+    font-size: 10px;
+    padding-left: 5px;
+}
+
+QFrame#previewSubbar,
+QFrame#previewToolbar {
+    background: #1a1a1a;
+    border: 1px solid #292929;
+    border-radius: 2px;
+}
+
+QFrame#previewToolbar {
+    border-left: none;
+    border-right: none;
+    padding: 0;
+}
+
+QFrame#previewToolbar QCheckBox,
+QFrame#previewToolbar QLabel,
+QFrame#previewToolbar QPushButton,
+QFrame#previewToolbar QComboBox {
+    color: #8a8a8a;
+    font-size: 10px;
+}
+
+QFrame#previewPerformanceBar {
+    background: #171717;
+    border-top: 1px solid #262626;
+    padding: 0;
+}
+
+QFrame#previewPerformanceBar QComboBox,
+QFrame#previewPerformanceBar QPushButton,
+QFrame#previewPerformanceBar QToolButton {
+    min-height: 24px;
+    padding-top: 2px;
+    padding-bottom: 2px;
+    font-size: 10px;
+}
+
+QWidget#timelineInlineBar {
+    background: #1a1a1a;
+    border-top: 1px solid #272727;
+    border-bottom: 1px solid #272727;
+    min-height: 30px;
+    max-height: 32px;
+}
+
+QWidget#timelineInlineBar QLabel,
+QWidget#timelineInlineBar QCheckBox,
+QWidget#timelineInlineBar QToolButton,
+QWidget#timelineInlineBar QLineEdit,
+QWidget#timelineInlineBar QDoubleSpinBox {
+    font-size: 10px;
+    min-height: 22px;
+    max-height: 24px;
+}
+
+QFrame#timelineToolbar {
+    background: #1f1f1f;
+    border: 1px solid #2c2c2c;
+    border-radius: 2px;
+}
+
+QFrame#timelineMeta {
+    background: #181818;
+    border: none;
+}
+
+QFrame#timelinePanel QToolButton#timelineToolButton,
+QFrame#timelinePanel QToolButton#timelineToolToggle,
+QFrame#timelinePanel QToolButton#timelineMenuButton,
+QFrame#timelinePanel QToolButton#timelineToolDanger {
+    color: #a8a8a8;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    padding: 2px;
+    min-width: 28px;
+    min-height: 25px;
+    font-size: 14px;
+}
+
+QFrame#timelinePanel QToolButton#timelineToolButton:hover,
+QFrame#timelinePanel QToolButton#timelineToolToggle:hover,
+QFrame#timelinePanel QToolButton#timelineMenuButton:hover {
+    color: #ffffff;
+    background: #2c3b43;
+    border-color: #3d788d;
+}
+
+QFrame#timelinePanel QToolButton#timelineToolToggle:checked {
+    color: #06151b;
+    background: #3dc0e8;
+    border-color: #58d5f5;
+}
+
+QFrame#timelinePanel QToolButton#timelineToolDanger {
+    color: #e28d99;
+}
+
+QFrame#timelinePanel QLabel#timelineTotal,
+QFrame#timelineMeta QLabel {
+    color: #858585;
+    font-size: 10px;
+}
+
+QFrame#timelinePanel QScrollArea {
+    background: #171717;
+    border: 1px solid #292929;
+    border-radius: 2px;
+}
+
+QFrame#timelinePanel QScrollBar:horizontal {
+    height: 10px;
+    background: #191919;
+}
+
+QFrame#timelinePanel QScrollBar::handle:horizontal {
+    min-width: 34px;
+    background: #4b4b4b;
+    border-radius: 2px;
+}
+
+QFrame#timelinePanel QScrollBar::handle:horizontal:hover {
+    background: #3da8c9;
+}
 """

@@ -1,4 +1,4 @@
-"""Framecut 3.26.0 — native Linux multitrack editor."""
+"""Framecut 3.27.0 — native Linux multitrack editor."""
 import math
 import json
 import os
@@ -44,9 +44,9 @@ from ai_tools import (AIToolError, remove_background_media, track_motion, auto_r
                        analyze_beats, detect_scene_changes, detect_audio_onset)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.26.0'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.27.0'
 except OSError:
-    APP_VERSION = '3.26.0'
+    APP_VERSION = '3.27.0'
 
 
 def label(text,name=None):
@@ -1368,10 +1368,13 @@ class Editor(SmoothWorkbench,QMainWindow):
                               self.media_tools_container,self.media_hint,self.media_empty_hint,
                               self.media_list,self.add_timeline_button)
         top.addWidget(media)
-        preview,pl=panel(); self.preview_panel=preview; preview.setObjectName('previewPanel')
-        preview_header=QHBoxLayout(); preview_header.setContentsMargins(0,0,0,0)
-        preview_header.addWidget(label('VORSCHAU','heading')); preview_header.addStretch(); preview_header.addWidget(label('TIMELINE MIX','statusPill')); pl.addLayout(preview_header)
-        self.preview_status=label('Timeline-Vorschau wird beim ersten Abspielen berechnet.','muted'); self.preview_status.setWordWrap(True); pl.addWidget(self.preview_status)
+        preview,pl=panel(); self.preview_panel=preview; preview.setObjectName('previewPanel'); pl.setContentsMargins(8,7,8,7); pl.setSpacing(5)
+        preview_header_frame=QFrame(); preview_header_frame.setObjectName('previewHeader')
+        preview_header=QHBoxLayout(preview_header_frame); preview_header.setContentsMargins(0,0,0,0); preview_header.setSpacing(6)
+        preview_header.addWidget(label('PLAYER','heading')); preview_header.addStretch()
+        self.preview_mode_pill=label('TIMELINE','statusPill'); self.preview_mode_pill.setObjectName('previewModePill'); preview_header.addWidget(self.preview_mode_pill)
+        pl.addWidget(preview_header_frame)
+        self.preview_status=label('Timeline-Vorschau wird beim ersten Abspielen berechnet.','muted'); self.preview_status.setObjectName('previewStatus'); self.preview_status.setWordWrap(False); pl.addWidget(self.preview_status)
         preview_options=QHBoxLayout(); self.live_preview_box=QCheckBox('Live-Vorschau'); self.live_preview_box.setChecked(True); self.live_preview_box.setToolTip('Nach einer Änderung automatisch eine neue Vorschau berechnen')
         self.quick_preview_box=QCheckBox('Schnellvorschau'); self.quick_preview_box.setChecked(True); self.quick_preview_box.setToolTip('Niedrigere Auflösung und schnelleres Rendering für die Vorschau')
         self.gpu_preview_box=QCheckBox('GPU-Decoding'); self.gpu_preview_box.setChecked(self.gpu_preview_info['available']); self.gpu_preview_box.setEnabled(self.gpu_preview_info['available'])
@@ -1392,11 +1395,14 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.placeholder.setAlignment(Qt.AlignCenter); self.video_stack.addWidget(self.placeholder)
         self.video=VideoView(); self.player.setVideoSink(self.video.sink); self.video_stack.addWidget(self.video)
         pl.addWidget(self.video_stack,1)
-        self.seek=QSlider(Qt.Horizontal); self.seek.setRange(0,10000); self.seek.sliderMoved.connect(self.seek_slider); pl.addWidget(self.seek)
-        controls=QHBoxLayout(); self.play_button=button('▶ Timeline',self.toggle_play); controls.addWidget(self.play_button)
-        controls.addWidget(button('Clip ansehen',self.source_preview)); controls.addStretch()
-        self.cinema_button=button('Vollbild',self.toggle_cinema_preview); self.cinema_button.setIcon(line_icon('view-fullscreen')); self.cinema_button.setObjectName('iconButton'); controls.addWidget(self.cinema_button)
-        self.time_label=label('00:00.0 / 00:00.0','muted'); controls.addWidget(self.time_label); pl.addLayout(controls)
+        self.seek=QSlider(Qt.Horizontal); self.seek.setObjectName('previewSeek'); self.seek.setRange(0,10000); self.seek.sliderMoved.connect(self.seek_slider); pl.addWidget(self.seek)
+        transport=QFrame(); transport.setObjectName('playerTransport')
+        controls=QHBoxLayout(transport); controls.setContentsMargins(0,0,0,0); controls.setSpacing(4)
+        self.play_button=button('▶',self.toggle_play); self.play_button.setObjectName('previewPlayButton'); self.play_button.setToolTip('Timeline abspielen / pausieren · Leertaste'); self.play_button.setAccessibleName('Timeline abspielen oder pausieren'); controls.addWidget(self.play_button)
+        self.source_preview_button=button('◉',self.source_preview); self.source_preview_button.setObjectName('previewControlButton'); self.source_preview_button.setToolTip('Ausgewählten Clip ansehen'); self.source_preview_button.setAccessibleName('Ausgewählten Clip ansehen'); controls.addWidget(self.source_preview_button)
+        controls.addWidget(label('00:00','previewTimecode')); controls.addStretch()
+        self.cinema_button=button('⛶',self.toggle_cinema_preview); self.cinema_button.setIcon(line_icon('view-fullscreen')); self.cinema_button.setObjectName('previewControlButton'); self.cinema_button.setToolTip('Vollbildvorschau'); controls.addWidget(self.cinema_button)
+        self.time_label=label('00:00.0 / 00:00.0','muted'); self.time_label.setObjectName('previewTimeLabel'); controls.addWidget(self.time_label); pl.addWidget(transport)
         source_controls=QHBoxLayout(); source_controls.setContentsMargins(6,0,6,0); source_controls.setSpacing(3)
         self.source_range_label=label('◉ Clip · In/Out','muted'); self.source_range_label.setObjectName('sourceRangeLabel'); source_controls.addWidget(self.source_range_label,1)
         self.source_in_button=timeline_tool_button('I','Quell-In am aktuellen Quellbild setzen · I',self.set_source_in,object_name='sourceToolButton')
@@ -1709,8 +1715,9 @@ class Editor(SmoothWorkbench,QMainWindow):
         actions_section.addWidget(button('Bild zurücksetzen',self.reset_transform)); actions_section.addWidget(button('Übernehmen',self.apply_properties,True)); actions_section.addWidget(button('Audio aus Video extrahieren',self.extract_audio))
         hint=label('Rechtsklick = Aktionen · Mitte ziehen = verschieben · Ränder = kürzen\nShift = ohne Einrasten · Strg-Klick = Mehrfachauswahl · Leertaste = Play/Pause','subtle'); hint.setWordWrap(True); il.addWidget(hint); il.addStretch()
         top.addWidget(inspector); top.setSizes([310,760,360]); top.setStretchFactor(0,0); top.setStretchFactor(1,1); top.setStretchFactor(2,0); vertical.addWidget(top)
-        bottom,bl=panel(); self.timeline_panel=bottom; bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored)
-        bar=QHBoxLayout(); bar.setContentsMargins(10,5,10,5); bar.setSpacing(6)
+        bottom,bl=panel(); self.timeline_panel=bottom; bottom.setObjectName('timelinePanel'); bottom.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Ignored); bl.setContentsMargins(7,7,7,7); bl.setSpacing(4)
+        timeline_toolbar=QFrame(); self.timeline_toolbar=timeline_toolbar; timeline_toolbar.setObjectName('timelineToolbar')
+        bar=QHBoxLayout(timeline_toolbar); bar.setContentsMargins(6,3,6,3); bar.setSpacing(3)
         bar.addWidget(label('TIMELINE','heading')); bar.addSpacing(2); bar.addWidget(timeline_separator())
 
         # Keep the primary editing actions visible, but give them enough
@@ -1789,9 +1796,10 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.snap_box=timeline_tool_button('⌁','Einrasten ein/aus',toggle=True,theme_name='snap-to-grid')
         self.snap_box.setChecked(True); self.snap_box.toggled.connect(lambda b:setattr(self.timeline,'snap',b))
         bar.addWidget(timeline_tool_group('AUSRICHTEN',[self.snap_box]))
-        self.total=label('','muted'); self.total.setObjectName('timelineTotal'); bar.addWidget(self.total); bl.addLayout(bar)
+        self.total=label('','muted'); self.total.setObjectName('timelineTotal'); bar.addWidget(self.total); bl.addWidget(timeline_toolbar)
 
-        row=QHBoxLayout(); row.setContentsMargins(10,0,10,6); row.setSpacing(6)
+        timeline_meta=QFrame(); timeline_meta.setObjectName('timelineMeta')
+        row=QHBoxLayout(timeline_meta); row.setContentsMargins(6,0,6,4); row.setSpacing(6)
         self.autosave_label=label('Autosave bereit','muted'); row.addWidget(self.autosave_label); row.addStretch()
         self.video_tracks=QSpinBox(); self.video_tracks.setRange(1,10); self.video_tracks.setValue(2); self.video_tracks.setToolTip('Anzahl der Video-Spuren'); self.video_tracks.valueChanged.connect(self.track_counts_changed)
         self.audio_tracks=QSpinBox(); self.audio_tracks.setRange(1,10); self.audio_tracks.setValue(2); self.audio_tracks.setToolTip('Anzahl der Audio-Spuren'); self.audio_tracks.valueChanged.connect(self.track_counts_changed)
@@ -1799,7 +1807,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         fit_button=timeline_tool_button('⛶','Timeline einpassen',self.fit_timeline,'view-fullscreen')
         zoom_icon=timeline_icon_label('⌕','Timeline-Zoom')
         self.zoom_slider=QSlider(Qt.Horizontal); self.zoom_slider.setToolTip('Timeline-Zoom'); self.zoom_slider.setRange(2,200); self.zoom_slider.setValue(60); self.zoom_slider.setFixedWidth(120); self.zoom_slider.valueChanged.connect(self.zoom)
-        row.addWidget(timeline_tool_group('ANSICHT',[fit_button,zoom_icon,self.zoom_slider])); bl.addLayout(row)
+        row.addWidget(timeline_tool_group('ANSICHT',[fit_button,zoom_icon,self.zoom_slider])); bl.addWidget(timeline_meta)
         self.timeline=Timeline(); self.timeline.library_catalog={item.item_id:item for item in list(library_items())+list(self.custom_library_items)}
         self.timeline.selection_changed.connect(self.timeline_selection_changed); self.timeline.seek.connect(self.set_playhead)
         self.timeline.context_requested.connect(self.show_context_menu)
@@ -5525,7 +5533,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.transport_timer.stop()
         self.transport_rate=0.0
         self.player.pause(); self.player.setPlaybackRate(1.0)
-        self.play_button.setText('▶ Timeline')
+        self.play_button.setText('▶')
 
     def _start_transport(self, rate):
         if self.worker or not self.clips:
@@ -5781,9 +5789,9 @@ class Editor(SmoothWorkbench,QMainWindow):
     def play_state(self,state):
         if state==QMediaPlayer.PlayingState:
             self.follow_suspended=False
-            self.play_button.setText(f'Ⅱ {self.transport_rate:g}×' if self.transport_rate else 'Ⅱ Pause')
+            self.play_button.setText(f'Ⅱ {self.transport_rate:g}×' if self.transport_rate else 'Ⅱ')
         else:
-            self.play_button.setText('▶ Timeline')
+            self.play_button.setText('▶')
 
     def position_changed(self,ms):
         if self.pending_seek or self.compare_active:return

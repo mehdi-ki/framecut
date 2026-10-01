@@ -1,4 +1,4 @@
-FRAMECUT 3.25.0 — START
+FRAMECUT 3.26.0 — START
 
 NEU: Smooth Workflow mit 32 Verbesserungen an der vorhandenen Bedienung.
 Oben im ⋯-Menü: Bearbeitungsverlauf, Projektstatus, UI-Größe, reduzierte Bewegung.
@@ -32,8 +32,8 @@ NEU IN 3.20.1: Flache Symboltoolbar ohne doppelte Gruppenkästen, einheitliche I
 NEU IN 3.21.0: Neues Workspace-Redesign mit Medien links, größerer Vorschau in der Mitte, aufklappbarem Inspector rechts, kompakterem Header und überarbeiteter Timeline-Optik.
 NEU IN 3.22.0: Einfach-/Pro-Modus, Schnitt-/Shorts-/Audio-/Farb-/Untertitel-Layouts, Fokusansicht, kontextabhängige Clip-Aktionen, Medienfavoriten, Karten-/Listenansicht, bessere leere Zustände und Timeline-Badges.
 NEU IN 3.24.0: Offline-Starter-Bibliothek mit Sounds, Videoeffekt-Presets, Clip-Animationen und Übergängen. Suche, Kategorien, Sound-Vorschau, direkte Anwendung und Sound-Drag-and-drop sind integriert.
-NEU IN 3.25.0: Eigene Bibliotheken für Textdesign, Sticker, Effekte, Übergänge und Filter. Textdesigns werden vor der Texteingabe übernommen; Sticker bleiben editierbare Textobjekte.
-PLAYER IN 3.25.0: Der letzte gültige Mehrspur-Mix bleibt nach einem Schnitt abspielbar, während die neue Vorschau und große Proxy-Quellen unabhängig im Hintergrund aktualisiert werden. Audio-Wellenformen erhalten einen stabilen Medienpfad und sichtbaren Lade-Fallback.
+NEU IN 3.26.0: Sound-Bereich statt Sammel-Bibliothek, eigener Animationsbereich, eigene Sound-/Preset-Imports und ein sichtbar getrennter Einfach-/Pro-Modus.
+PLAYER IN 3.26.0: Extrahierte Audiospuren bleiben bei unveränderten Schnitten direkt abspielbar; Audio-Wellenformen werden korrekt grafisch gezeichnet und blockieren den Player nicht.
 
 VORSCHAU: ▶ Einfache Schnittspuren spielen direkt; komplexe Timeline-Mixe werden nach kurzer Bearbeitungspause im Hintergrund berechnet. Der letzte gültige Frame bleibt sichtbar.
 Clip ansehen zeigt sofort die einzelne Quelle.

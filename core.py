@@ -480,6 +480,10 @@ class Clip:
     source_type: str = "video"  # video, audio, image, image_sequence, text, adjustment
     source_paths: list = field(default_factory=list)
     source_fps: float = 24.0
+    # When audio is extracted from a video, keep the relation so the preview
+    # can continue using the original AV stream until the detached track is
+    # actually changed. This is metadata only; export still renders both clips.
+    linked_source_uid: str = ""
 
     @property
     def length(self):
@@ -551,6 +555,8 @@ class Clip:
             raise ValueError("Videos und Texte gehören auf Video-, Audiodateien auf Audiospuren.")
         if not isinstance(self.uid, str) or not self.uid:
             raise ValueError("Clip-ID fehlt.")
+        if not isinstance(self.linked_source_uid, str):
+            raise ValueError("Ungültige Audio-Verknüpfung.")
         if not isinstance(self.keyframes, list):
             raise ValueError("Ungültige Keyframes.")
         if self.kind != "video" and self.keyframes:

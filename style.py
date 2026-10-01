@@ -362,6 +362,29 @@ QLabel#sourceRangeLabel {
     font-size: 10px;
 }
 
+QLabel#modeBadge {
+    color: #78d7c6;
+    background: #17302f;
+    border: 1px solid #2b665e;
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: .5px;
+}
+
+QLabel#modeBadge[pro="true"] {
+    color: #f3cb82;
+    background: #342c1b;
+    border-color: #765d2b;
+}
+
+QComboBox#editModeCombo[pro="true"] {
+    color: #ffe2a7;
+    background: #352d1d;
+    border-color: #765d2b;
+}
+
 QLabel#emptyState {
     color: #7e96a6;
     background: #101923;

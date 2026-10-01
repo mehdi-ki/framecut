@@ -1,5 +1,6 @@
-"""Framecut 3.25.0 — native Linux multitrack editor."""
+"""Framecut 3.26.0 — native Linux multitrack editor."""
 import math
+import json
 import os
 import sys
 import shutil
@@ -30,8 +31,8 @@ from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_
                   trim_timeline_range,close_track_gaps,copy_keyframe_bundle,paste_keyframe_bundle,
                   write_chapter_file,capture_frame)
 from timeline import Timeline,MediaList
-from asset_library import (AssetLibraryPanel, get_library_item, library_items,
-                           library_items_for, library_sound_path)
+from asset_library import (AssetLibraryPanel, LibraryItem, get_library_item,
+                           library_items, library_items_for, library_sound_path)
 from style import STYLE
 from ux import FineDoubleSpinBox as QDoubleSpinBox, line_icon
 from workbench import SmoothWorkbench, HISTORY_NAMES
@@ -43,9 +44,9 @@ from ai_tools import (AIToolError, remove_background_media, track_motion, auto_r
                        analyze_beats, detect_scene_changes, detect_audio_onset)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.25.0'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.26.0'
 except OSError:
-    APP_VERSION = '3.25.0'
+    APP_VERSION = '3.26.0'
 
 
 def label(text,name=None):
@@ -948,6 +949,9 @@ class Editor(SmoothWorkbench,QMainWindow):
         super().__init__()
         self.state_dir=Path(state_dir) if state_dir else state_directory()
         self.state_dir.mkdir(parents=True,exist_ok=True)
+        self.custom_library_root=self.state_dir/'library'/'custom'
+        self.custom_library_manifest=self.state_dir/'library'/'custom_library.json'
+        self.custom_library_items=self._load_custom_library_items()
         self.init_smooth_state(); self.job_type=Job
         self.recovery_path=self.state_dir/'recovery.framecut'
         self.cache_root=self.state_dir/'cache'; self.cache_root.mkdir(parents=True,exist_ok=True)
@@ -1043,6 +1047,153 @@ class Editor(SmoothWorkbench,QMainWindow):
         if recovery: QTimer.singleShot(0,self.offer_recovery)
         if configured_manifest_url(): QTimer.singleShot(2500,lambda:self.check_for_updates(True))
 
+    CUSTOM_LIBRARY_CATEGORIES = {
+        'sounds': 'sound',
+        'effects': 'effect',
+        'animations': 'animation',
+        'transitions': 'transition',
+        'text_styles': 'text_style',
+        'stickers': 'sticker',
+        'filters': 'filter',
+    }
+
+    def _load_custom_library_items(self):
+        """Load user assets without making the built-in catalog mutable."""
+        try:
+            raw=json.loads(self.custom_library_manifest.read_text(encoding='utf-8'))
+        except (OSError,ValueError,TypeError):
+            return []
+        items=[]
+        for value in raw if isinstance(raw,list) else []:
+            if not isinstance(value,dict):
+                continue
+            category=str(value.get('category','')).strip()
+            kind=str(value.get('kind','')).strip()
+            if category not in self.CUSTOM_LIBRARY_CATEGORIES or kind != self.CUSTOM_LIBRARY_CATEGORIES[category]:
+                continue
+            parameters=value.get('parameters',{})
+            if not isinstance(parameters,dict):
+                parameters={}
+            try:
+                items.append(LibraryItem(
+                    str(value.get('item_id') or f'custom_{uuid.uuid4().hex}'),
+                    str(value.get('title') or 'Eigenes Asset'), category, kind,
+                    str(value.get('description') or 'Eigenes Framecut-Asset.'),
+                    tuple(str(tag) for tag in value.get('tags',[]) if str(tag).strip()),
+                    str(value.get('icon') or 'package-x-generic'),
+                    float(value.get('duration') or 0.0), dict(parameters)))
+            except (TypeError,ValueError):
+                continue
+        return items
+
+    def _save_custom_library_items(self):
+        self.custom_library_manifest.parent.mkdir(parents=True,exist_ok=True)
+        payload=[]
+        for item in self.custom_library_items:
+            payload.append({'item_id':item.item_id,'title':item.title,'category':item.category,
+                            'kind':item.kind,'description':item.description,'tags':list(item.tags),
+                            'icon':item.icon,'duration':item.duration,'parameters':dict(item.parameters)})
+        temporary=self.custom_library_manifest.with_name(f'.{self.custom_library_manifest.name}.{uuid.uuid4().hex}.tmp')
+        temporary.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
+        temporary.replace(self.custom_library_manifest)
+
+    def _library_items_for(self, category):
+        category=str(category)
+        return tuple(library_items_for(category))+tuple(item for item in self.custom_library_items
+                                                        if item.category == category)
+
+    def _library_item(self, item_id):
+        return get_library_item(item_id) or next((item for item in self.custom_library_items
+                                                   if item.item_id == str(item_id)),None)
+
+    def _refresh_custom_library(self):
+        """Refresh every preset panel and the timeline's drag catalog."""
+        if hasattr(self,'asset_library_panel'):
+            self.asset_library_panel.set_items(self._library_items_for('sounds'))
+        category_by_panel={'text':'text_styles','sticker':'stickers','effects':'effects',
+                           'animations':'animations','transitions':'transitions','filters':'filters'}
+        for key,panel_widget in getattr(self,'library_panels',{}).items():
+            panel_widget.set_items(self._library_items_for(category_by_panel.get(key,key)))
+        if hasattr(self,'timeline'):
+            catalog=list(library_items())+list(self.custom_library_items)
+            self.timeline.library_catalog={item.item_id:item for item in catalog}
+
+    def import_custom_library_asset(self, category):
+        """Import user sounds or JSON/LUT presets into the local asset catalog."""
+        category=str(category or '').strip()
+        if category == 'all':
+            category,ok=QInputDialog.getItem(self,'Eigenes Asset importieren','Kategorie:',
+                                              ['sounds','effects','animations','transitions','text_styles','stickers','filters'],0,False)
+            if not ok:
+                return
+        if category not in self.CUSTOM_LIBRARY_CATEGORIES:
+            return self.error('Diese Asset-Kategorie wird nicht unterstützt.')
+        if category == 'sounds':
+            paths,_=QFileDialog.getOpenFileNames(
+                self,'Eigene Sounds importieren','',
+                'Audio (*.wav *.mp3 *.flac *.ogg *.m4a *.aac);;Alle Dateien (*)')
+            if not paths:
+                return
+            added=[]; errors=[]
+            self.custom_library_root.mkdir(parents=True,exist_ok=True)
+            for path in paths:
+                try:
+                    source=Path(path).expanduser().resolve()
+                    audio=import_clip(source)
+                    if audio.kind != 'audio':
+                        raise ValueError('Die Datei enthält keine reine Audiospur.')
+                    target=self.custom_library_root/f'{uuid.uuid4().hex}{source.suffix.lower()}'
+                    shutil.copy2(source,target)
+                    added.append(LibraryItem(
+                        f'custom_sound_{uuid.uuid4().hex}',source.stem,'sounds','sound',
+                        'Eigener importierter Sound.',('custom','audio'),'audio-volume-high',
+                        float(audio.duration),{'path':str(target)}))
+                except Exception as exc:
+                    errors.append(f'{Path(path).name}: {exc}')
+            if added:
+                self.custom_library_items.extend(added); self._save_custom_library_items(); self._refresh_custom_library()
+                self.statusBar().showMessage(f'{len(added)} eigene Sounds importiert.',4000)
+            if errors:
+                self.error('\n'.join(errors))
+            return
+
+        preset_filter='Framecut-Preset (*.json);;Alle Dateien (*)'
+        if category == 'filters':
+            preset_filter='Framecut-Preset oder LUT (*.json *.cube *.3dl);;Alle Dateien (*)'
+        path,_=QFileDialog.getOpenFileName(self,'Eigenes Asset importieren','',preset_filter)
+        if not path:
+            return
+        try:
+            source=Path(path).expanduser().resolve()
+            self.custom_library_root.mkdir(parents=True,exist_ok=True)
+            if category == 'filters' and source.suffix.lower() in ('.cube','.3dl'):
+                target=self.custom_library_root/f'{uuid.uuid4().hex}{source.suffix.lower()}'
+                shutil.copy2(source,target)
+                item=LibraryItem(f'custom_filter_{uuid.uuid4().hex}',source.stem,'filters','filter',
+                                 'Eigene LUT für Farblooks.',('custom','lut'),'color-management',0.0,
+                                 {'filter_preset':'none','lut_path':str(target)})
+            else:
+                payload=json.loads(source.read_text(encoding='utf-8'))
+                if not isinstance(payload,dict):
+                    raise ValueError('Das Preset muss ein JSON-Objekt sein.')
+                payload_category=str(payload.get('category') or category)
+                if payload_category != category:
+                    raise ValueError(f'Das Preset gehört zur Kategorie „{payload_category}“, nicht „{category}“.')
+                kind=self.CUSTOM_LIBRARY_CATEGORIES[category]
+                parameters=payload.get('parameters',{})
+                if not isinstance(parameters,dict):
+                    raise ValueError('„parameters“ muss ein JSON-Objekt sein.')
+                item=LibraryItem(
+                    f'custom_{kind}_{uuid.uuid4().hex}',str(payload.get('title') or source.stem),
+                    category,kind,str(payload.get('description') or 'Eigenes Framecut-Preset.'),
+                    tuple(str(tag) for tag in payload.get('tags',[]) if str(tag).strip()),
+                    str(payload.get('icon') or 'package-x-generic'),float(payload.get('duration') or 0.0),
+                    dict(parameters))
+            self.custom_library_items.append(item); self._save_custom_library_items(); self._refresh_custom_library()
+            self.statusBar().showMessage(f'Eigenes Asset „{item.title}“ importiert.',4000)
+        except Exception as exc:
+            self.error(f'Asset konnte nicht importiert werden: {exc}')
+
     def build_ui(self):
         root=QWidget(); root.setObjectName('editorRoot')
         outer=QVBoxLayout(root); outer.setContentsMargins(12,10,12,8); outer.setSpacing(8)
@@ -1095,9 +1246,10 @@ class Editor(SmoothWorkbench,QMainWindow):
             tab.clicked.connect(activate); mode_layout.addWidget(tab)
             return tab
         mode_tab('Medien',self.open_media_panel,True,'Medienablage öffnen')
-        mode_tab('Bibliothek',self.open_library_panel,tooltip='Starter-Bibliothek mit Sounds, Effekten und Animationen öffnen')
+        mode_tab('Sound',self.open_sound_panel,tooltip='Soundbibliothek öffnen und eigene Sounds importieren')
         mode_tab('Audio',self.open_mixer,tooltip='Audio-Mixer öffnen')
         mode_tab('Text',self.open_text_panel,tooltip='Textdesign auswählen und Textclip anlegen')
+        mode_tab('Animation',self.open_animation_panel,tooltip='Animationsbibliothek öffnen')
         mode_tab('Sticker',self.open_sticker_panel,tooltip='Offline-Stickerbibliothek öffnen')
         mode_tab('Effekte',self.open_effects_panel,tooltip='Effektbibliothek öffnen')
         mode_tab('Übergänge',self.open_transitions_panel,tooltip='Übergangsbibliothek öffnen')
@@ -1119,6 +1271,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.edit_mode_combo.setToolTip('Einfach zeigt nur die häufigsten Einstellungen · Pro zeigt alle Werkzeuge')
         self.edit_mode_combo.currentIndexChanged.connect(self.set_edit_mode)
         mode_layout.addWidget(self.edit_mode_combo)
+        self.edit_mode_badge=label('KERNWERKZEUGE','modeBadge'); mode_layout.addWidget(self.edit_mode_badge)
         self.focus_button=QPushButton('Fokus'); self.focus_button.setObjectName('modeTab'); self.focus_button.setToolTip('Vorschau und Timeline vergrößern · Strg+Shift+F')
         self.focus_button.clicked.connect(self.toggle_focus_mode); mode_layout.addWidget(self.focus_button)
         outer.addWidget(modebar)
@@ -1173,25 +1326,32 @@ class Editor(SmoothWorkbench,QMainWindow):
         ml.addWidget(self.media_list,1)
         self.add_timeline_button=button('＋ Zur Timeline hinzufügen',self.add_selected_asset); ml.addWidget(self.add_timeline_button)
         self.library_stack=QStackedWidget(); self.library_stack.setObjectName('libraryStack'); self.library_stack.hide()
-        self.asset_library_panel=AssetLibraryPanel()
+        self.asset_library_panel=AssetLibraryPanel(
+            items=self._library_items_for('sounds'),title='SOUND',
+            hint='Eigene und mitgelieferte Sounds direkt anhören oder in die Timeline ziehen.',
+            fixed_category='sounds',action_label='Einfügen')
         self.asset_library_panel.use_requested.connect(self.use_library_item)
         self.asset_library_panel.preview_requested.connect(self.preview_library_item)
+        self.asset_library_panel.custom_import_requested.connect(self.import_custom_library_asset)
         self.library_stack.addWidget(self.asset_library_panel)
         self.library_panels={}
         dedicated_libraries=(
-            ('text', library_items_for('text_styles'), 'TEXT-DESIGN-BIBLIOTHEK',
+            ('text', self._library_items_for('text_styles'), 'TEXT-DESIGN',
              'Wähle zuerst ein fertiges Textdesign. Danach gibst du den Text ein; alle Stilwerte sind bereits vorbereitet.',
              'Text anlegen', 'text_styles'),
-            ('sticker', library_items_for('stickers'), 'STICKER-BIBLIOTHEK',
+            ('animations', self._library_items_for('animations'), 'ANIMATIONEN',
+             'Bewegungsvorlagen auf den ausgewählten Video- oder Textclip anwenden.',
+             'Anwenden', 'animations'),
+            ('sticker', self._library_items_for('stickers'), 'STICKER',
              'Offline-Sticker als editierbare Textobjekte einfügen. Position, Größe und Farbe sind sofort anpassbar.',
              'Einfügen', 'stickers'),
-            ('effects', library_items_for('effects'), 'EFFEKT-BIBLIOTHEK',
+            ('effects', self._library_items_for('effects'), 'EFFEKTE',
              'Video-Looks und Adjustment-Startwerte auf den ausgewählten Clip anwenden.',
              'Anwenden', 'effects'),
-            ('transitions', library_items_for('transitions'), 'ÜBERGANGS-BIBLIOTHEK',
+            ('transitions', self._library_items_for('transitions'), 'ÜBERGÄNGE',
              'Einen Übergang als Startwert auf den ausgewählten Video- oder Audioclip anwenden.',
              'Anwenden', 'transitions'),
-            ('filters', library_items_for('filters'), 'FILTER-BIBLIOTHEK',
+            ('filters', self._library_items_for('filters'), 'FILTER',
              'Farblooks auswählen und direkt auf den ausgewählten Videoclip anwenden.',
              'Anwenden', 'filters'),
         )
@@ -1200,6 +1360,7 @@ class Editor(SmoothWorkbench,QMainWindow):
                                             fixed_category=category,action_label=action_label)
             panel_widget.use_requested.connect(self.use_library_item)
             panel_widget.preview_requested.connect(self.preview_library_item)
+            panel_widget.custom_import_requested.connect(self.import_custom_library_asset)
             self.library_panels[key]=panel_widget
             self.library_stack.addWidget(panel_widget)
         ml.addWidget(self.library_stack,1)
@@ -1236,22 +1397,21 @@ class Editor(SmoothWorkbench,QMainWindow):
         controls.addWidget(button('Clip ansehen',self.source_preview)); controls.addStretch()
         self.cinema_button=button('Vollbild',self.toggle_cinema_preview); self.cinema_button.setIcon(line_icon('view-fullscreen')); self.cinema_button.setObjectName('iconButton'); controls.addWidget(self.cinema_button)
         self.time_label=label('00:00.0 / 00:00.0','muted'); controls.addWidget(self.time_label); pl.addLayout(controls)
-        source_controls=QHBoxLayout(); source_controls.setContentsMargins(0,0,0,0); source_controls.setSpacing(4)
-        self.source_range_label=label('Quelle: Clip ansehen für In/Out','muted'); self.source_range_label.setObjectName('sourceRangeLabel'); source_controls.addWidget(self.source_range_label,1)
+        source_controls=QHBoxLayout(); source_controls.setContentsMargins(6,0,6,0); source_controls.setSpacing(3)
+        self.source_range_label=label('◉ Clip · In/Out','muted'); self.source_range_label.setObjectName('sourceRangeLabel'); source_controls.addWidget(self.source_range_label,1)
         self.source_in_button=timeline_tool_button('I','Quell-In am aktuellen Quellbild setzen · I',self.set_source_in,object_name='sourceToolButton')
         self.source_out_button=timeline_tool_button('O','Quell-Out am aktuellen Quellbild setzen · O',self.set_source_out,object_name='sourceToolButton')
         self.source_clear_button=timeline_tool_button('×','Quell-In/Out auf den gesamten Clip zurücksetzen',self.clear_source_marks,object_name='sourceToolDanger')
         self.source_insert_button=timeline_tool_button('↳','Markierten Quellbereich am Abspielkopf einfügen und spätere Clips verschieben',self.insert_source_range,'insert-object',object_name='sourceToolButton')
         self.source_overwrite_button=timeline_tool_button('▣','Markierten Quellbereich am Abspielkopf überschreiben',self.overwrite_source_range,'document-save-as',object_name='sourceToolButton')
         for widget in (self.source_in_button,self.source_out_button,self.source_clear_button,self.source_insert_button,self.source_overwrite_button): source_controls.addWidget(widget)
-        source_bar=QFrame(); source_bar.setObjectName('previewSubbar'); source_bar.setLayout(source_controls); pl.addWidget(source_bar)
-        work_controls=QHBoxLayout(); work_controls.setContentsMargins(0,0,0,0); work_controls.setSpacing(4)
-        self.work_range_label=label('Arbeitsbereich: gesamte Timeline','muted'); self.work_range_label.setObjectName('sourceRangeLabel'); work_controls.addWidget(self.work_range_label,1)
+        range_separator=timeline_separator(); range_separator.setFixedHeight(24); source_controls.addWidget(range_separator)
+        self.work_range_label=label('⌁ Timeline · gesamt','muted'); self.work_range_label.setObjectName('sourceRangeLabel'); source_controls.addWidget(self.work_range_label,1)
         self.work_in_button=timeline_tool_button('I','Arbeitsbereich-In am Abspielkopf setzen · Strg+Alt+I',self.set_work_in,object_name='sourceToolButton')
         self.work_out_button=timeline_tool_button('O','Arbeitsbereich-Out am Abspielkopf setzen · Strg+Alt+O',self.set_work_out,object_name='sourceToolButton')
         self.work_clear_button=timeline_tool_button('×','Arbeitsbereich löschen',self.clear_work_area,object_name='sourceToolDanger')
-        for widget in (self.work_in_button,self.work_out_button,self.work_clear_button): work_controls.addWidget(widget)
-        work_bar=QFrame(); work_bar.setObjectName('previewSubbar'); work_bar.setLayout(work_controls); pl.addWidget(work_bar)
+        for widget in (self.work_in_button,self.work_out_button,self.work_clear_button): source_controls.addWidget(widget)
+        source_bar=QFrame(); source_bar.setObjectName('previewSubbar'); source_bar.setLayout(source_controls); pl.addWidget(source_bar)
         preview_tools=QFrame(); self.preview_tools=preview_tools; preview_tools.setObjectName('previewToolbar')
         preview_tools_layout=QVBoxLayout(preview_tools); preview_tools_layout.setContentsMargins(8,4,8,4); preview_tools_layout.setSpacing(1)
         preview_tools_layout.addLayout(preview_options); preview_tools_layout.addLayout(performance_options); pl.addWidget(preview_tools)
@@ -1476,7 +1636,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         clip_section=inspector_section('CLIP · POSITION',True); clip_section.addLayout(clip_form)
         timing_section=inspector_section('TIMING · AUDIO-BASIS',True); timing_section.addLayout(timing_form)
         text_section=inspector_section('TEXT · INHALT UND POSITION',True); text_section.addLayout(text_form)
-        text_style_section=inspector_section('TEXT · STIL UND ANIMATION',False); text_style_section.addLayout(text_style_form)
+        text_style_section=inspector_section('TEXT · STIL UND ANIMATION',False,True); text_style_section.addLayout(text_style_form)
         transform_form=configure_form(QFormLayout())
         transform_form.addRow('Zoom',self.transform_scale)
         transform_form.addRow('Bild X',self.transform_x); transform_form.addRow('Bild Y',self.transform_y)
@@ -1530,7 +1690,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         ai_form.addRow('',auto_reframe_buttons); ai_form.addRow('',self.auto_reframe_status)
         ai_section=inspector_section('KI-WERKZEUGE · LOKAL',False,True); ai_section.addLayout(ai_form)
         transition_form=configure_form(QFormLayout()); transition_form.addRow('Übergang',self.transition_type); transition_form.addRow('Dauer',self.transition_duration)
-        transition_section=inspector_section('ÜBERGÄNGE',False); transition_section.addLayout(transition_form)
+        transition_section=inspector_section('ÜBERGÄNGE',False,True); transition_section.addLayout(transition_form)
         keyframe_section=inspector_section('ANIMATION · KEYFRAMES UND SPEED-RAMPING',False,True)
         keyframe_form=configure_form(QFormLayout()); keyframe_form.addRow('Zeit im Clip',self.keyframe_time); keyframe_form.addRow('Kurve',self.keyframe_curve); keyframe_section.addLayout(keyframe_form)
         keyframe_buttons=QHBoxLayout(); keyframe_buttons.setContentsMargins(0,0,0,0); keyframe_buttons.addWidget(self.keyframe_set_button,1); keyframe_buttons.addWidget(self.keyframe_remove_button,1)
@@ -1640,7 +1800,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         zoom_icon=timeline_icon_label('⌕','Timeline-Zoom')
         self.zoom_slider=QSlider(Qt.Horizontal); self.zoom_slider.setToolTip('Timeline-Zoom'); self.zoom_slider.setRange(2,200); self.zoom_slider.setValue(60); self.zoom_slider.setFixedWidth(120); self.zoom_slider.valueChanged.connect(self.zoom)
         row.addWidget(timeline_tool_group('ANSICHT',[fit_button,zoom_icon,self.zoom_slider])); bl.addLayout(row)
-        self.timeline=Timeline(); self.timeline.library_catalog={item.item_id:item for item in library_items()}
+        self.timeline=Timeline(); self.timeline.library_catalog={item.item_id:item for item in list(library_items())+list(self.custom_library_items)}
         self.timeline.selection_changed.connect(self.timeline_selection_changed); self.timeline.seek.connect(self.set_playhead)
         self.timeline.context_requested.connect(self.show_context_menu)
         self.timeline.track_context_requested.connect(self.show_track_context_menu)
@@ -1708,10 +1868,17 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.edit_mode=str(mode)
         for entry in getattr(self, 'inspector_sections', []):
             entry['section'].setVisible(self.edit_mode == 'pro' or not entry['advanced'])
+        is_pro=self.edit_mode == 'pro'
+        if hasattr(self,'edit_mode_badge'):
+            self.edit_mode_badge.setText('ALLE WERKZEUGE' if is_pro else 'KERNWERKZEUGE')
+            self.edit_mode_badge.setProperty('pro',is_pro)
+            self.edit_mode_badge.style().unpolish(self.edit_mode_badge); self.edit_mode_badge.style().polish(self.edit_mode_badge)
+        self.edit_mode_combo.setProperty('pro',is_pro)
+        self.edit_mode_combo.style().unpolish(self.edit_mode_combo); self.edit_mode_combo.style().polish(self.edit_mode_combo)
         if hasattr(self, 'statusBar'):
             self.statusBar().showMessage(
-                'Einfach-Modus · häufige Einstellungen sichtbar' if self.edit_mode == 'simple'
-                else 'Pro-Modus · alle Inspector-Werkzeuge sichtbar', 2500)
+                'Einfach-Modus · Kernwerkzeuge sichtbar, Profi-Bereiche ausgeblendet' if self.edit_mode == 'simple'
+                else 'Pro-Modus · vollständiger Inspector mit Audio, KI, Masken und Keyframes', 3000)
 
     def apply_workspace_preset(self, *_):
         """Apply a task-oriented layout without creating another editor mode."""
@@ -1841,11 +2008,11 @@ class Editor(SmoothWorkbench,QMainWindow):
             return
         total=length(self.clips)
         if self.work_in is None and self.work_out is None:
-            self.work_range_label.setText('Arbeitsbereich: gesamte Timeline')
+            self.work_range_label.setText('⌁ Timeline · gesamt')
             self.work_range_label.setToolTip('Strg+Alt+I/O setzen den Exportbereich.')
             return
         start,end=self.work_area_bounds()
-        self.work_range_label.setText(f'Arbeitsbereich: {start:.2f}–{end:.2f} s')
+        self.work_range_label.setText(f'⌁ Bereich · {start:.2f}–{end:.2f} s')
         self.work_range_label.setToolTip(f'{end-start:.2f} s von {total:.2f} s · Exportdialog kann diesen Bereich verwenden.')
 
     def set_work_in(self):
@@ -1936,7 +2103,7 @@ class Editor(SmoothWorkbench,QMainWindow):
             return False
         if not all((self._direct_value(getattr(clip, name), expected)
                     for name, expected in (
-                        ('speed', 1.0), ('volume', 1.0), ('fade_in', 0.0), ('fade_out', 0.0),
+                        ('speed', 1.0), ('fade_in', 0.0), ('fade_out', 0.0),
                         ('video_scale', 1.0), ('video_x', .5), ('video_y', .5),
                         ('crop_left', 0.0), ('crop_top', 0.0), ('crop_right', 0.0), ('crop_bottom', 0.0),
                         ('rotation', 0.0), ('brightness', 0.0), ('contrast', 1.0), ('saturation', 1.0),
@@ -1969,11 +2136,78 @@ class Editor(SmoothWorkbench,QMainWindow):
             return False
         return True
 
+    def _direct_audio_is_plain(self, clip):
+        """Whether a detached audio clip can be represented by its source AV stream."""
+        if (not clip.enabled or clip.kind != 'audio' or clip.source_type != 'audio'
+                or not clip.path or not Path(clip.path).is_file()):
+            return False
+        if not all((self._direct_value(getattr(clip, name), expected)
+                    for name, expected in (
+                        ('speed', 1.0), ('volume', 1.0), ('fade_in', 0.0), ('fade_out', 0.0),
+                        ('audio_noise_reduction', 0.0), ('audio_eq_low', 0.0),
+                        ('audio_eq_mid', 0.0), ('audio_eq_high', 0.0),
+                        ('audio_compressor_threshold', -18.0), ('audio_compressor_ratio', 4.0),
+                        ('audio_ducking', 0.0), ('audio_voice_isolation', 0.0),
+                        ('audio_pan', 0.0), ('audio_normalize_target', -16.0))
+                    )):
+            return False
+        return not (clip.freeze_frame or clip.reverse or clip.audio_compressor_enabled
+                    or clip.audio_normalize or clip.audio_channel_mode != 'stereo'
+                    or clip.transition_type != 'none' or clip.transition_duration > 1e-7
+                    or clip.speed_keyframes or clip.volume_keyframes)
+
+    def _direct_extracted_audio_for_video(self, video):
+        """Return unchanged extracted tracks that can be represented by source AV playback."""
+        link_id=getattr(video,'linked_source_uid','') or video.uid
+        candidates=[clip for clip in self.clips
+                    if clip.kind == 'audio' and getattr(clip,'linked_source_uid','') == link_id]
+        if not candidates:
+            return None
+        video_group=sorted((clip for clip in self.clips if clip.kind == 'video'
+                            and (getattr(clip,'linked_source_uid','') or clip.uid) == link_id),
+                           key=lambda clip:(clip.position,clip.uid))
+        if not video_group or any(not self._direct_clip_is_plain(clip)
+                                  or not self._direct_value(clip.volume,0.0)
+                                  for clip in video_group):
+            return None
+        expected_position=video_group[0].position
+        expected_source=video_group[0].start
+        for clip in video_group:
+            if (not self._direct_value(clip.position,expected_position)
+                    or not self._direct_value(clip.start,expected_source)):
+                return None
+            expected_position=clip.finish; expected_source=clip.end
+        if len({clip.track for clip in candidates}) != 1:
+            return None
+        state=self.track_states.get(candidates[0].track,{})
+        if (state.get('muted') or not self._direct_value(state.get('volume',1.0),1.0)
+                or not self._direct_value(state.get('pan',0.0),0.0)):
+            return None
+        ordered=tuple(sorted(candidates,key=lambda clip:(clip.position,clip.uid)))
+        for audio in ordered:
+            if not self._direct_audio_is_plain(audio):
+                return None
+        audio_position=video_group[0].position
+        audio_source=video_group[0].start
+        for audio in ordered:
+            if (not self._direct_value(audio.position,audio_position)
+                    or not self._direct_value(audio.start,audio_source)):
+                return None
+            audio_position=audio.finish; audio_source=audio.end
+        if (not self._direct_value(audio_position,video_group[-1].finish)
+                or not self._direct_value(audio_source,video_group[-1].end)):
+            return None
+        return ordered
+
     def _direct_preview_clips(self):
         """Return a contiguous, single-track timeline suitable for direct play."""
         if not self.clips:
             return ()
-        tracks={clip.track for clip in self.clips}
+        video_clips=[clip for clip in self.clips if clip.kind == 'video']
+        audio_clips=[clip for clip in self.clips if clip.kind == 'audio']
+        if len(video_clips) != len([clip for clip in self.clips if clip.kind in ('video','audio')]):
+            return ()
+        tracks={clip.track for clip in video_clips}
         if len(tracks) != 1:
             return ()
         track=next(iter(tracks))
@@ -1988,7 +2222,23 @@ class Editor(SmoothWorkbench,QMainWindow):
                 or not self._direct_value(self.master_mixer.get('pan',0.0),0.0)
                 or self.master_mixer.get('loudness_normalization',False)):
             return ()
-        ordered=tuple(sorted(self.clips,key=lambda clip:(clip.position,clip.uid)))
+        ordered=tuple(sorted(video_clips,key=lambda clip:(clip.position,clip.uid)))
+        linked_audio=[]
+        linked_groups=set()
+        for clip in ordered:
+            link_id=getattr(clip,'linked_source_uid','') or clip.uid
+            candidates=[audio for audio in audio_clips
+                        if getattr(audio,'linked_source_uid','') == link_id]
+            if candidates:
+                if link_id not in linked_groups:
+                    linked=self._direct_extracted_audio_for_video(clip)
+                    if linked is None:
+                        return ()
+                    linked_audio.extend(linked); linked_groups.add(link_id)
+            elif clip.has_audio and not self._direct_value(clip.volume,1.0):
+                return ()
+        if {audio.uid for audio in audio_clips} != {audio.uid for audio in linked_audio}:
+            return ()
         expected=0.0
         for clip in ordered:
             if abs(float(clip.position)-expected) > 1e-5 or not self._direct_clip_is_plain(clip):
@@ -2055,7 +2305,10 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.direct_preview=True; self.direct_preview_revision=self.revision
         self.direct_preview_signature=self.direct_preview_signature_for_current()
         self.mode='timeline'; self.audio.setVolume(1); self.player.setPlaybackRate(1.0)
-        self.preview_status.setText('DIRECT-SCHNITT · sofort abspielbar · keine Neu-Berechnung nötig')
+        linked=any(getattr(clip,'linked_source_uid','') for clip in self.clips)
+        self.preview_status.setText(
+            'DIRECT-SCHNITT · extrahierte Audiospur synchron · sofort abspielbar'
+            if linked else 'DIRECT-SCHNITT · sofort abspielbar · keine Neu-Berechnung nötig')
         self._load_direct_clip_at_playhead(bool(play))
         return True
 
@@ -3924,14 +4177,23 @@ class Editor(SmoothWorkbench,QMainWindow):
         if self.worker:return
         if not any(c.kind=='video' and c.source_type != 'adjustment' for c in self.clips):
             return self.error('Füge zuerst ein Video zur Timeline hinzu.')
-        style=str(style or self.text_style_preset.currentData() or 'title')
-        preset=dict(TEXT_STYLE_PRESETS.get(style,TEXT_STYLE_PRESETS['title']))
-        preset_index=self.text_style_preset.findData(style)
-        if preset_index >= 0:
+        custom_style=isinstance(style,dict)
+        style_key=str((style.get('style') if custom_style else style)
+                      or self.text_style_preset.currentData() or 'title')
+        preset=dict(TEXT_STYLE_PRESETS.get(style_key,TEXT_STYLE_PRESETS['title']))
+        if custom_style:
+            allowed={'font_size','color','font_family','font_bold','font_italic','outline_width',
+                     'outline_color','shadow_size','shadow_color','background_enabled',
+                     'background_color','background_opacity','background_padding','text_animation',
+                     'text_animation_duration','x','y'}
+            preset.update({key:value for key,value in style.items() if key in allowed})
+        preset_index=self.text_style_preset.findData(style_key) if not custom_style else -1
+        if not custom_style and preset_index >= 0:
             self.text_style_preset.blockSignals(True)
             self.text_style_preset.setCurrentIndex(preset_index)
             self.text_style_preset.blockSignals(False)
-        title={'title':'Titel','subtitle':'Untertitel','lower_third':'Lower Third'}.get(style,'Text')
+        title=('Eigenes Textdesign' if custom_style else
+               {'title':'Titel','subtitle':'Untertitel','lower_third':'Lower Third'}.get(style_key,'Text'))
         text,ok=QInputDialog.getText(self,f'{title} hinzufügen','Text eingeben:')
         if not ok or not text.strip():return
         position=max(0,min(self.playhead,length(self.clips)))
@@ -4679,7 +4941,8 @@ class Editor(SmoothWorkbench,QMainWindow):
             proposed=None; chosen_tracks=list(self.tracks)
             for track in sorted((t for t in self.tracks if t<0),reverse=True):
                 candidate=replace(audio,uid=uuid.uuid4().hex,track=track,position=source_clip.position,
-                                  start=start,end=end,volume=source_clip.volume)
+                                  start=start,end=end,volume=source_clip.volume,
+                                  linked_source_uid=source_clip.uid)
                 try:
                     validate_timeline(self.clips+[candidate],self.tracks); proposed=candidate; break
                 except ValueError:
@@ -4688,10 +4951,12 @@ class Editor(SmoothWorkbench,QMainWindow):
                 track=min(self.tracks+[0])-1
                 chosen_tracks.append(track)
                 proposed=replace(audio,uid=uuid.uuid4().hex,track=track,position=source_clip.position,
-                                 start=start,end=end,volume=source_clip.volume)
+                                 start=start,end=end,volume=source_clip.volume,
+                                 linked_source_uid=source_clip.uid)
             validate_timeline(self.clips+[proposed],chosen_tracks)
             self.checkpoint(); self.tracks=chosen_tracks; self.track_states=normalize_track_states(self.track_states,self.tracks); self.track_names=normalize_track_names(self.track_names,self.tracks)
-            self.clips=[replace(v,volume=0) if v.uid==source_clip.uid else v for v in self.clips]+[proposed]
+            self.clips=[replace(v,volume=0,linked_source_uid=source_clip.uid)
+                        if v.uid==source_clip.uid else v for v in self.clips]+[proposed]
             self.assets.append(proposed); self.selection=[proposed.uid]; self.current=proposed.uid; self.prepare_visuals([proposed]); self.changed()
             self.statusBar().showMessage('Audio extrahiert und auf eine eigene Audiospur gelegt.',6000)
         except Exception as exc:
@@ -4877,16 +5142,29 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.refresh_media()
 
     def open_library_panel(self):
-        """Replace the media bin with the compact offline starter library."""
+        """Keep the old all-assets API available for projects and test helpers."""
+        if not hasattr(self,'asset_library_panel'):
+            return
+        for widget in self._media_controls:
+            widget.hide()
+        self.media_heading.setText('ASSETS')
+        catalog=list(library_items())+list(self.custom_library_items)
+        self.media_count.setText(f'{len(catalog)} Assets')
+        self.library_stack.setCurrentWidget(self.asset_library_panel)
+        self.library_stack.show()
+        self.asset_library_panel.set_scope(catalog,None)
+
+    def open_sound_panel(self):
+        """Show sounds without duplicating the feature-specific panels."""
         if not hasattr(self, 'asset_library_panel'):
             return
         for widget in self._media_controls:
             widget.hide()
-        self.media_heading.setText('BIBLIOTHEK')
-        self.media_count.setText(f'{len(library_items())} Starter-Assets')
+        self.media_heading.setText('SOUND')
+        self.media_count.setText(f'{len(self._library_items_for("sounds"))} Sounds')
         self.library_stack.setCurrentWidget(self.asset_library_panel)
         self.library_stack.show()
-        self.asset_library_panel.refresh()
+        self.asset_library_panel.set_scope(self._library_items_for('sounds'),'sounds')
 
     def open_preset_library(self, key):
         """Show one dedicated offline library in the media column."""
@@ -4896,7 +5174,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         for widget in self._media_controls:
             widget.hide()
         labels={
-            'text':'TEXT', 'sticker':'STICKER', 'effects':'EFFEKTE',
+            'text':'TEXT', 'animations':'ANIMATIONEN', 'sticker':'STICKER', 'effects':'EFFEKTE',
             'transitions':'ÜBERGÄNGE', 'filters':'FILTER',
         }
         self.media_heading.setText(labels.get(str(key),str(key).upper()))
@@ -4907,6 +5185,9 @@ class Editor(SmoothWorkbench,QMainWindow):
 
     def open_text_panel(self):
         self.open_preset_library('text')
+
+    def open_animation_panel(self):
+        self.open_preset_library('animations')
 
     def open_sticker_panel(self):
         self.open_preset_library('sticker')
@@ -4921,14 +5202,17 @@ class Editor(SmoothWorkbench,QMainWindow):
         self.open_preset_library('filters')
 
     def preview_library_item(self, item_id):
-        item=get_library_item(item_id)
+        item=self._library_item(item_id)
         if item is None:
             return
         if item.kind != 'sound':
             self.statusBar().showMessage('Dieses Preset wird direkt auf den ausgewählten Clip angewendet.',3000)
             return
         try:
-            path=library_sound_path(item.item_id,self.state_dir)
+            custom_path=item.parameters.get('path') if isinstance(item.parameters,dict) else None
+            path=Path(custom_path).expanduser().resolve() if custom_path else library_sound_path(item.item_id,self.state_dir)
+            if not path.is_file():
+                raise ValueError(f'Die Sounddatei fehlt:\n{path}')
             self.library_player.stop()
             self.library_player.setSource(QUrl.fromLocalFile(str(path)))
             self.library_player.play()
@@ -4978,7 +5262,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         values.update(parameters)
         candidate=replace(clip,effect_preset=preset_name,**values)
         try:
-            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
+            self._commit_library_clip(candidate,f'Asset: {item.title}')
             self.statusBar().showMessage(f'Effekt „{item.title}“ angewendet.',3000)
         except Exception as exc:
             self.error(exc)
@@ -5020,7 +5304,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         else:
             return self.statusBar().showMessage('Wähle einen normalen Video- oder Textclip aus.',3000)
         try:
-            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
+            self._commit_library_clip(candidate,f'Asset: {item.title}')
             self.statusBar().showMessage(f'Animation „{item.title}“ angewendet.',3000)
         except Exception as exc:
             self.error(exc)
@@ -5035,7 +5319,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         duration=min(float(item.parameters.get('duration',.5)),max(0.0,clip.length))
         candidate=replace(clip,transition_type=transition,transition_duration=duration)
         try:
-            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
+            self._commit_library_clip(candidate,f'Asset: {item.title}')
             self.statusBar().showMessage(f'Übergang „{item.title}“ angewendet.',3000)
         except Exception as exc:
             self.error(exc)
@@ -5049,9 +5333,10 @@ class Editor(SmoothWorkbench,QMainWindow):
         preset=str(item.parameters.get('filter_preset','none'))
         if preset not in FILTER_PRESETS:
             return self.statusBar().showMessage('Dieses Filter-Preset ist nicht verfügbar.',3000)
-        candidate=replace(clip,filter_preset=preset)
+        lut_path=str(item.parameters.get('lut_path') or '')
+        candidate=replace(clip,filter_preset=preset,lut_path=lut_path)
         try:
-            self._commit_library_clip(candidate,f'Bibliothek: {item.title}')
+            self._commit_library_clip(candidate,f'Asset: {item.title}')
             self.statusBar().showMessage(f'Filter „{item.title}“ angewendet.',3000)
         except Exception as exc:
             self.error(exc)
@@ -5077,7 +5362,7 @@ class Editor(SmoothWorkbench,QMainWindow):
         try:
             proposed=self.clips+[candidate]
             validate_timeline(proposed,self.tracks+[track])
-            self.checkpoint(f'Bibliothek: {item.title} einfügen')
+            self.checkpoint(f'Asset: {item.title} einfügen')
             self.tracks.append(track)
             self.track_states=normalize_track_states(self.track_states,self.tracks)
             self.track_names=normalize_track_names(self.track_names,self.tracks)
@@ -5092,7 +5377,10 @@ class Editor(SmoothWorkbench,QMainWindow):
         if self.worker:
             return
         try:
-            path=library_sound_path(item.item_id,self.state_dir)
+            custom_path=item.parameters.get('path') if isinstance(item.parameters,dict) else None
+            path=Path(custom_path).expanduser().resolve() if custom_path else library_sound_path(item.item_id,self.state_dir)
+            if not path.is_file():
+                raise ValueError(f'Die Sounddatei fehlt:\n{path}')
             existing=next((asset for asset in self.assets
                            if asset.path and Path(asset.path).resolve()==path.resolve()),None)
             if existing is None:
@@ -5108,7 +5396,7 @@ class Editor(SmoothWorkbench,QMainWindow):
             target_position=self._library_insert_position(target_track,asset.length,position)
             candidate=replace(asset,uid=uuid.uuid4().hex,position=target_position,track=target_track)
             validate_timeline(self.clips+[candidate],target_tracks)
-            self.checkpoint('Bibliothek: Sound einfügen')
+            self.checkpoint('Asset: Sound einfügen')
             if target_tracks != self.tracks:
                 self.tracks=target_tracks
                 self.track_states=normalize_track_states(self.track_states,self.tracks)
@@ -5125,7 +5413,7 @@ class Editor(SmoothWorkbench,QMainWindow):
 
     def use_library_item(self, item_id):
         """Apply a preset or insert a generated sound using existing editor data."""
-        item=get_library_item(item_id)
+        item=self._library_item(item_id)
         if item is None:
             return
         if item.kind == 'sound':
@@ -5139,12 +5427,12 @@ class Editor(SmoothWorkbench,QMainWindow):
         elif item.kind == 'filter':
             self._apply_library_filter(item)
         elif item.kind == 'text_style':
-            self.add_text(item.parameters.get('style'))
+            self.add_text(item.parameters if item.item_id.startswith('custom_') else item.parameters.get('style'))
         elif item.kind == 'sticker':
             self._insert_library_sticker(item)
 
     def handle_library_drop(self, item_id, position, track):
-        item=get_library_item(item_id)
+        item=self._library_item(item_id)
         if item is None or item.kind != 'sound':
             return
         self._insert_library_sound(item,position=float(position),track=int(track))
@@ -5391,14 +5679,14 @@ class Editor(SmoothWorkbench,QMainWindow):
             marks=[]
             if self.source_in is not None: marks.append(f'I {self._source_clock(source_in)}')
             if self.source_out is not None: marks.append(f'O {self._source_clock(source_out)}')
-            text='Quelle · '+(' · '.join(marks) if marks else 'gesamter Clip')
+            text='◉ Clip · '+(' · '.join(marks) if marks else 'gesamt')
             self.source_range_label.setText(text)
         elif clip is not None and clip.kind in ('video','audio') and clip.source_type in ('video','audio'):
-            self.source_range_label.setText('Quelle: „Clip ansehen“ für In/Out')
+            self.source_range_label.setText('◉ Clip · „Clip ansehen“ für In/Out')
         elif clip is not None and clip.source_type in ('image','image_sequence'):
-            self.source_range_label.setText('Quelle: Standbild · keine In/Out-Marken')
+            self.source_range_label.setText('◉ Standbild · keine In/Out-Marken')
         else:
-            self.source_range_label.setText('Quelle: kein Medienclip ausgewählt')
+            self.source_range_label.setText('◉ Kein Clip ausgewählt')
 
     def set_source_in(self):
         clip=self._source_media_clip()

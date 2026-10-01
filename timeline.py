@@ -825,7 +825,7 @@ class Timeline(QWidget):
     def library_drop_candidate(self,event):
         """Return a validated ghost for a sound dragged from the library."""
         self.ghost_valid=False; self.snapline=None
-        self.feedback='Bibliotheks-Presets über „Verwenden“ auf einen Clip anwenden'
+        self.feedback='Presets über „Verwenden“ auf einen Clip anwenden'
         if not event.mimeData().hasFormat(LIBRARY_MIME):
             return None
         item_id=bytes(event.mimeData().data(LIBRARY_MIME)).decode('utf-8', 'replace')
@@ -834,7 +834,7 @@ class Timeline(QWidget):
             return None
         track=self.track_at(event.position().y())
         if track is None or track >= 0:
-            self.feedback='Bibliotheks-Sounds gehören auf eine Audio-Spur'
+            self.feedback='Sounds gehören auf eine Audio-Spur'
             return None
         position=self.time_at(event.position().x())
         if self.snap and not(event.modifiers() & Qt.ShiftModifier):

@@ -21,6 +21,7 @@ from ux import line_icon
 
 
 LIBRARY_MIME = 'application/x-framecut-library'
+LIBRARY_KIND_ROLE = Qt.UserRole + 1
 
 
 @dataclass(frozen=True)
@@ -247,7 +248,7 @@ def library_preview_clip(item, position, track):
 def library_sound_path(item_id, state_dir):
     item = get_library_item(item_id)
     if item is None or item.kind != 'sound':
-        raise ValueError('Unbekannter Bibliotheks-Sound.')
+        raise ValueError('Unbekannter Sound.')
     root = Path(state_dir).expanduser().resolve() / 'library' / 'sounds'
     root.mkdir(parents=True, exist_ok=True)
     target = root / f'{item.item_id}.wav'
@@ -304,8 +305,7 @@ class LibraryList(QListWidget):
         item = self.currentItem()
         if item is None:
             return
-        library_item = get_library_item(item.data(Qt.UserRole))
-        if library_item is None or library_item.kind != 'sound':
+        if str(item.data(LIBRARY_KIND_ROLE) or '') != 'sound':
             return
         drag = QDrag(self)
         mime = QMimeData()
@@ -320,8 +320,9 @@ class AssetLibraryPanel(QWidget):
     """Compact left-panel browser for built-in sounds and editing presets."""
     use_requested = Signal(str)
     preview_requested = Signal(str)
+    custom_import_requested = Signal(str)
 
-    def __init__(self, parent=None, items=None, title='STARTER-BIBLIOTHEK',
+    def __init__(self, parent=None, items=None, title='ASSETS',
                  hint='Sounds, Looks und Animationen direkt verwenden. Sounds lassen sich in die Timeline ziehen.',
                  fixed_category=None, action_label='Verwenden'):
         super().__init__(parent)
@@ -331,7 +332,7 @@ class AssetLibraryPanel(QWidget):
         layout = QVBoxLayout(self); layout.setContentsMargins(0,0,0,0); layout.setSpacing(7)
         intro = QLabel(title); intro.setObjectName('heading'); layout.addWidget(intro)
         hint_label = QLabel(hint); hint_label.setObjectName('subtle'); hint_label.setWordWrap(True); layout.addWidget(hint_label)
-        self.search = QLineEdit(); self.search.setPlaceholderText('Bibliothek durchsuchen …')
+        self.search = QLineEdit(); self.search.setPlaceholderText('Assets durchsuchen …')
         self.search.setClearButtonEnabled(True); self.search.setToolTip('Nach Name, Kategorie oder Schlagwort suchen'); layout.addWidget(self.search)
         self.category = QComboBox()
         if self._fixed_category:
@@ -343,23 +344,54 @@ class AssetLibraryPanel(QWidget):
             for value, category_title in LIBRARY_CATEGORIES.items():
                 if value == 'all' or value in available_categories:
                     self.category.addItem(category_title, value)
-        self.category.setToolTip('Bibliothekskategorie wählen'); layout.addWidget(self.category)
+        self.category.setToolTip('Asset-Kategorie wählen'); layout.addWidget(self.category)
         self.list = LibraryList(); self.list.setObjectName('assetLibraryList'); self.list.setIconSize(self.list.iconSize())
         self.list.setSpacing(2); self.list.setAlternatingRowColors(False); self.list.setDragEnabled(True)
         self.list.itemDoubleClicked.connect(lambda *_: self.use_current())
         self.list.currentItemChanged.connect(lambda *_: self.update_details())
         self.search.textChanged.connect(self.refresh); self.category.currentIndexChanged.connect(self.refresh)
         layout.addWidget(self.list, 1)
-        self.details = QLabel('Wähle ein Bibliothekselement aus.'); self.details.setObjectName('subtle'); self.details.setWordWrap(True); layout.addWidget(self.details)
+        self.details = QLabel('Wähle ein Asset aus.'); self.details.setObjectName('subtle'); self.details.setWordWrap(True); layout.addWidget(self.details)
         actions = QHBoxLayout(); actions.setContentsMargins(0,0,0,0); actions.setSpacing(5)
+        self.custom_import = QPushButton('＋ Eigenen Import')
+        self.custom_import.setToolTip('Eigenen Sound, Effekt, Filter oder ein anderes Preset hinzufügen')
+        self.custom_import.clicked.connect(lambda: self.custom_import_requested.emit(self._fixed_category or self.category.currentData() or 'all'))
+        actions.addWidget(self.custom_import)
         self.preview = QPushButton('Vorschau'); self.preview.setIcon(line_icon('media-playback-start')); self.preview.clicked.connect(self.preview_current); actions.addWidget(self.preview)
         self.use = QPushButton(action_label); self.use.setObjectName('primary'); self.use.clicked.connect(self.use_current); actions.addWidget(self.use)
         layout.addLayout(actions)
         self.refresh()
 
+    def set_items(self, items):
+        """Replace the visible catalog after a custom asset was imported."""
+        self.set_scope(items,self._fixed_category)
+
+    def set_scope(self, items, fixed_category=None):
+        """Change the catalog and optionally restrict it to one feature area."""
+        self._items=tuple(items)
+        self._fixed_category=str(fixed_category) if fixed_category else None
+        self.category.blockSignals(True)
+        self.category.clear()
+        if self._fixed_category:
+            category_title=LIBRARY_CATEGORIES.get(self._fixed_category,self._fixed_category)
+            self.category.addItem(category_title,self._fixed_category)
+            self.category.hide()
+        else:
+            available_categories={item.category for item in self._items}
+            for value,category_title in LIBRARY_CATEGORIES.items():
+                if value == 'all' or value in available_categories:
+                    self.category.addItem(category_title,value)
+            self.category.show()
+        self.category.blockSignals(False)
+        self.refresh()
+
     def current_item_id(self):
         current = self.list.currentItem()
         return str(current.data(Qt.UserRole)) if current is not None else None
+
+    def current_library_item(self):
+        item_id=self.current_item_id()
+        return next((item for item in self._items if item.item_id == item_id),None)
 
     def refresh(self):
         category = self._fixed_category or self.category.currentData() or 'all'
@@ -374,7 +406,7 @@ class AssetLibraryPanel(QWidget):
                 continue
             visible.append(item)
             row=QListWidgetItem()
-            row.setData(Qt.UserRole,item.item_id); row.setIcon(line_icon(item.icon))
+            row.setData(Qt.UserRole,item.item_id); row.setData(LIBRARY_KIND_ROLE,item.kind); row.setIcon(line_icon(item.icon))
             row.setText(f'{item.title}\n{LIBRARY_CATEGORIES[item.category]} · {item.description}')
             row.setToolTip(f'{item.title}\n{item.description}\nSchlagworte: {", ".join(item.tags)}')
             # Keep rows compact and predictable when the left panel is narrow.
@@ -386,7 +418,7 @@ class AssetLibraryPanel(QWidget):
         self.update_details()
 
     def update_details(self):
-        item=get_library_item(self.current_item_id())
+        item=self.current_library_item()
         enabled=item is not None
         self.preview.setEnabled(enabled and item.kind == 'sound')
         self.use.setEnabled(enabled)

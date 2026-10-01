@@ -343,11 +343,11 @@ class SmoothWorkbench:
                             image=QImage(str(target))
                         if not image.isNull(): posters[source_path]=image.scaled(320,180,Qt.KeepAspectRatio,Qt.SmoothTransformation)
                     if (asset.has_audio or asset.kind=='audio') and source_path not in waveforms:
-                        target=root/(uuid.uuid5(uuid.NAMESPACE_URL,key+'-wave-v3').hex+'.png')
+                        target=root/(uuid.uuid5(uuid.NAMESPACE_URL,key+'-wave-v4').hex+'.png')
                         if not target.exists():
                             subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-i',asset.path,
-                                '-filter_complex','showwavespic=s=1200x180:colors=63ead4:scale=sqrt:draw=full:filter=peak',
-                                '-frames:v','1','-threads','1',str(target)],check=True,timeout=20,capture_output=True)
+                                '-filter_complex','[0:a]showwavespic=s=1600x180:colors=63ead4:scale=sqrt:draw=scale:filter=peak[v]',
+                                '-map','[v]','-frames:v','1','-threads','1',str(target)],check=True,timeout=20,capture_output=True)
                         image=QImage(str(target))
                         if not image.isNull(): waves[source_path]=image
                 except (OSError,subprocess.SubprocessError): pass

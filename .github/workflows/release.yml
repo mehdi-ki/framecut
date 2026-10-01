@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Release tag to build
         required: true
-        default: v3.25.0
+        default: v3.26.0
         type: string
 
 permissions:

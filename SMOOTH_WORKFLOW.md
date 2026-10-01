@@ -1,4 +1,4 @@
-# Framecut 3.25.0 — Smooth Workflow
+# Framecut 3.26.0 — Smooth Workflow
 
 Dieses Update verbessert den vorhandenen Schnittworkflow in 32 Punkten.
 Projekte bleiben kompatibel; neue Clip-Metadaten werden mit neutralen Vorgaben geladen.

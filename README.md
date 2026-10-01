@@ -1,4 +1,4 @@
-# Framecut 3.25.0 — Smooth Workflow
+# Framecut 3.26.0 — Smooth Workflow
 
 Native Linux-Videoschnitt-App mit einer CapCut-ähnlichen Anordnung. Eigener Code,
 keine CapCut-Kopie. Python/PySide6 mit lokalem FFmpeg-Export und optionaler lokaler
@@ -16,7 +16,7 @@ Bewegung. **Strg+Alt+Z** zeigt den Verlauf. In der Timeline: **Strg+Mausrad** zo
 **Mitteltaste** oder **Umschalt+Mausrad** verschiebt die Ansicht, **Esc** verwirft eine
 laufende Mausgeste. **B gedrückt halten** vergleicht die Timeline ohne Bild-Effekte.
 
-## Neu in 3.25: Vorschau-Performance und Preset-Bibliotheken
+## Neu in 3.26: Direkter Player, Sound-Assets und flüssige Audioextraktion
 
 Die Mehrspur-Vorschau bleibt nach Schnitten sofort abspielbar: Der letzte
 gültige Renderstand bleibt sichtbar, während die aktuelle Komposition im
@@ -26,14 +26,23 @@ für den Export unverändert. Audio-Wellenformen werden unter einem
 kanonischen Medienpfad gespeichert und erscheinen auch in älteren Projekten
 zuverlässig in der Timeline.
 
-Die Modusleiste öffnet jetzt eigene Offline-Bibliotheken für **Textdesigns**,
-**Sticker**, **Effekte**, **Übergänge** und **Filter**. Bei Textdesigns werden
-erst Preset und danach der Text gewählt; alle Stilwerte werden direkt auf den
-neuen Clip übernommen.
+Die Modusleiste öffnet jetzt getrennte Bereiche für **Sound**, **Textdesigns**,
+**Animationen**, **Sticker**, **Effekte**, **Übergänge** und **Filter**. Der frühere Sammelpunkt
+„Bibliothek“ ist entfernt, damit jeder Inhalt dort liegt, wo er benutzt wird.
+Der **Einfach-/Pro-Modus** ist sichtbar getrennt: Einfach zeigt die
+Kernwerkzeuge, Pro blendet Audio-Smarttools, Masken, KI, Keyframes und weitere
+Profi-Bereiche ein. Quelle und Timeline-Arbeitsbereich teilen sich unter dem
+Player nur noch eine kompakte Icon-Leiste.
 
-## Neu in 3.24: Asset-Bibliothek
+Jeder dieser Bereiche besitzt **＋ Eigenen Import**. Sounds akzeptieren WAV,
+MP3, FLAC, OGG, M4A und AAC. Effekte, Animationen, Übergänge, Textdesigns und
+Sticker werden als Framecut-JSON-Preset importiert; Filter akzeptieren zusätzlich
+`.cube`- und `.3dl`-LUTs. Die eigenen Assets werden lokal im Framecut-
+Benutzerordner gespeichert und stehen beim nächsten Start wieder bereit.
 
-Der neue Tab **Bibliothek** links stellt 22 offline nutzbare Starter-Assets bereit:
+## Neu in 3.24: Starter-Assets
+
+Die getrennten Bereiche stellen 22 offline nutzbare Starter-Assets bereit:
 sechs Sounds, sechs Videoeffekt-Presets, sechs Animationen und vier Übergänge.
 Suche und Kategorien filtern die Liste sofort. Sounds können angehört, mit
 **Verwenden** auf einer freien Audiospur eingefügt oder direkt auf die Timeline
@@ -61,7 +70,7 @@ verwendet; beim Export bleibt die Originaldatei unverändert.
 
 1. Framecut schließen und die bisherigen Projekte speichern.
 2. Dieses ZIP in einen **neuen Ordner** entpacken. Die bisherige Version als Rückfall behalten.
-3. Den Ordner `Framecut-3.25.0` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
+3. Den Ordner `Framecut-3.26.0` öffnen, in dem `start.sh`, `install.sh` und `app.py` liegen.
 4. Rechtsklick auf eine freie Stelle → „Im Terminal öffnen“.
 5. Ausführen:
 
@@ -70,14 +79,14 @@ verwendet; beim Export bleibt die Originaldatei unverändert.
    ```
 
 Für eine Desktop-Installation kannst du stattdessen `bash install.sh` ausführen.
-Der Installer legt Framecut unter `~/.local/share/framecut/3.25.0` ab und erstellt
+Der Installer legt Framecut unter `~/.local/share/framecut/3.26.0` ab und erstellt
 den Starter `~/.local/bin/framecut` sowie einen Eintrag im Anwendungsmenü.
 
-## Linux-Auslieferung 3.25.0
+## Linux-Auslieferung 3.26.0
 
 Das Quellpaket enthält jetzt drei reproduzierbare Auslieferungswege:
 
-- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.25.0_amd64.deb`. Installation mit `sudo apt install ./framecut_3.25.0_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.25.0/.venv` an; FFmpeg und Python bleiben systemweit.
+- **Debian/Ubuntu/Mint:** `bash build_deb.sh` erzeugt ein echtes `framecut_3.26.0_amd64.deb`. Installation mit `sudo apt install ./framecut_3.26.0_amd64.deb`. Die Anwendung legt ihre Python-Umgebung pro Benutzer unter `~/.local/share/framecut/3.26.0/.venv` an; FFmpeg und Python bleiben systemweit.
 - **AppImage:** `bash build_appimage.sh` erzeugt aus der vorbereiteten `Framecut.AppDir` ein echtes Type-2-AppImage, sobald das offizielle `appimagetool` über `PATH` oder `APPIMAGETOOL=/pfad/appimagetool` verfügbar ist. Der Builder bricht ohne dieses Werkzeug bewusst ab und erzeugt keine Datei, die nur fälschlich `.AppImage` heißt.
 - **Komplettes Release:** `bash build_release.sh` erstellt das Linux-ZIP, das `.deb`, Prüfsummen und – falls `appimagetool` vorhanden ist – das AppImage. Ohne Tool bleibt eine kurze Build-Hinweisdatei neben den übrigen Artefakten.
 
@@ -116,7 +125,7 @@ neu gestartet werden. Die Manifest-Datei selbst wird nie automatisch verändert.
 
 ### GitHub-Release-Automation
 
-`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.25.0` automatisch
+`.github/workflows/release.yml` veröffentlicht bei einem Tag wie `v3.26.0` automatisch
 die getesteten ZIP-, `.deb`- und AppImage-Dateien sowie `updates.json`. Die Version
 kommt aus der Datei `VERSION`; Tag und Versionsdatei müssen übereinstimmen. Dadurch
 werden Prüfsummen und Download-Adressen für den Update-Checker bei jedem Release
@@ -476,6 +485,11 @@ Videoclip auswählen und rechts im Inspector **Geschwindigkeit** ändern. 1× is
 ## Audio aus Video extrahieren
 
 Videoclip auswählen und im Clip-Inspector auf **Audio aus Video extrahieren** klicken. Framecut erzeugt eine eigene WAV-Datei unter `~/.local/state/framecut/extracted-audio/`, übernimmt nur den ausgewählten Quellbereich in eine neue Audiospur und setzt die Lautstärke des ursprünglichen Videoclips auf 0. Die WAV-Datei wird als Projektmedium gespeichert und bleibt nach einem Neustart verfügbar.
+Solange diese Audiospur unverändert und synchron bleibt, nutzt die Vorschau weiterhin
+den Original-AV-Stream für die direkte Wiedergabe: Auch nach einem Schnitt muss kein
+neuer Mehrspur-Render abgewartet werden. Sobald die extrahierte Spur verschoben,
+geschnitten, stummgeschaltet oder mit Audioeffekten verändert wird, wechselt Framecut
+automatisch in den korrekten Mehrspur-Render.
 
 ## So funktioniert die Timeline
 

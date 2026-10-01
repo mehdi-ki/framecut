@@ -1,8 +1,8 @@
 # Framecut Asset-Bibliothek
 
-Framecut 3.25 bringt eine offline nutzbare Starter-Bibliothek direkt im
-Editor mit. Die Modusleiste öffnet zusätzlich eigene Sammlungen für Textdesign,
-Sticker, Effekte, Übergänge und Filter. Alles benötigt
+Framecut 3.26 bringt offline nutzbare Starter-Assets direkt im
+Editor mit. Die Modusleiste öffnet getrennte Sammlungen für Sound, Textdesign,
+Animationen, Sticker, Effekte, Übergänge und Filter. Alles benötigt
 keinen Account und keinen Download von Drittanbieter-Paketen.
 
 ## Inhalt
@@ -30,9 +30,30 @@ keinen Account und keinen Download von Drittanbieter-Paketen.
 Suche und Kategorie-Filter wirken sofort. **Vorschau** steht für Sounds zur
 Verfügung. **Verwenden** fügt einen Sound auf einer freien Audiospur ein oder
 wendet ein Preset auf den ausgewählten Clip an. Sounds können zusätzlich aus
-der Liste direkt auf eine Audiospur der Timeline gezogen werden. Die fünf
+der Liste direkt auf eine Audiospur der Timeline gezogen werden. Die sieben
 dedizierten Modusleisten zeigen jeweils nur ihre eigene Sammlung und erklären
 im Detailfeld, ob ein Element eingefügt oder auf die Auswahl angewendet wird.
 
-Die Bibliothek ist bewusst klein und zuverlässig gehalten. Eigene Medien
-bleiben weiterhin im Medienpanel; die Bibliothek ersetzt den Import nicht.
+## Eigene Assets importieren
+
+In jedem Bereich gibt es **＋ Eigenen Import**. Sounds können als WAV, MP3,
+FLAC, OGG, M4A oder AAC importiert werden. Eigene Effekte, Animationen,
+Übergänge, Textdesigns und Sticker werden als JSON-Preset eingelesen. Filter
+akzeptieren zusätzlich `.cube`- und `.3dl`-LUT-Dateien. Die Dateien werden in
+den lokalen Framecut-Benutzerordner kopiert; die Originale bleiben unverändert.
+
+Ein JSON-Preset verwendet dieses Format:
+
+```json
+{
+  "title": "Mein Effekt",
+  "category": "effects",
+  "description": "Kurze Beschreibung",
+  "tags": ["custom", "look"],
+  "parameters": {"effect_preset": "cinematic"}
+}
+```
+
+Die Kategorie muss zum geöffneten Bereich passen. Unterstützt werden
+`effects`, `animations`, `transitions`, `text_styles`, `stickers` und
+`filters`.

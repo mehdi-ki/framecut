@@ -749,4 +749,20 @@ QHeaderView::section {
 QFormLayout QLabel {
     color: #9aa5b4;
 }
+
+QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {
+    border: 1px solid #86efd3;
+}
+QToolButton:focus, QPushButton:focus {
+    border: 1px solid #86efd3;
+}
+QWidget:disabled {
+    color: #8396a5;
+}
+QToolTip {
+    background: #203443;
+    color: #f1f8fc;
+    border: 1px solid #7195a5;
+    padding: 6px;
+}
 """

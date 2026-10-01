@@ -72,6 +72,10 @@ class DeliveryTest(unittest.TestCase):
         self.assertTrue((root/'framecut.svg').is_file())
         self.assertTrue((root/'transcription.py').is_file())
         self.assertTrue((root/'ai_tools.py').is_file())
+        for module in ('ux.py','workbench.py'):
+            self.assertTrue((root/module).is_file())
+            for script in ('build_deb.sh','build_appimage.sh'):
+                self.assertIn(module,(root/script).read_text(encoding='utf-8'))
         self.assertIn('faster-whisper', (root/'requirements.txt').read_text(encoding='utf-8'))
         self.assertIn('opencv-python-headless', (root/'requirements.txt').read_text(encoding='utf-8'))
         self.assertIn('rembg', (root/'requirements.txt').read_text(encoding='utf-8'))

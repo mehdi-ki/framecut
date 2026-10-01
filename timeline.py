@@ -5,7 +5,7 @@ from time import monotonic
 from PySide6.QtCore import Qt, Signal, QRectF, QMimeData, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QDrag, QImage, QPolygonF
 from PySide6.QtWidgets import QWidget, QListWidget
-from core import edited_clip, snap_time, length
+from core import edited_clip, snap_time, length, validate_timeline
 
 ASSET_MIME = 'application/x-framecut-asset'
 
@@ -54,7 +54,10 @@ class Timeline(QWidget):
     track_lock_requested = Signal(int)
     marker_context_requested = Signal(float, object)
     zoom_request = Signal(int)
+    zoom_at_request = Signal(int, float)
     pan_request = Signal(int)
+    navigation_started = Signal()
+    trim_preview = Signal(object, str)
     gesture_done = Signal()
     LEFT, TOP, ROW = 150, 36, 70
 
@@ -69,6 +72,7 @@ class Timeline(QWidget):
         self.markers = []
         self.playhead = 0.0
         self.scale = 60.0
+        self.ui_scale = 1.0
         self.snap = True
         self.drag = None
         self.playhead_drag = False
@@ -79,6 +83,11 @@ class Timeline(QWidget):
         self.marquee_append = False
         self.ghost = None
         self.snapline = None
+        self.assets = []
+        self.drop_preview = None
+        self.ghost_valid = True
+        self.gesture_origin = None
+        self.feedback = ''
         # Some Linux/Qt combinations deliver both the mouse right-click path
         # and a follow-up context-menu event. Keep one native gesture from
         # opening the editor menu twice while still allowing a new click
@@ -265,7 +274,35 @@ class Timeline(QWidget):
         return bool(self.track_states.get(track, {}).get("locked", False))
 
     def hit(self, point):
-        return next((c for c in reversed(self.clips) if self.rect_for(c).contains(point)), None)
+        direct = next((c for c in reversed(self.clips) if self.rect_for(c).contains(point)), None)
+        if direct:
+            return direct
+        return next((c for c in reversed(self.clips)
+                     if self.rect_for(c).adjusted(-5,0,5,0).contains(point)), None)
+
+    def edge_mode(self, clip, point):
+        r = self.rect_for(clip); tolerance = min(11, max(3, r.width()/3))
+        if abs(point.x()-r.left()) <= tolerance:
+            return 'left'
+        if abs(point.x()-r.right()) <= tolerance:
+            return 'right'
+        return 'move'
+
+    def fade_handle(self, clip, point):
+        if clip.kind != 'audio' or clip.uid not in self.selection:
+            return None
+        r = self.rect_for(clip)
+        if abs(point.y()-(r.top()+10)) > 8 or r.width() < 30:
+            return None
+        for mode, x in (('fade_in', r.left()+max(8, clip.fade_in*self.scale)),
+                        ('fade_out', r.right()-max(8, clip.fade_out*self.scale))):
+            if abs(point.x()-x) <= 8:
+                return mode
+        return None
+
+    def ui_font(self,size,weight=QFont.Normal):
+        font=QFont('Sans',round(size*self.ui_scale),weight)
+        return font
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -275,9 +312,9 @@ class Timeline(QWidget):
         p.fillRect(ruler, QColor('#111d28'))
         p.fillRect(QRectF(0, 0, self.LEFT, self.TOP), QColor('#15232e'))
         p.setPen(QColor('#8ea6b5'))
-        p.setFont(QFont('Sans', 8, QFont.Bold))
+        p.setFont(self.ui_font( 8, QFont.Bold))
         p.drawText(QRectF(14, 0, self.LEFT-24, self.TOP), Qt.AlignLeft|Qt.AlignVCenter, 'TRACKS')
-        p.setFont(QFont('Sans',9))
+        p.setFont(self.ui_font(9))
         viewport = QRectF(event.rect())
         steps = [.1,.25,.5,1,2,5,10,15,30,60,120,300,600]
         step = next((s for s in steps if s*self.scale>=65),600)
@@ -290,18 +327,18 @@ class Timeline(QWidget):
             p.drawText(int(x)+5,22,f'{int(t)//60:02}:{t%60:04.1f}' if step<1 else f'{int(t)//60:02}:{int(t)%60:02}')
         p.fillRect(0,self.TOP,self.LEFT,self.height()-self.TOP,QColor('#111b25'))
         p.setPen(QPen(QColor('#304451'),1)); p.drawLine(self.LEFT,0,self.LEFT,self.height())
-        p.setFont(QFont('Sans',9))
+        p.setFont(self.ui_font(9))
         for i, track in enumerate(self.tracks):
             y=self.TOP+i*self.ROW
             row_color = QColor('#101a23' if i % 2 == 0 else '#0e1720')
             p.fillRect(QRectF(0,y,self.width(),self.ROW), row_color)
             p.setPen(QColor('#233541')); p.drawLine(0,y,self.width(),y)
             p.setPen(QColor('#8bd9c5' if track < 0 else '#8fc9e1'))
-            p.setFont(QFont('Sans',9,QFont.Bold))
+            p.setFont(self.ui_font(9,QFont.Bold))
             name=self.track_names.get(track, f'VIDEO {track}' if track>0 else f'AUDIO {-track}')
             track_icon='▣' if track > 0 else '♫'
             p.drawText(QRectF(12,y+9,self.LEFT-64,22),Qt.AlignLeft|Qt.AlignVCenter,f'{track_icon}  {name}')
-            p.setFont(QFont('Sans',8))
+            p.setFont(self.ui_font(8))
             p.setPen(QColor('#6f8797'))
             p.drawText(QRectF(12,y+32,self.LEFT-24,18),Qt.AlignLeft|Qt.AlignVCenter,'Bild + Ton' if track>0 else 'Musik / Ton')
             state = self.track_states.get(track, {})
@@ -310,7 +347,7 @@ class Timeline(QWidget):
             for box_x, letter, color in ((self.LEFT-53,'M',mute_color),(self.LEFT-29,'L',lock_color)):
                 p.setBrush(QColor('#26333d') if ((letter == 'M' and state.get('muted')) or (letter == 'L' and state.get('locked'))) else QColor('#192630'))
                 p.setPen(QPen(QColor('#334957'),1)); p.drawRoundedRect(QRectF(box_x,y+16,20,20),5,5)
-                p.setPen(color); p.setFont(QFont('Sans',8,QFont.Bold)); p.drawText(QRectF(box_x,y+16,20,20),Qt.AlignCenter,letter)
+                p.setPen(color); p.setFont(self.ui_font(8,QFont.Bold)); p.drawText(QRectF(box_x,y+16,20,20),Qt.AlignCenter,letter)
         for marker in self.markers:
             marker_time = float(marker.get('time', 0.0))
             x = self.LEFT + marker_time * self.scale
@@ -320,10 +357,10 @@ class Timeline(QWidget):
             p.setPen(QPen(color, 1, Qt.DashLine)); p.drawLine(int(x), 4, int(x), self.height())
             p.setPen(Qt.NoPen); p.setBrush(color)
             p.drawPolygon(QPolygonF([QPointF(x, 4), QPointF(x+6, 4), QPointF(x, 11)]))
-            p.setPen(color); p.setFont(QFont('Sans', 8, QFont.Bold if marker.get('kind') == 'chapter' else QFont.Normal))
+            p.setPen(color); p.setFont(self.ui_font( 8, QFont.Bold if marker.get('kind') == 'chapter' else QFont.Normal))
             text = str(marker.get('label', 'Marker'))[:24]
             p.drawText(int(x)+7, 12, text)
-            p.setFont(QFont('Sans', 9))
+            p.setFont(self.ui_font( 9))
         ghost_ids={clip.uid for clip in (self.ghost or [])}
         for c in self.clips:
             if c.uid in ghost_ids:
@@ -331,11 +368,18 @@ class Timeline(QWidget):
             self.draw_clip(p,c,False,viewport)
         for ghost in self.ghost or []:
             self.draw_clip(p,ghost,True,viewport)
+        if self.drop_preview is not None:
+            self.draw_clip(p,self.drop_preview,True,viewport)
+        if self.feedback:
+            feedback_rect = QRectF(max(self.LEFT+8, viewport.left()+12), max(self.TOP+6,viewport.top()+6), 420, 27)
+            p.setPen(Qt.NoPen); p.setBrush(QColor('#172933' if self.ghost_valid else '#592a30'))
+            p.drawRoundedRect(feedback_rect,5,5); p.setPen(QColor('#f0f8fa')); p.setFont(self.ui_font(9))
+            p.drawText(feedback_rect.adjusted(8,0,-5,0),Qt.AlignVCenter,self.feedback)
         if self.marquee_active and self.marquee_start is not None and self.marquee_current is not None:
             rect = QRectF(self.marquee_start, self.marquee_current).normalized()
             p.setPen(QPen(QColor('#63ead4'), 1, Qt.DashLine)); p.setBrush(QColor(99,234,212,35)); p.drawRect(rect)
         if not self.clips:
-            p.setPen(QColor('#8794a6')); p.setFont(QFont('Sans',10,QFont.Bold)); p.drawText(self.LEFT+24,self.TOP+40,'Timeline leer · Medien hierher ziehen oder mit + hinzufügen')
+            p.setPen(QColor('#8794a6')); p.setFont(self.ui_font(10,QFont.Bold)); p.drawText(self.LEFT+24,self.TOP+40,'Timeline leer · Medien hierher ziehen oder mit + hinzufügen')
         if self.snapline is not None:
             p.setPen(QPen(QColor('#f8c86f'),1,Qt.DashLine))
             x=int(self.LEFT+self.snapline*self.scale); p.drawLine(x,28,x,self.height())
@@ -355,12 +399,14 @@ class Timeline(QWidget):
         p.setBrush(fill)
         p.drawRoundedRect(r,7,7)
         accent = QColor('#e6bf67' if c.source_type=='adjustment' else '#c898ed' if c.kind=='text' else '#70c8e2' if c.track>0 else '#72d0ac')
+        if c.label_color:
+            accent = QColor(c.label_color)
         p.setPen(Qt.NoPen); p.setBrush(accent); p.drawRoundedRect(QRectF(r.left()+1,r.top()+1,r.width()-2,3),2,2)
         if selected:
             p.setBrush(QColor(116,226,208,36)); p.setPen(Qt.NoPen); p.drawRoundedRect(r.adjusted(3,4,-3,-3),5,5)
         if c.kind == 'text':
-            p.setPen(QColor('#f5e8ff')); p.setFont(QFont('Sans',9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),'T  '+c.text[:24])
-            p.setPen(QColor('#d8b9ef')); p.setFont(QFont('Sans',8)); p.drawText(int(r.left()+10),int(r.top()+43),f'{c.length:.2f} s  ·  Text')
+            p.setPen(QColor('#f5e8ff')); p.setFont(self.ui_font(9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),'T  '+c.text[:24])
+            p.setPen(QColor('#d8b9ef')); p.setFont(self.ui_font(8)); p.drawText(int(r.left()+10),int(r.top()+43),f'{c.length:.2f} s  ·  Text')
         if c.kind == 'video' and c.path in self.thumbnails and r.width() > 34:
             image = self._thumbnail(c.path, r.height()-4)
             if image is not None:
@@ -375,8 +421,8 @@ class Timeline(QWidget):
                 p.restore()
         if c.source_type == 'adjustment':
             p.save(); p.setClipRect(r.adjusted(8,2,-7,-2))
-            p.setPen(QColor('#f8d27a')); p.setFont(QFont('Sans',9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),'FX  Adjustment-Layer')
-            p.setPen(QColor('#d6b86a')); p.setFont(QFont('Sans',8)); p.drawText(int(r.left()+10),int(r.top()+43),f'{c.length:.2f} s  ·  Effekte')
+            p.setPen(QColor('#f8d27a')); p.setFont(self.ui_font(9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),'FX  Adjustment-Layer')
+            p.setPen(QColor('#d6b86a')); p.setFont(self.ui_font(8)); p.drawText(int(r.left()+10),int(r.top()+43),f'{c.length:.2f} s  ·  Effekte')
             p.restore()
         if c.kind == 'audio' and c.path in self.waveforms and r.width() > 24:
             image = self._waveform(c, r.width()-6, r.height()-6)
@@ -387,16 +433,16 @@ class Timeline(QWidget):
                 p.restore()
         p.save(); p.setClipRect(r.adjusted(8,2,-7,-2))
         if c.kind != 'text' and c.source_type != 'adjustment':
-            title = c.compound_name or Path(c.path).name
+            title = c.display_name or c.compound_name or Path(c.path).name
             if c.camera_angle:
                 title = f'{title} · {c.camera_angle}'
             if r.width() > 54:
-                p.setPen(QColor('#e5f4f8')); p.setFont(QFont('Sans',9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),title[:32])
+                p.setPen(QColor('#e5f4f8')); p.setFont(self.ui_font(9,QFont.Bold)); p.drawText(int(r.left()+10),int(r.top()+23),title[:32])
             if r.width() > 82:
                 detail = f'{c.length:.2f} s  ·  {c.volume:.0%}'
                 if c.multicam_group and not c.multicam_active:
                     detail += '  ·  inaktiver Winkel'
-                p.setPen(QColor('#aec7d1')); p.setFont(QFont('Sans',8)); p.drawText(int(r.left()+10),int(r.top()+43),detail)
+                p.setPen(QColor('#aec7d1')); p.setFont(self.ui_font(8)); p.drawText(int(r.left()+10),int(r.top()+43),detail)
         p.restore()
         if selected and r.width()>18:
             p.setOpacity(1)
@@ -436,11 +482,28 @@ class Timeline(QWidget):
                 width=25 if text != 'VOL' else 31
                 badge_x-=width
                 p.setPen(Qt.NoPen); p.setBrush(QColor(color)); p.drawRoundedRect(QRectF(badge_x,r.top()+8,width,16),4,4)
-                p.setPen(QColor('#12202a')); p.setFont(QFont('Sans',7,QFont.Bold)); p.drawText(QRectF(badge_x,r.top()+8,width,16),Qt.AlignCenter,text)
+                p.setPen(QColor('#12202a')); p.setFont(self.ui_font(7,QFont.Bold)); p.drawText(QRectF(badge_x,r.top()+8,width,16),Qt.AlignCenter,text)
                 badge_x-=3
             p.restore()
         if self.track_states.get(c.track, {}).get('muted'):
             p.save(); p.setBrush(QColor(10,14,20,92)); p.setPen(QPen(QColor('#ff8f8f'),1,Qt.DashLine)); p.drawRoundedRect(r.adjusted(2,2,-2,-2),4,4); p.restore()
+        if not c.enabled:
+            p.fillRect(r.adjusted(2,2,-2,-2),QColor(10,14,20,170))
+            p.setPen(QColor('#dae1e8')); p.drawText(r.adjusted(8,0,-8,0),Qt.AlignCenter,'AUS')
+        if c.kind == 'audio' and r.width() > 30:
+            p.save(); p.setClipRect(r.adjusted(2,2,-2,-2)); p.setPen(QPen(QColor('#c5ffdb'),1.5))
+            left_x = r.left()+min(c.length,c.fade_in)*self.scale
+            right_x = r.right()-min(c.length,c.fade_out)*self.scale
+            p.drawLine(QPointF(r.left(),r.bottom()),QPointF(left_x,r.top()+10))
+            p.drawLine(QPointF(right_x,r.top()+10),QPointF(r.right(),r.bottom()))
+            if selected:
+                p.setBrush(QColor('#b6ffde'))
+                for x in (r.left()+max(8,c.fade_in*self.scale),r.right()-max(8,c.fade_out*self.scale)):
+                    p.drawEllipse(QPointF(x,r.top()+10),4,4)
+            p.restore()
+        if ghost:
+            p.setPen(QPen(QColor('#8dffdf' if self.ghost_valid else '#ff8d97'),2,Qt.DashLine))
+            p.setBrush(Qt.NoBrush); p.drawRoundedRect(r,7,7)
         p.setOpacity(1)
 
     def _group_ids(self, clip):
@@ -455,6 +518,9 @@ class Timeline(QWidget):
         return any(self.track_locked(clip.track) for clip in self.clips if clip.uid in self.selection)
 
     def mousePressEvent(self,event):
+        if event.button()==Qt.MiddleButton:
+            self.setFocus(); self.pan_drag=event.globalPosition().x(); self.navigation_started.emit()
+            self.setCursor(Qt.ClosedHandCursor); event.accept(); return
         if event.button()==Qt.RightButton:
             point=event.position().toPoint()
             self._request_context_menu(point,self.mapToGlobal(point))
@@ -464,6 +530,7 @@ class Timeline(QWidget):
             return
         self.setFocus()
         point=event.position()
+        self.gesture_origin = self.playhead
         control = self.track_control_at(point)
         if control and not (event.modifiers() & Qt.ControlModifier):
             track, action = control
@@ -487,7 +554,7 @@ class Timeline(QWidget):
         c=self.hit(point)
         if event.modifiers() & Qt.ControlModifier:
             if not c:
-                self.pan_drag=point.x()
+                self.pan_drag=event.globalPosition().x(); self.navigation_started.emit()
                 self.setCursor(Qt.ClosedHandCursor)
                 return
             ids=self._group_ids(c)
@@ -515,11 +582,7 @@ class Timeline(QWidget):
             if self._selection_locked():
                 self.update()
                 return
-            r=self.rect_for(c); mode='move'
-            if len(ids)==1 and abs(point.x()-r.left())<=7:
-                mode='left'
-            elif len(ids)==1 and abs(point.x()-r.right())<=7:
-                mode='right'
+            mode=(self.fade_handle(c,point) or self.edge_mode(c,point)) if len(ids)==1 else 'move'
             originals=[replace(value) for value in self.clips if value.uid in ids]
             self.drag=(originals,mode,point.x())
         elif point.x()>=self.LEFT:
@@ -533,9 +596,9 @@ class Timeline(QWidget):
     def mouseMoveEvent(self,event):
         point=event.position()
         if self.pan_drag is not None:
-            delta=int(point.x()-self.pan_drag)
+            delta=int(event.globalPosition().x()-self.pan_drag)
             if delta:
-                self.pan_request.emit(delta); self.pan_drag=point.x()
+                self.pan_request.emit(delta); self.pan_drag=event.globalPosition().x()
             self.setCursor(Qt.ClosedHandCursor)
             return
         if self.marquee_start is not None:
@@ -553,7 +616,7 @@ class Timeline(QWidget):
                 self.setCursor(Qt.PointingHandCursor)
                 return
             c=self.hit(point)
-            edge=c and min(abs(point.x()-self.rect_for(c).left()),abs(point.x()-self.rect_for(c).right()))<=7 and len(self._group_ids(c))==1
+            edge=c and (self.fade_handle(c,point) or self.edge_mode(c,point)!='move') and len(self._group_ids(c))==1
             self.setCursor(Qt.ForbiddenCursor if c and (self.track_locked(c.track) or self._selection_locked()) else Qt.SizeHorCursor if edge else Qt.OpenHandCursor if c else Qt.ArrowCursor)
             return
         originals,mode,x=self.drag
@@ -562,6 +625,12 @@ class Timeline(QWidget):
         if abs(point.x()-x)<3 and self.ghost is None:
             return
         group=len(originals)>1
+        if mode in ('fade_in','fade_out'):
+            original=originals[0]
+            value=max(0,min(60,original.length,getattr(original,mode)+(delta if mode=='fade_in' else -delta)))
+            self.ghost=[replace(original,**{mode:value})]; self.ghost_valid=True
+            self.feedback=f'{"Einblenden" if mode=="fade_in" else "Ausblenden"}: {value:.2f} s · Esc bricht ab'
+            self.update(); return
         if group:
             candidates=[edited_clip(original,'move',delta,original.track) for original in originals]
         else:
@@ -588,11 +657,24 @@ class Timeline(QWidget):
                 else:
                     candidates=[edited_clip(original,mode,delta+adjustment,candidates[0].track)]
         self.ghost=candidates
+        try:
+            replacements={c.uid:c for c in candidates}
+            validate_timeline([replacements.get(c.uid,c) for c in self.clips],self.tracks,files=False)
+            self.ghost_valid=not any(self.track_locked(c.track) for c in candidates)
+        except ValueError:
+            self.ghost_valid=False
+        if not self.ghost_valid:
+            self.feedback='Nicht möglich: Spur gesperrt oder Clip überlappt'
+        else:
+            snapped=' · eingerastet' if self.snapline is not None else ''
+            self.feedback=f'{candidates[0].position:.2f} s · {candidates[0].length:.2f} s{snapped} · Esc bricht ab'
+        if mode in ('left','right'):
+            self.trim_preview.emit(candidates[0],mode)
         self.setCursor(Qt.ClosedHandCursor if mode=='move' else Qt.SizeHorCursor)
         self.update()
 
     def mouseReleaseEvent(self,event):
-        if event.button()!=Qt.LeftButton:
+        if event.button() not in (Qt.LeftButton,Qt.MiddleButton):
             return
         if self.pan_drag is not None:
             self.pan_drag=None
@@ -624,34 +706,38 @@ class Timeline(QWidget):
             self.gesture_done.emit()
             self.update()
             return
-        changed=self.ghost
-        self.drag=None; self.ghost=None; self.snapline=None
+        changed=self.ghost if self.ghost_valid else None
+        self.drag=None; self.ghost=None; self.snapline=None; self.feedback=''; self.ghost_valid=True
         if changed:
             self.commit.emit(changed)
         self.gesture_done.emit()
         self.update()
 
     def keyPressEvent(self,event):
-        if event.key()==Qt.Key_Escape and self.pan_drag is not None:
-            self.pan_drag=None; self.setCursor(Qt.ArrowCursor); self.update(); self.gesture_done.emit()
-        elif event.key()==Qt.Key_Escape and self.playhead_drag:
-            self.playhead_drag=False; self.setCursor(Qt.ArrowCursor); self.update(); self.gesture_done.emit()
-        elif event.key()==Qt.Key_Escape and self.drag:
-            self.drag=None; self.ghost=None; self.snapline=None
-            self.update(); self.gesture_done.emit()
-        elif event.key()==Qt.Key_Escape and self.marquee_start is not None:
-            self.marquee_start=None; self.marquee_current=None; self.marquee_active=False; self.marquee_append=False
-            self.setCursor(Qt.ArrowCursor); self.update(); self.gesture_done.emit()
+        if event.key()==Qt.Key_Escape:
+            self.cancel_gesture(); event.accept()
         elif event.key() in (Qt.Key_Delete,Qt.Key_Backspace):
             self.delete_selected.emit()
         else:
             super().keyPressEvent(event)
 
+    def cancel_gesture(self):
+        if self.playhead_drag and self.gesture_origin is not None:
+            self.seek.emit(self.gesture_origin)
+        self.pan_drag=None; self.playhead_drag=False; self.drag=None; self.ghost=None
+        self.marquee_start=None; self.marquee_current=None; self.marquee_active=False; self.marquee_append=False
+        self.drop_preview=None; self.snapline=None; self.feedback=''; self.ghost_valid=True
+        self.setCursor(Qt.ArrowCursor); self.update(); self.gesture_done.emit()
+
     def wheelEvent(self,event):
         if event.modifiers() & Qt.ControlModifier:
-            self.zoom_request.emit(1 if event.angleDelta().y()>0 else -1)
+            self.zoom_at_request.emit(1 if event.angleDelta().y()>0 else -1,event.position().x())
             event.accept()
+        elif event.modifiers() & Qt.ShiftModifier or event.pixelDelta().x() or event.angleDelta().x():
+            delta=event.pixelDelta().x() or event.angleDelta().x() or event.angleDelta().y()
+            self.navigation_started.emit(); self.pan_request.emit(delta); event.accept()
         else:
+            self.navigation_started.emit()
             event.ignore()
 
     def _request_context_menu(self, point, global_pos=None):
@@ -688,17 +774,45 @@ class Timeline(QWidget):
             event.acceptProposedAction()
 
     def dragMoveEvent(self,event):
-        track = self.track_at(event.position().y())
-        if event.mimeData().hasFormat(ASSET_MIME) and track is not None and not self.track_locked(track):
+        candidate=self.asset_drop_candidate(event)
+        self.drop_preview=candidate
+        if candidate is not None and self.ghost_valid:
             event.acceptProposedAction()
+        else:
+            event.ignore()
+        self.update()
+
+    def asset_drop_candidate(self,event):
+        self.ghost_valid=False; self.snapline=None
+        self.feedback='Hier ist keine passende freie Spur'
+        if not event.mimeData().hasFormat(ASSET_MIME): return None
+        try:
+            index=int(bytes(event.mimeData().data(ASSET_MIME)).decode())
+            if index < 0 or index >= len(self.assets): return None
+            asset=self.assets[index]; track=self.track_at(event.position().y())
+            if track is None or (track>0)!=(asset.kind in ('video','text')): return None
+            position=self.time_at(event.position().x())
+            if self.snap and not(event.modifiers() & Qt.ShiftModifier):
+                target=snap_time(position,self.snap_targets(),8/self.scale)
+                if abs(target-position)>1e-9: self.snapline=target
+                position=target
+            candidate=replace(asset,uid='drop-preview',track=track,position=position)
+            if self.track_locked(track): return candidate
+            validate_timeline(self.clips+[candidate],self.tracks,files=False)
+            self.ghost_valid=True
+            self.feedback=f'Einfügen · {position:.2f} s · {self.track_names.get(track,track)}'
+            return candidate
+        except (ValueError,IndexError):
+            self.feedback='Nicht einfügbar: Überlappung oder ungültiges Medium'
+            return locals().get('candidate')
+
+    def dragLeaveEvent(self,event):
+        self.drop_preview=None; self.snapline=None; self.feedback=''; self.ghost_valid=True; self.update()
 
     def dropEvent(self,event):
-        if event.mimeData().hasFormat(ASSET_MIME):
-            track=self.track_at(event.position().y())
-            if track is not None and not self.track_locked(track):
-                index=int(bytes(event.mimeData().data(ASSET_MIME)).decode())
-                position=self.time_at(event.position().x())
-                if self.snap and not(event.modifiers() & Qt.ShiftModifier):
-                    position=snap_time(position,self.snap_targets(),8/self.scale)
-                self.add_asset.emit(index,position,track)
-                event.acceptProposedAction()
+        candidate=self.asset_drop_candidate(event)
+        if candidate is not None and self.ghost_valid:
+            index=int(bytes(event.mimeData().data(ASSET_MIME)).decode())
+            self.add_asset.emit(index,candidate.position,candidate.track); event.acceptProposedAction()
+        else: event.ignore()
+        self.drop_preview=None; self.snapline=None; self.feedback=''; self.ghost_valid=True; self.update()

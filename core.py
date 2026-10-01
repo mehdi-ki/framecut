@@ -178,6 +178,7 @@ AUTO_REFRAME_FORMAT_LABELS = {
     '1:1': 'Quadratisch · 1:1',
 }
 _PROBE_CACHE = {}
+_FRAME_RATE_CACHE = {}
 
 
 def auto_reframe_aspect(format_name, size):
@@ -464,6 +465,9 @@ class Clip:
     # Editing workflow metadata. These fields were added after the first
     # project format and deliberately keep defaults for older .framecut files.
     group_id: str = ""
+    display_name: str = ""
+    label_color: str = ""
+    enabled: bool = True
     # Compound clips keep a named, selectable container identity while the
     # original child clips remain editable on their source tracks.
     compound_id: str = ""
@@ -487,6 +491,12 @@ class Clip:
         return self.position + self.length
 
     def validate(self, files=True):
+        if not isinstance(self.display_name, str) or len(self.display_name) > 200:
+            raise ValueError('Clipname muss ein Text mit höchstens 200 Zeichen sein.')
+        if not isinstance(self.enabled, bool):
+            raise ValueError('Ungültige Clip-Sichtbarkeit.')
+        if not isinstance(self.label_color, str) or (self.label_color and not re.fullmatch(r'#[0-9a-fA-F]{6}', self.label_color)):
+            raise ValueError('Ungültige Clipfarbe.')
         if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in
                    (self.duration, self.start, self.end, self.volume, self.position, self.speed,
                     self.video_scale, self.video_x, self.video_y, self.crop_left, self.crop_top,
@@ -818,6 +828,17 @@ def probe(path):
         raise ValueError("Datei nicht lesbar: " + Path(path).name)
     data = json.loads(r.stdout)
     streams = data.get("streams", [])
+    fps=30.0
+    for stream in streams:
+        if stream.get('codec_type')=='video' and not stream.get('disposition',{}).get('attached_pic'):
+            try:
+                numerator,denominator=stream.get('avg_frame_rate','30/1').split('/')
+                candidate=float(numerator)/float(denominator)
+                if math.isfinite(candidate) and 1<=candidate<=120: fps=candidate
+            except (ValueError,ZeroDivisionError): pass
+            break
+    _FRAME_RATE_CACHE[str(resolved)]=fps
+    if len(_FRAME_RATE_CACHE)>512: _FRAME_RATE_CACHE.pop(next(iter(_FRAME_RATE_CACHE)))
     video = any(s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic") for s in streams)
     audio = any(s.get("codec_type") == "audio" for s in streams)
     durations = [float(s.get("duration") or 0) for s in streams]
@@ -877,7 +898,7 @@ def import_clip(path):
     kind = "video" if video else "audio"
     source_type = "image" if video and Path(path).suffix.lower() in IMAGE_EXTENSIONS else kind
     return Clip(path, duration, end=duration, kind=kind, track=1 if video else -1,
-                has_audio=audio, source_type=source_type)
+                has_audio=audio, source_type=source_type,source_fps=_FRAME_RATE_CACHE.get(path,30.0))
 
 
 def import_image_sequence(paths, fps=24.0):
@@ -2797,7 +2818,7 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
     solo_tracks = {track for track, state in track_states.items() if state["solo"]}
     muted_tracks = {track for track, state in track_states.items()
                     if state["muted"] or (solo_tracks and track not in solo_tracks)}
-    transitions = transition_pairs(clips)
+    transitions = transition_pairs([clip for clip in clips if clip.enabled])
     transition_out = {previous_uid: (incoming_uid, duration, kind)
                       for incoming_uid, (previous_uid, duration, kind) in transitions.items()}
     if not clips:
@@ -2814,6 +2835,9 @@ def render(clips, tracks, target, size=(1920,1080), progress=lambda n: None, can
         raise ValueError("Export darf keine Quelldatei überschreiben.")
     target.parent.mkdir(parents=True, exist_ok=True)
     total = length(clips)
+    # Disabled clips retain their timeline duration but contribute neither
+    # picture nor sound. Originals are never changed.
+    clips = [clip for clip in clips if clip.enabled]
     if duration_override is not None:
         try:
             duration_override = float(duration_override)

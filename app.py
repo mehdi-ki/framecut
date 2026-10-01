@@ -1,4 +1,4 @@
-"""Framecut 3.22.0 — native Linux multitrack editor."""
+"""Framecut 3.23.0 — native Linux multitrack editor."""
 import math
 import os
 import sys
@@ -7,6 +7,8 @@ import threading
 import tempfile
 import uuid
 import subprocess
+import inspect
+import time
 from pathlib import Path
 from dataclasses import replace
 
@@ -29,6 +31,8 @@ from core import (Clip,PRESETS,MIN_CLIP,FILTER_PRESETS,MASK_TYPES,AUDIO_CHANNEL_
                   write_chapter_file,capture_frame)
 from timeline import Timeline,MediaList
 from style import STYLE
+from ux import FineDoubleSpinBox as QDoubleSpinBox, line_icon
+from workbench import SmoothWorkbench, HISTORY_NAMES
 from update_system import (configured_manifest_url,download_verified,fetch_manifest,
                            install_downloaded,preferred_kinds,select_artifact,update_cache_directory,
                            update_checks_disabled)
@@ -37,9 +41,9 @@ from ai_tools import (AIToolError, remove_background_media, track_motion, auto_r
                        analyze_beats, detect_scene_changes, detect_audio_onset)
 
 try:
-    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.22.0'
+    APP_VERSION = Path(__file__).with_name('VERSION').read_text(encoding='utf-8').strip() or '3.23.0'
 except OSError:
-    APP_VERSION = '3.22.0'
+    APP_VERSION = '3.23.0'
 
 
 def label(text,name=None):
@@ -49,7 +53,7 @@ def label(text,name=None):
 
 
 def button(text,callback,primary=False):
-    widget=QPushButton(text); widget.clicked.connect(callback)
+    widget=QPushButton(text); widget.clicked.connect(lambda checked=False:callback())
     if primary: widget.setObjectName('primary')
     return widget
 
@@ -57,7 +61,7 @@ def button(text,callback,primary=False):
 def icon_action(symbol, tooltip, callback, theme_name=None):
     """Create a compact header action without adding another text-heavy box."""
     widget=QToolButton()
-    icon=QIcon.fromTheme(theme_name) if theme_name else QIcon()
+    icon=line_icon(theme_name) if theme_name else QIcon()
     if not icon.isNull():
         widget.setIcon(icon)
         widget.setToolButtonStyle(Qt.ToolButtonIconOnly)
@@ -71,7 +75,7 @@ def icon_action(symbol, tooltip, callback, theme_name=None):
     widget.setIconSize(QSize(17,17))
     widget.setFixedSize(34,30)
     widget.setAutoRaise(True)
-    widget.clicked.connect(callback)
+    widget.clicked.connect(lambda checked=False:callback())
     return widget
 
 
@@ -79,7 +83,7 @@ def timeline_tool_button(symbol, tooltip, callback=None, theme_name=None, toggle
     """Create a compact, icon-first timeline action with a descriptive tooltip."""
     widget=QToolButton()
     widget.setText(symbol)
-    icon=QIcon.fromTheme(theme_name) if theme_name else QIcon()
+    icon=line_icon(theme_name) if theme_name else QIcon()
     if not icon.isNull():
         widget.setIcon(icon)
         widget.setToolButtonStyle(Qt.ToolButtonIconOnly)
@@ -95,7 +99,7 @@ def timeline_tool_button(symbol, tooltip, callback=None, theme_name=None, toggle
     if toggle:
         widget.setCheckable(True)
     if callback is not None:
-        widget.clicked.connect(callback)
+        widget.clicked.connect(lambda checked=False:callback())
     return widget
 
 
@@ -361,7 +365,8 @@ class ExportDialog(QDialog):
         self.setMinimumWidth(430)
         self.work_area=work_area
         layout=QVBoxLayout(self); layout.setContentsMargins(18,16,18,16); layout.setSpacing(12)
-        layout.addWidget(label('EXPORT · FORMAT, QUALITÄT UND HARDWARE','heading'))
+        layout.addWidget(label('EXPORT · FERTIGEN FILM SPEICHERN','heading'))
+        self.summary=label('','projectTitle'); self.summary.setWordWrap(True); layout.addWidget(self.summary)
         form=QFormLayout()
         self.preset_combo=QComboBox()
         for value,info in EXPORT_PRESETS.items():
@@ -376,10 +381,16 @@ class ExportDialog(QDialog):
         for value,title in EXPORT_ENCODER_LABELS.items(): self.encoder_combo.addItem(title,value)
         self.hdr=QCheckBox('HDR10 · BT.2020 / PQ')
         self.hdr.setToolTip('10-Bit-Video mit HDR-Farbmetadaten; benötigt H.265/HEVC oder AV1.')
-        form.addRow('Format',self.format_combo); form.addRow('Videocodec',self.codec_combo)
-        form.addRow('Bildrate',self.fps); form.addRow('Videobitrate',self.bitrate)
-        form.addRow('Encoding',self.encoder_combo); form.addRow('Farbraum',self.hdr)
+        form.addRow('Format',self.format_combo); form.addRow('Bildrate',self.fps)
         layout.addLayout(form)
+        self.advanced_toggle=QToolButton(); self.advanced_toggle.setText('Erweitert · Codec und Qualität')
+        self.advanced_toggle.setCheckable(True); self.advanced_toggle.setArrowType(Qt.RightArrow)
+        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); layout.addWidget(self.advanced_toggle)
+        self.advanced_panel=QWidget(); advanced=QFormLayout(self.advanced_panel)
+        advanced.addRow('Videocodec',self.codec_combo); advanced.addRow('Videobitrate',self.bitrate)
+        advanced.addRow('Encoding',self.encoder_combo); advanced.addRow('Farbraum',self.hdr)
+        layout.addWidget(self.advanced_panel); self.advanced_panel.hide()
+        self.advanced_toggle.toggled.connect(lambda visible:(self.advanced_panel.setVisible(visible),self.advanced_toggle.setArrowType(Qt.DownArrow if visible else Qt.RightArrow)))
         self.work_area_box=QCheckBox('Nur Arbeitsbereich exportieren')
         self.work_area_box.setEnabled(bool(work_area))
         if work_area:
@@ -398,6 +409,26 @@ class ExportDialog(QDialog):
         self.preset_combo.currentIndexChanged.connect(self.preset_changed)
         self.preset_combo.setCurrentIndex(self.preset_combo.findData('master'))
         self.preset_changed()
+        if parent is not None and hasattr(parent,'clips'):
+            source=next((c for c in parent.clips if c.kind=='video' and c.source_type not in ('image','adjustment')),None)
+            self.fps.setValue(source.source_fps if source else 30)
+            saved=getattr(parent,'last_export_settings',{})
+            try: saved=normalize_export_settings(saved) if saved else {}
+            except (ValueError,TypeError): saved={}
+            if saved:
+                self.format_combo.setCurrentIndex(self.format_combo.findData(saved['format']))
+                self.codec_combo.setCurrentIndex(self.codec_combo.findData(saved['video_codec']))
+                self.fps.setValue(saved['fps']); self.bitrate.setValue(saved['bitrate_kbps'])
+                self.encoder_combo.setCurrentIndex(self.encoder_combo.findData(saved['encoder'])); self.hdr.setChecked(saved['hdr'])
+        self.fps.valueChanged.connect(self.update_summary); self.format_combo.currentIndexChanged.connect(self.update_summary)
+        self.preset_combo.currentIndexChanged.connect(self.update_summary); self.work_area_box.toggled.connect(self.update_summary)
+        self.update_summary()
+
+    def update_summary(self,*_):
+        parent=self.parent(); preset=EXPORT_PRESETS.get(self.preset_combo.currentData(),{})
+        size=preset.get('size') or (PRESETS[parent.preset.currentText()] if parent is not None and hasattr(parent,'preset') else (1920,1080))
+        area='Arbeitsbereich' if self.work_area_box.isChecked() else 'Gesamte Timeline'
+        self.summary.setText(f'{size[0]} × {size[1]} · {self.fps.value():g} FPS · {self.format_combo.currentText()}\n{area} · Originalmedien')
 
     def preset_changed(self,*_):
         values=EXPORT_PRESETS.get(self.preset_combo.currentData())
@@ -745,10 +776,15 @@ class MixerDialog(QDialog):
             self.track_controls[track] = {'volume_slider':volume_slider,'volume_spin':volume_spin,
                                           'pan_slider':pan_slider,'pan_spin':pan_spin,'mute':mute,
                                           'solo':solo,'meter':meter}
-            volume_slider.valueChanged.connect(lambda value, t=track: volume_spin.setValue(value))
-            volume_spin.valueChanged.connect(lambda value, t=track: volume_slider.setValue(round(value)))
-            pan_slider.valueChanged.connect(lambda value, t=track: pan_spin.setValue(value))
-            pan_spin.valueChanged.connect(lambda value, t=track: pan_slider.setValue(round(value)))
+            volume_slider.valueChanged.connect(lambda value, s=volume_spin: s.setValue(value))
+            volume_spin.valueChanged.connect(lambda value, s=volume_slider: s.setValue(round(value)))
+            pan_slider.valueChanged.connect(lambda value, s=pan_spin: s.setValue(value))
+            pan_spin.valueChanged.connect(lambda value, s=pan_slider: s.setValue(round(value)))
+            for control in (volume_slider,pan_slider):
+                control.sliderPressed.connect(lambda:setattr(self,'_checkpointed',False))
+                control.sliderReleased.connect(lambda:setattr(self,'_checkpointed',False))
+            for control in (volume_spin,pan_spin):
+                control.editingFinished.connect(lambda:setattr(self,'_checkpointed',False))
             volume_spin.valueChanged.connect(lambda value, t=track: self.set_track(t, volume=value/100.0))
             pan_spin.valueChanged.connect(lambda value, t=track: self.set_track(t, pan=value/100.0))
             mute.toggled.connect(lambda value, t=track: self.set_track(t, muted=value))
@@ -905,11 +941,12 @@ class UpdateDownloadJob(QThread):
             self.result.emit({'ok':False,'error':str(exc)})
 
 
-class Editor(QMainWindow):
+class Editor(SmoothWorkbench,QMainWindow):
     def __init__(self,state_dir=None,recovery=True):
         super().__init__()
         self.state_dir=Path(state_dir) if state_dir else state_directory()
         self.state_dir.mkdir(parents=True,exist_ok=True)
+        self.init_smooth_state(); self.job_type=Job
         self.recovery_path=self.state_dir/'recovery.framecut'
         self.cache_root=self.state_dir/'cache'; self.cache_root.mkdir(parents=True,exist_ok=True)
         self.cache_limit_bytes=768*1024*1024
@@ -964,7 +1001,7 @@ class Editor(QMainWindow):
         # Debounce edits so a burst of trim/property changes produces one
         # preview render after the user pauses, not one render per keystroke.
         self.live_preview_timer=QTimer(self); self.live_preview_timer.setSingleShot(True); self.live_preview_timer.setInterval(700); self.live_preview_timer.timeout.connect(self.auto_preview)
-        self.build_ui(); self.update_project_identity(); self.setAcceptDrops(True); self.update_cache_status()
+        self.build_ui(); self.init_smooth_ui(); self.update_project_identity(); self.setAcceptDrops(True); self.update_cache_status()
         shortcuts=[('Ctrl+I',self.import_dialog),('Ctrl+S',self.save),('Ctrl+Shift+S',lambda:self.save(True)),
                    ('Ctrl+O',self.open_project),('Ctrl+N',self.new_project),('Ctrl+Z',self.undo),
                    ('Ctrl+Shift+Z',self.redo),('Ctrl+Y',self.redo),('Ctrl+B',self.split),('S',self.split),
@@ -981,12 +1018,13 @@ class Editor(QMainWindow):
                    ('Shift+Alt+Right',lambda:self.slip_selected(1)),
                    ('Ctrl+A',self.select_all),('J',self.transport_j),('K',self.transport_stop),('L',self.transport_l),
                    ('Ctrl+K',self.open_command_palette),('Ctrl+Shift+F',self.toggle_focus_mode),('F11',self.toggle_cinema_preview),
+                   ('Ctrl+Alt+Z',self.show_history),('Up',lambda:self.jump_cut(-1)),('Down',lambda:self.jump_cut(1)),
                    ('Space',self.toggle_play),('Delete',self.remove),('Backspace',self.remove),
                    ('Left',lambda:self.nudge_playhead(-1)),('Right',lambda:self.nudge_playhead(1)),
                    ('Shift+Left',lambda:self.nudge_playhead(-5)),('Shift+Right',lambda:self.nudge_playhead(5)),
                    ('Home',lambda:self.set_playhead(0)),('End',lambda:self.set_playhead(length(self.clips)))]
         for shortcut,fn in shortcuts:
-            action=QAction(self); action.setShortcut(shortcut); action.setShortcutContext(Qt.ApplicationShortcut); action.triggered.connect(fn); self.addAction(action)
+            action=QAction(self); action.setShortcut(shortcut); action.setShortcutContext(Qt.WindowShortcut); action.triggered.connect(fn); self.addAction(action)
         self.refresh()
         self.statusBar().showMessage('Bereit · Lokal auf deinem Rechner · Quelldateien bleiben unverändert')
         if recovery: QTimer.singleShot(0,self.offer_recovery)
@@ -1044,8 +1082,8 @@ class Editor(QMainWindow):
             tab.clicked.connect(activate); mode_layout.addWidget(tab)
             return tab
         mode_tab('Medien',lambda:self.media_search.setFocus(),True,'Medienablage öffnen')
-        mode_tab('Audio',self.open_mixer,'Audio-Mixer öffnen')
-        mode_tab('Text',self.add_text,'Textclip am Spurende anlegen')
+        mode_tab('Audio',self.open_mixer,tooltip='Audio-Mixer öffnen')
+        mode_tab('Text',self.add_text,tooltip='Textclip am Spurende anlegen')
         mode_tab('Sticker',lambda:self.statusBar().showMessage('Sticker-Bereich · eigene Medien lassen sich über Import hinzufügen'))
         mode_tab('Effekte',lambda:self.statusBar().showMessage('Effekte findest du rechts im Inspector · Presets und Adjustment-Layer sind verfügbar'))
         mode_tab('Übergänge',lambda:self.statusBar().showMessage('Übergänge findest du rechts im Inspector · Clip auswählen'))
@@ -1106,7 +1144,7 @@ class Editor(QMainWindow):
         self.media_favorites_only.setToolTip('Nur markierte Medien anzeigen')
         self.media_favorites_only.toggled.connect(lambda *_: self.refresh_media())
         self.media_favorite_button=QToolButton(); self.media_favorite_button.setObjectName('mediaFavoriteButton'); self.media_favorite_button.setText('☆'); self.media_favorite_button.setToolTip('Ausgewähltes Medium als Favorit markieren'); self.media_favorite_button.setAccessibleName('Medium als Favorit markieren'); self.media_favorite_button.clicked.connect(self.toggle_asset_favorite)
-        library_tools.addWidget(label('ANSICHT','muted')); library_tools.addWidget(self.media_view_combo); library_tools.addWidget(self.media_favorites_only); library_tools.addStretch(); library_tools.addWidget(self.media_favorite_button); ml.addLayout(library_tools)
+        library_tools.addWidget(self.media_view_combo); library_tools.addWidget(self.media_favorites_only); library_tools.addStretch(); library_tools.addWidget(self.media_favorite_button); ml.addLayout(library_tools)
         media_hint=label('Ziehen zum Einfügen · Doppelklick zum Anhängen','subtle'); media_hint.setWordWrap(True); ml.addWidget(media_hint)
         self.media_empty_hint=label('Noch keine Medien\nImportiere ein Video, Audio oder Bild, um zu starten.','emptyState'); self.media_empty_hint.setAlignment(Qt.AlignCenter); self.media_empty_hint.setWordWrap(True); self.media_empty_hint.setVisible(False); ml.addWidget(self.media_empty_hint)
         self.media_list=MediaList(); self.media_list.setObjectName('mediaList'); self.media_list.setViewMode(QListWidget.IconMode)
@@ -1145,7 +1183,7 @@ class Editor(QMainWindow):
         self.seek=QSlider(Qt.Horizontal); self.seek.setRange(0,10000); self.seek.sliderMoved.connect(self.seek_slider); pl.addWidget(self.seek)
         controls=QHBoxLayout(); self.play_button=button('▶ Timeline',self.toggle_play); controls.addWidget(self.play_button)
         controls.addWidget(button('Clip ansehen',self.source_preview)); controls.addStretch()
-        self.cinema_button=button('⛶ Cinema',self.toggle_cinema_preview); self.cinema_button.setObjectName('iconButton'); controls.addWidget(self.cinema_button)
+        self.cinema_button=button('Vollbild',self.toggle_cinema_preview); self.cinema_button.setIcon(line_icon('view-fullscreen')); self.cinema_button.setObjectName('iconButton'); controls.addWidget(self.cinema_button)
         self.time_label=label('00:00.0 / 00:00.0','muted'); controls.addWidget(self.time_label); pl.addLayout(controls)
         source_controls=QHBoxLayout(); source_controls.setContentsMargins(0,0,0,0); source_controls.setSpacing(4)
         self.source_range_label=label('Quelle: Clip ansehen für In/Out','muted'); self.source_range_label.setObjectName('sourceRangeLabel'); source_controls.addWidget(self.source_range_label,1)
@@ -1163,12 +1201,12 @@ class Editor(QMainWindow):
         self.work_clear_button=timeline_tool_button('×','Arbeitsbereich löschen',self.clear_work_area,object_name='sourceToolDanger')
         for widget in (self.work_in_button,self.work_out_button,self.work_clear_button): work_controls.addWidget(widget)
         work_bar=QFrame(); work_bar.setObjectName('previewSubbar'); work_bar.setLayout(work_controls); pl.addWidget(work_bar)
-        preview_tools=QFrame(); preview_tools.setObjectName('previewToolbar')
+        preview_tools=QFrame(); self.preview_tools=preview_tools; preview_tools.setObjectName('previewToolbar')
         preview_tools_layout=QVBoxLayout(preview_tools); preview_tools_layout.setContentsMargins(8,4,8,4); preview_tools_layout.setSpacing(1)
         preview_tools_layout.addLayout(preview_options); preview_tools_layout.addLayout(performance_options); pl.addWidget(preview_tools)
         top.addWidget(preview)
         inspector,inspector_outer=panel(); self.inspector_panel=inspector; inspector.setObjectName('inspectorPanel'); inspector.setMinimumWidth(250); inspector.setMinimumHeight(0)
-        inspector_scroll=QScrollArea(); inspector_scroll.setWidgetResizable(True); inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        inspector_scroll=QScrollArea(); self.inspector_scroll=inspector_scroll; inspector_scroll.setWidgetResizable(True); inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded); inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         inspector_content=QWidget(); il=QVBoxLayout(inspector_content); il.setContentsMargins(0,0,0,0); il.setSpacing(8)
         inspector_scroll.setWidget(inspector_content); inspector_outer.addWidget(inspector_scroll)
         inspector_header=QFrame(); inspector_header.setObjectName('inspectorHeader')
@@ -1197,7 +1235,7 @@ class Editor(QMainWindow):
             body_layout=QVBoxLayout(body); body_layout.setContentsMargins(10,7,10,10); body_layout.setSpacing(7)
             toggle.toggled.connect(lambda checked, body=body, toggle=toggle: (body.setVisible(checked), toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)))
             section_layout.addWidget(toggle); section_layout.addWidget(body); il.addWidget(section)
-            self.inspector_sections.append({'section':section,'advanced':advanced,'toggle':toggle})
+            self.inspector_sections.append({'section':section,'advanced':advanced,'toggle':toggle,'body':body})
             return body_layout
 
         self.position=QDoubleSpinBox(); self.start=QDoubleSpinBox(); self.end=QDoubleSpinBox()
@@ -1363,6 +1401,7 @@ class Editor(QMainWindow):
             layout.setVerticalSpacing(5); layout.setHorizontalSpacing(9)
             layout.setLabelAlignment(Qt.AlignLeft|Qt.AlignVCenter)
             layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+            layout.setRowWrapPolicy(QFormLayout.WrapLongRows)
             return layout
 
         clip_form=configure_form(QFormLayout())
@@ -1594,7 +1633,7 @@ class Editor(QMainWindow):
         self.set_edit_mode()
         self.apply_workspace_preset()
 
-    def error(self,message): QMessageBox.warning(self,'Framecut',str(message))
+    def error(self,message): self.present_error(message)
 
     def update_project_identity(self):
         """Keep the compact header in sync with the active project."""
@@ -1603,7 +1642,9 @@ class Editor(QMainWindow):
         name=Path(self.project_path).stem if self.project_path else 'Neues Projekt'
         self.project_title_label.setText(name)
         self.project_meta_label.setText('Gespeichert' if self.project_path else 'Lokales Projekt')
-        self.autosave_pill.setText('● Ungespeichert' if self.dirty else '● Autosave')
+        saved=self.autosave_revision==self.revision and self.last_autosave is not None
+        self.autosave_pill.setText('● Wiederherstellbar' if self.dirty and saved else '● Sicherung folgt' if self.dirty else '● Gespeichert' if self.project_path else '● Bereit')
+        self.autosave_pill.setToolTip('Autosave ist eine Wiederherstellungskopie. Strg+S speichert deine Projektdatei.')
         self.autosave_pill.setProperty('dirty',bool(self.dirty))
         self.autosave_pill.style().unpolish(self.autosave_pill); self.autosave_pill.style().polish(self.autosave_pill); self.autosave_pill.update()
 
@@ -1647,6 +1688,7 @@ class Editor(QMainWindow):
         if not hasattr(self, 'top'):
             return
         self.focus_mode=not self.focus_mode
+        if self.focus_mode: self._normal_sizes=self.top.sizes()
         self.media_panel.setVisible(not self.focus_mode)
         self.inspector_panel.setVisible(not self.focus_mode)
         self.focus_button.setText('Fokus schließen' if self.focus_mode else 'Fokus')
@@ -1655,17 +1697,20 @@ class Editor(QMainWindow):
             self.top.setSizes([0, 1200, 0])
             self.statusBar().showMessage('Fokusmodus · Vorschau und Timeline maximiert',3000)
         else:
-            self.apply_workspace_preset()
+            if self._normal_sizes: self.top.setSizes(self._normal_sizes)
+            else: self.apply_workspace_preset()
             self.statusBar().showMessage('Fokusmodus beendet · Arbeitsbereich wiederhergestellt',3000)
 
     def update_context_toolbar(self):
         if not hasattr(self, 'context_toolbar'):
             return
         clip=self.current_clip()
-        available=clip is not None and not self.worker
+        available=clip is not None and not self.worker and not self.selection_locked()
         self.context_toolbar.setVisible(bool(clip))
         for action in (self.context_split_button,self.context_duplicate_button,self.context_reset_button,self.context_delete_button):
             action.setEnabled(available)
+        self.context_reset_button.setEnabled(bool(available and len(self.selection)==1 and clip.kind=='video'))
+        self.context_reset_button.setProperty('disabledReason','Wähle genau einen entsperrten Videoclip aus.')
 
     def set_media_view(self, *_):
         """Switch the media browser between visual cards and a compact list."""
@@ -1684,7 +1729,8 @@ class Editor(QMainWindow):
         item=self.media_list.currentItem() if hasattr(self, 'media_list') else None
         if item is None:
             return self.statusBar().showMessage('Wähle zuerst ein Medium aus.',2500)
-        uid=item.data(MediaList.ASSET_UID_ROLE)
+        index=item.data(MediaList.ASSET_INDEX_ROLE)
+        uid=str(Path(self.assets[index].path).resolve())
         if uid in self.favorite_assets:
             self.favorite_assets.remove(uid); message='Favorit entfernt.'
         else:
@@ -1696,7 +1742,7 @@ class Editor(QMainWindow):
         if not hasattr(self, 'media_favorite_button'):
             return
         item=self.media_list.currentItem()
-        uid=item.data(MediaList.ASSET_UID_ROLE) if item is not None else None
+        uid=str(Path(self.assets[item.data(MediaList.ASSET_INDEX_ROLE)].path).resolve()) if item is not None else None
         favorite=uid in self.favorite_assets if uid is not None else False
         self.media_favorite_button.setEnabled(item is not None)
         self.media_favorite_button.setText('★' if favorite else '☆')
@@ -2709,6 +2755,10 @@ class Editor(QMainWindow):
             ('Projekt speichern', 'Ctrl+S', self.save),
             ('Medien importieren', 'Ctrl+I', self.import_dialog),
             ('Fokusmodus umschalten', 'Ctrl+Shift+F', self.toggle_focus_mode),
+            ('Bearbeitungsverlauf öffnen', 'Ctrl+Alt+Z', self.show_history),
+            ('Projekt-Statuszentrale öffnen', '—', self.show_project_status),
+            ('Zum vorherigen Schnitt', '↑', lambda:self.jump_cut(-1)),
+            ('Zum nächsten Schnitt', '↓', lambda:self.jump_cut(1)),
             ('Einfach-Modus aktivieren', '—', lambda: self.edit_mode_combo.setCurrentIndex(self.edit_mode_combo.findData('simple'))),
             ('Pro-Modus aktivieren', '—', lambda: self.edit_mode_combo.setCurrentIndex(self.edit_mode_combo.findData('pro'))),
             ('Schnitt-Layout aktivieren', '—', lambda: self.workspace_preset_combo.setCurrentIndex(self.workspace_preset_combo.findData('edit'))),
@@ -2882,10 +2932,14 @@ class Editor(QMainWindow):
                 dict(self.track_names),list(self.selection),[clone(c) for c in self.assets],
                 [dict(marker) for marker in self.markers],dict(self.master_mixer))
 
-    def checkpoint(self):
+    def checkpoint(self,title=None):
+        caller=inspect.currentframe().f_back.f_code.co_name
         self.history.append(self.snapshot()); self.history=self.history[-80:]; self.future.clear()
+        self.history_labels.append(title or HISTORY_NAMES.get(caller,'Bearbeitung'))
+        self.history_labels=self.history_labels[-80:]; self.future_labels.clear()
 
     def changed(self):
+        self.compare_released()
         self.dirty=True; self.revision+=1; self.preview_revision=-1; self.preview_signature=None
         self.preview_queued=True; self.preview_play_requested=False
         if self.preview_worker:
@@ -2908,15 +2962,19 @@ class Editor(QMainWindow):
         if hasattr(self,'live_preview_box') and self.live_preview_box.isChecked() and self.clips:
             self.live_preview_timer.start()
         self.refresh()
+        self.refresh_history()
+        QTimer.singleShot(0,self.ensure_missing_proxies)
 
     def preset_changed(self,*_): self.changed()
 
     def undo(self):
         if self.history and not self.worker:
+            self.future_labels.append(self.history_labels.pop() if self.history_labels else 'Bearbeitung')
             self.future.append(self.snapshot()); self.clips,self.tracks,self.current,self.track_states,self.track_names,self.selection,self.assets,self.markers,self.master_mixer=self.history.pop(); self.refresh_media(); self.prepare_visuals(self.assets); self.changed()
 
     def redo(self):
         if self.future and not self.worker:
+            self.history_labels.append(self.future_labels.pop() if self.future_labels else 'Bearbeitung')
             self.history.append(self.snapshot()); self.clips,self.tracks,self.current,self.track_states,self.track_names,self.selection,self.assets,self.markers,self.master_mixer=self.future.pop(); self.refresh_media(); self.prepare_visuals(self.assets); self.changed()
 
     def refresh(self):
@@ -3237,6 +3295,25 @@ class Editor(QMainWindow):
         self.checkpoint(); self.clips=[candidate if value.uid==c.uid else value for value in self.clips]; self.changed()
 
     def fill_inspector(self):
+        if self._inspector_filling: return
+        self._inspector_filling=True
+        scroll=self.inspector_scroll.verticalScrollBar(); old_scroll=scroll.value()
+        try:
+            self._fill_inspector_values(); self.refresh_inline()
+            clip=self.current_clip()
+            for control in self._inspector_controls():
+                if self.worker or self.selection_locked(): control.setEnabled(False)
+                reason=('Wähle zuerst einen Clip aus.' if not clip else
+                        'Wähle für diese Einstellung genau einen Clip aus.' if len(self.selection)>1 else
+                        'Entsperre die Spur, um diesen Clip zu bearbeiten.' if self.selection_locked() else
+                        'Die laufende Analyse muss zuerst abgeschlossen oder abgebrochen werden.' if self.worker else
+                        'Für diesen Cliptyp oder Zustand nicht verfügbar; prüfe die Auswahl und zugehörigen Optionen.')
+                control.setProperty('disabledReason',reason if not control.isEnabled() else '')
+        finally:
+            self._inspector_filling=False
+            scroll.setValue(old_scroll)
+
+    def _fill_inspector_values(self):
         self.update_context_toolbar()
         c=self.current_clip(); self.track_combo.clear()
         if len(self.selection)>1:
@@ -3429,6 +3506,7 @@ class Editor(QMainWindow):
             self.multicam_status.setText('Keine Multi-Kamera-Gruppe.')
 
     def select_clip(self,uid):
+        self.compare_released(); self.video.cancel_transform()
         if uid!=self.current and self.mode=='source':
             self.player.pause();self.pending_seek=None;self.player.setSource(QUrl());self.mode='timeline'
             self.source_clip_uid=None;self.source_in=None;self.source_out=None
@@ -3436,6 +3514,7 @@ class Editor(QMainWindow):
         self.set_selection([uid], uid, expand_groups=True)
 
     def commit_drag(self,candidate):
+        if self.worker: self.refresh(); return
         candidates = list(candidate) if isinstance(candidate, (list, tuple)) else [candidate]
         originals = {value.uid: value for value in self.clips}
         if any(value.uid not in originals for value in candidates):
@@ -3513,6 +3592,7 @@ class Editor(QMainWindow):
             self.error(exc)
 
     def apply_properties(self):
+        if self._inspector_filling or self.worker: return
         c=self.current_clip()
         if len(self.selection)>1:
             self.statusBar().showMessage('Inspector-Änderungen sind bei Mehrfachauswahl deaktiviert.',3000)
@@ -3602,6 +3682,7 @@ class Editor(QMainWindow):
                 values.update(transition_type=transition_type,
                               transition_duration=self.transition_duration.value() if transition_type!='none' else 0.0)
             candidate=replace(c,**values)
+            if candidate==c: return
             try:
                 proposed=[candidate if v.uid==c.uid else v for v in self.clips]; validate_timeline(proposed,self.tracks)
                 self.checkpoint(); self.clips=proposed; self.changed()
@@ -3869,7 +3950,10 @@ class Editor(QMainWindow):
         selected=self.selected_clips()
         if selected and not self.worker and not self.selection_locked():
             removed={clip.uid for clip in selected}
-            self.checkpoint(); self.clips=[clip for clip in self.clips if clip.uid not in removed]; self.selection=[]; self.current=None; self.changed()
+            anchor=selected[0]
+            self.checkpoint(); self.clips=[clip for clip in self.clips if clip.uid not in removed]
+            adjacent=min(self.clips,key=lambda c:((c.track!=anchor.track),abs(c.position-anchor.position)),default=None)
+            self.current=adjacent.uid if adjacent else None; self.selection=[self.current] if self.current else []; self.changed()
 
     def add_track(self,video):
         if self.worker:return
@@ -4543,7 +4627,7 @@ class Editor(QMainWindow):
                 progress(int((i+1)/len(paths)*100))
             if cancel.is_set():raise ExportCancelled()
             return assets,errors
-        self.start_job('Medien werden geprüft …',operation,self.import_done)
+        self.start_independent_job('import','Medien werden geprüft …',operation,self.import_done)
 
     def import_done(self,result):
         if not result['ok']:return self.job_error(result)
@@ -4551,8 +4635,10 @@ class Editor(QMainWindow):
         asset_key=lambda asset:(asset.source_type,tuple(asset.source_paths) if asset.source_paths else asset.path)
         known={asset_key(asset) for asset in self.assets}
         added=[asset for asset in assets if asset_key(asset) not in known]
+        if added: self.checkpoint('Medien importieren')
         self.assets.extend(added); self.prepare_visuals(added); self.refresh_media()
         if added:self.changed()
+        if added and self.performance_combo.currentData()=='smooth': QTimer.singleShot(0,self.performance_changed)
         if errors:self.error('\n'.join(errors))
 
     def refresh_media(self):
@@ -4575,7 +4661,7 @@ class Editor(QMainWindow):
                 continue
             if filter_value not in ('all',category) and not (filter_value=='offline' and offline):
                 continue
-            if favorites_only and c.uid not in self.favorite_assets:
+            if favorites_only and str(Path(c.path).resolve()) not in self.favorite_assets:
                 continue
             rows.append((index,c,category,offline,icon,label_kind))
         if sort_value == 'name':
@@ -4586,7 +4672,7 @@ class Editor(QMainWindow):
             rows.sort(key=lambda row:(-float(row[1].duration),Path(row[1].path).name.casefold(),row[0]))
         self.media_list.setUpdatesEnabled(False); self.media_list.clear()
         for index,c,category,offline,icon,label_kind in rows:
-            marker=('⚠  ' if offline else '')+('★  ' if c.uid in self.favorite_assets else '')
+            marker=('⚠  ' if offline else '')+('★  ' if str(Path(c.path).resolve()) in self.favorite_assets else '')
             item=QListWidgetItem(f'{marker}{icon}  {Path(c.path).name}\n{c.duration:.1f} s  ·  {label_kind}')
             poster=self.thumbnails.get(c.path) if hasattr(self,'thumbnails') else None
             if poster is not None and not poster.isNull():
@@ -4616,6 +4702,7 @@ class Editor(QMainWindow):
             else:
                 self.media_empty_hint.setText('Keine Medien passen zu diesem Filter\nSuche oder Filter zurücksetzen.')
         self.update_media_favorite_button()
+        self.timeline.assets=self.assets if hasattr(self,'timeline') else []
         if hasattr(self,'proxy_box'):
             available=any(c.kind in ('video','audio') and c.source_type not in ('image','image_sequence')
                           and c.path and Path(c.path).is_file() for c in self.assets+self.clips)
@@ -4625,35 +4712,13 @@ class Editor(QMainWindow):
                 self.proxy_box.setChecked(False)
 
     def prepare_visuals(self, assets):
-        """Create a lightweight poster frame for each imported video.
+        """Posters and waveforms are decoded off the GUI thread."""
+        self.queue_visuals(assets)
 
-        The frame is only editor metadata; source files are never modified.
-        """
-        for asset in assets:
-            try:
-                if asset.kind == 'video' and asset.path not in self.thumbnails:
-                    target=self.thumbnail_cache/(uuid.uuid5(uuid.NAMESPACE_URL, asset.path).hex+'.jpg')
-                    if asset.source_type in ('image','image_sequence'):
-                        image=QImage(asset.source_paths[0] if asset.source_paths else asset.path)
-                        if not image.isNull():
-                            image=image.scaled(320,180,Qt.KeepAspectRatio,Qt.SmoothTransformation)
-                    else:
-                        if not target.exists():
-                            subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-ss',str(min(.5,max(0,asset.duration*.08))),'-i',asset.path,'-frames:v','1','-vf','scale=320:-2',str(target)],check=True,timeout=20)
-                        image=QImage(str(target))
-                    if not image.isNull(): self.thumbnails[asset.path]=image
-                if (asset.kind == 'audio' or asset.has_audio) and asset.path not in self.waveforms:
-                    target=self.thumbnail_cache/(uuid.uuid5(uuid.NAMESPACE_URL, asset.path+'-wave-v2').hex+'.png')
-                    if not target.exists():
-                        subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-i',asset.path,
-                                        '-filter_complex','showwavespic=s=1200x180:colors=63ead4:scale=sqrt:draw=full:filter=peak',
-                                        '-frames:v','1',str(target)],check=True,timeout=30)
-                    image=QImage(str(target))
-                    if not image.isNull(): self.waveforms[asset.path]=image
-            except (OSError, subprocess.SubprocessError):
-                continue
-        self.timeline.set_visuals(self.thumbnails,self.waveforms)
-        self.trim_cache()
+    def jump_cut(self,direction):
+        targets=sorted({v for c in self.clips for v in (c.position,c.finish)})
+        choices=[v for v in targets if (v-self.playhead)*direction>1e-6]
+        if choices: self.set_playhead(min(choices) if direction>0 else max(choices))
 
     def nudge_playhead(self, seconds):
         if self.worker:return
@@ -4751,9 +4816,11 @@ class Editor(QMainWindow):
         event.acceptProposedAction()
 
     def zoom(self,value):
-        old=self.timeline.scale; scroll=self.scroll.horizontalScrollBar(); center=(scroll.value()+self.scroll.viewport().width()/2-self.timeline.LEFT)/old
+        old=self.timeline.scale; scroll=self.scroll.horizontalScrollBar()
+        center,offset=self._zoom_anchor or ((scroll.value()+self.scroll.viewport().width()/2-self.timeline.LEFT)/old,self.scroll.viewport().width()/2)
         self.timeline.scale=float(value); self.timeline.refresh(self.clips,self.tracks,self.current,self.track_states,self.track_names,self.selection)
-        scroll.setValue(int(center*value+self.timeline.LEFT-self.scroll.viewport().width()/2))
+        self.timeline.resize(max(self.timeline.minimumWidth(),self.scroll.viewport().width()),self.timeline.height())
+        scroll.setValue(int(center*value+self.timeline.LEFT-offset))
 
     def fit_timeline(self):
         width=self.scroll.viewport().width()-self.timeline.LEFT-35
@@ -4885,6 +4952,7 @@ class Editor(QMainWindow):
 
     def set_playhead(self,time):
         self.playhead=max(0,min(length(self.clips),float(time))); self.timeline.set_playhead(self.playhead); self.update_time()
+        self.refresh_view_geometry()
         if self.mode=='timeline' and self.preview_is_current():
             self.player.setPosition(int(min(self.playhead,length(self.clips))*1000))
         elif self.mode=='source' and self.current_clip():
@@ -4905,12 +4973,13 @@ class Editor(QMainWindow):
 
     def play_state(self,state):
         if state==QMediaPlayer.PlayingState:
+            self.follow_suspended=False
             self.play_button.setText(f'Ⅱ {self.transport_rate:g}×' if self.transport_rate else 'Ⅱ Pause')
         else:
             self.play_button.setText('▶ Timeline')
 
     def position_changed(self,ms):
-        if self.pending_seek:return
+        if self.pending_seek or self.compare_active:return
         if self.mode=='timeline':
             if not self.preview_is_current():return
             self.playhead=ms/1000
@@ -4922,6 +4991,7 @@ class Editor(QMainWindow):
             if ms/1000>=source_out-.015 and self.player.playbackState()==QMediaPlayer.PlayingState:
                 self.player.setPosition(round(source_out*1000)); self.player.pause()
         self.timeline.set_playhead(self.playhead); self.update_time()
+        self.follow_playhead(); self.refresh_view_geometry()
         self.update_source_monitor_controls()
 
     def media_ready(self,status):
@@ -4959,7 +5029,8 @@ class Editor(QMainWindow):
         source_in,source_out=self._source_bounds(c)
         source_time=max(source_in,min(source_out-.01,self._source_position(c)))
         self.update_source_monitor_controls()
-        self.load_player(c.path,source_time,True,c.kind=='video')
+        source=self.proxy_map.get(str(Path(c.path).resolve()),c.path) if self.proxy_enabled else c.path
+        self.load_player(source,source_time,True,c.kind=='video')
 
     def toggle_play(self):
         if self.worker:return
@@ -4987,7 +5058,7 @@ class Editor(QMainWindow):
         self.render_preview()
 
     def auto_preview(self):
-        if self.worker or not self.clips: return
+        if self.worker or not self.clips or self.compare_active: return
         if not self.live_preview_box.isChecked() and not self.preview_play_requested:return
         self.preview_queued=False
         self.render_preview(auto=True)
@@ -4999,6 +5070,7 @@ class Editor(QMainWindow):
             self.live_preview_timer.start()
 
     def render_preview(self,auto=False):
+        if self.compare_active: return
         if self.preview_is_current():
             return
         if self.preview_worker:
@@ -5015,8 +5087,8 @@ class Editor(QMainWindow):
                 source=self.proxy_map.get(str(Path(source).resolve()),source)
             clips.append(replace(clip,path=source,source_paths=list(clip.source_paths)))
         tracks=list(self.tracks); track_states={track:dict(state) for track,state in self.track_states.items()}; master_settings=dict(self.master_mixer)
+        use_gpu=self.gpu_preview_box.isChecked()
         def operation(progress,cancel):
-            use_gpu=self.gpu_preview_box.isChecked()
             try:
                 render(clips,tracks,target,size,progress,cancel,True,track_states,
                        preview_acceleration=use_gpu,master_settings=master_settings)
@@ -5031,7 +5103,7 @@ class Editor(QMainWindow):
             return str(target),revision
         self.preview_status.setText('Mehrspur-Vorschau wird im Hintergrund aktualisiert …')
         job=Job(operation); job.preview_signature=signature; self.preview_worker=job
-        job.progress.connect(lambda value:self.preview_status.setText(f'Mehrspur-Vorschau wird aktualisiert … {value}%'))
+        job.progress.connect(lambda value:None if self.compare_active else self.preview_status.setText(f'Mehrspur-Vorschau wird aktualisiert … {value}%'))
         job.result.connect(lambda result,j=job:self.finish_preview_job(j,result,auto,revision,signature))
         job.start()
 
@@ -5041,6 +5113,9 @@ class Editor(QMainWindow):
         job.wait(); self.preview_worker=None; job.deleteLater()
         stale=revision!=self.revision or signature!=self.preview_signature_for_current()
         if not result['ok']:
+            if self.compare_active:
+                self.preview_queued=True
+                return
             if result.get('cancelled') and (stale or self.preview_queued or self.preview_play_requested):
                 self.live_preview_timer.start()
                 return
@@ -5058,6 +5133,9 @@ class Editor(QMainWindow):
                 self.live_preview_timer.start()
             return
         old=self.preview_path; self.preview_path=path; self.preview_revision=rev; self.preview_signature=signature
+        if self.compare_active:
+            self.preview_queued=False
+            return
         self.mode='timeline'; self.audio.setVolume(1); self.update_source_monitor_controls()
         should_play=self.preview_play_requested
         pending_rate=self.transport_rate_pending
@@ -5184,14 +5262,17 @@ class Editor(QMainWindow):
         if self.project_path:
             directory=Path(self.project_path).with_suffix('.proxies')
         else:
-            directory=self.state_dir/'proxies'/uuid.uuid4().hex
+            directory=self.proxy_directory or self.state_dir/'proxies'/uuid.uuid4().hex
         self.proxy_directory=directory
         clips=[replace(c,source_paths=list(c.source_paths)) for c in self.clips]
         assets=[replace(c,source_paths=list(c.source_paths)) for c in self.assets]
+        profile=self.proxy_profile
         def operation(progress,cancel):
-            return create_proxy_files(clips,assets,directory,profile=self.proxy_profile,
+            return create_proxy_files(clips,assets,directory,profile=profile,
                                       progress=progress,cancel=cancel)
         def complete(result):
+            if profile!=self.proxy_profile:
+                QTimer.singleShot(0,self.start_proxy_generation); return
             if not result['ok']:
                 self.proxy_enabled=False
                 self.proxy_box.blockSignals(True); self.proxy_box.setChecked(False); self.proxy_box.blockSignals(False)
@@ -5204,7 +5285,7 @@ class Editor(QMainWindow):
             self.preview_queued=True
             if self.clips:
                 self.render_preview()
-        self.start_job('Proxy-Dateien werden erzeugt …',operation,complete)
+        self.start_independent_job('proxy','Proxy-Dateien werden erzeugt …',operation,complete)
 
     def update_render_queue_button(self):
         if not hasattr(self,'render_queue_button'):
@@ -5259,7 +5340,7 @@ class Editor(QMainWindow):
             self.update_render_queue_button()
             if self.render_queue and not self.render_queue_paused:
                 QTimer.singleShot(0,self.process_render_queue)
-        self.start_job(item['label']+' wird gerendert …',operation,complete)
+        self.start_independent_job('export',item['label']+' wird gerendert …',operation,complete)
 
     def start_export(self):
         if self.worker:return
@@ -5280,8 +5361,11 @@ class Editor(QMainWindow):
                       for path in ([clip.path]+list(clip.source_paths)
                                    +([clip.background_removed_path] if clip.background_removed_path else []))]
         if any(Path(path).resolve()==target for path in source_files if path):return self.error('Der Export darf keine Quelldatei überschreiben.')
+        if not target.parent.is_dir() or not os.access(target.parent,os.W_OK):
+            return self.error('Zielordner nicht beschreibbar: '+str(target.parent))
         if target.exists() and QMessageBox.question(self,'Datei ersetzen?',f'{target}\nüberschreiben?',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:return
-        clips=[replace(c,source_paths=list(c.source_paths)) for c in self.clips]
+        clips=self.snapshot()[0]
+        self.last_export_settings=dict(export_settings)
         export_duration=None
         if dialog.export_work_area and work_area:
             try:
@@ -5307,12 +5391,12 @@ class Editor(QMainWindow):
         self.render_queue_paused=False; self.process_render_queue()
 
     def start_job(self,title,operation,callback):
+        if self.worker: return
         self.cancel_preview(wait=True)
         self.transport_stop()
-        self.player.pause(); self.centralWidget().setEnabled(False)
-        self.progress=QProgressDialog(title,'Abbrechen',0,100,self)
-        self.progress.setWindowModality(Qt.ApplicationModal);self.progress.setMinimumDuration(0)
-        self.progress.setAutoClose(False);self.progress.setAutoReset(False)
+        self.player.pause()
+        self.progress=self.new_task(title)
+        self.statusBar().showMessage('Analyse läuft · Navigation bleibt verfügbar; Clip-Änderungen nach Abschluss.')
         self.worker=Job(operation);self.progress.canceled.connect(self.worker.cancel.set)
         self.worker.progress.connect(self.progress.setValue)
         self.worker.result.connect(lambda result:self.finish_job(result,callback))
@@ -5320,7 +5404,8 @@ class Editor(QMainWindow):
 
     def finish_job(self,result,callback):
         self.worker.wait();self.worker.deleteLater();self.worker=None
-        self.progress.close();self.progress.deleteLater();self.centralWidget().setEnabled(True)
+        self.progress.close();self.progress.deleteLater()
+        if not self.independent_jobs: self.tasks_host.hide()
         callback(result)
 
     def job_error(self,result):
@@ -5405,10 +5490,18 @@ class Editor(QMainWindow):
 
     def autosave(self):
         if not self.recovery_enabled or not self.dirty:return
+        if self.autosave_revision==self.revision:return
         if self.timeline.drag:
             self.autosave_timer.start();return
         try:
+            backup=self.state_dir/'recovery-previous.framecut'
+            if self.recovery_path.is_file():
+                try:
+                    load_project(self.recovery_path,allow_missing=True)
+                    staged=backup.with_suffix('.tmp'); shutil.copy2(self.recovery_path,staged); os.replace(staged,backup)
+                except (OSError,ValueError): pass
             save_project(self.recovery_path,self.clips,self.preset.currentText(),self.tracks,self.assets,self.project_path,self.track_states,self.track_names,self.markers,self.master_mixer)
+            self.last_autosave=time.time(); self.autosave_revision=self.revision
             self.autosave_label.setText('Autosave ✓');self.autosave_label.setToolTip(str(self.recovery_path)); self.update_project_identity()
         except Exception as exc:
             self.autosave_label.setText('Autosave fehlgeschlagen');self.statusBar().showMessage(str(exc)); self.update_project_identity()
@@ -5418,14 +5511,22 @@ class Editor(QMainWindow):
         if self.recovery_enabled:
             try:self.recovery_path.unlink(missing_ok=True)
             except OSError:pass
+            try:(self.state_dir/'recovery-previous.framecut').unlink(missing_ok=True)
+            except OSError:pass
 
     def offer_recovery(self):
-        if not self.recovery_path.exists():return
+        previous=self.state_dir/'recovery-previous.framecut'
+        if not self.recovery_path.exists() and not previous.exists():return
         answer=QMessageBox.question(self,'Ungespeicherten Schnitt wiederherstellen?',
             'Es gibt eine automatische Sicherung der letzten Sitzung. Wiederherstellen?',QMessageBox.Yes|QMessageBox.No,QMessageBox.Yes)
         if answer!=QMessageBox.Yes:self.clear_recovery();return
         try:
-            data=load_project(self.recovery_path);self.apply_project(data,data.get('origin'));self.changed()
+            try: data=load_project(self.recovery_path,allow_missing=True)
+            except (OSError,ValueError):
+                if not previous.is_file(): raise
+                if self.recovery_path.is_file(): shutil.copy2(self.recovery_path,self.state_dir/f'recovery-unreadable-{uuid.uuid4().hex[:8]}.framecut')
+                data=load_project(previous,allow_missing=True)
+            self.apply_project(data,data.get('origin'));self.changed()
             self.statusBar().showMessage('Autosave wiederhergestellt. Bitte als Projekt speichern.')
         except Exception as exc:
             # Keep unreadable recovery data even if a new session is subsequently saved.
@@ -5457,6 +5558,10 @@ class Editor(QMainWindow):
         return self.save() if answer==QMessageBox.Save else answer==QMessageBox.Discard
 
     def apply_project(self,data,path):
+        self.project_session=getattr(self,'project_session',0)+1
+        self.cancel_interaction()
+        for key,(job,_) in self.independent_jobs.items():
+            if key!='export': job.cancel.set()
         self.cancel_preview(wait=True); self.preview_queued=False; self.preview_play_requested=False
         self.transport_stop()
         self.player.stop();self.pending_seek=None;self.player.setSource(QUrl());self.video_stack.setCurrentIndex(0)
@@ -5467,6 +5572,8 @@ class Editor(QMainWindow):
         self.source_clip_uid=None;self.source_in=None;self.source_out=None
         self.work_in=None;self.work_out=None
         self.history.clear();self.future.clear();self.revision+=1;self.preview_revision=-1;self.preview_signature=None;self.preview_path=None
+        self.history_labels.clear();self.future_labels.clear();self.refresh_history()
+        self.last_autosave=None;self.autosave_revision=-1
         self.preset.blockSignals(True);self.preset.setCurrentText(data['preset'] if data['preset'] in PRESETS else next(iter(PRESETS)));self.preset.blockSignals(False)
         self.mode='timeline';self.dirty=False;self.prepare_visuals(self.assets);self.refresh_media();self.refresh()
         self.placeholder.setText('▶ Timeline berechnet die Mehrspur-Vorschau.\n„Clip ansehen“ zeigt sofort die Quelle.')
@@ -5506,6 +5613,11 @@ class Editor(QMainWindow):
     def closeEvent(self,event):
         if self.worker:
             self.error('Bitte den laufenden Vorgang zuerst abschließen oder abbrechen.');event.ignore();return
+        if self.independent_jobs:
+            answer=QMessageBox.question(self,'Hintergrundaufgaben abbrechen?',
+                'Import, Proxy-Erzeugung oder Export laufen noch. Sicher abbrechen und schließen?',
+                QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+            if answer!=QMessageBox.Yes: event.ignore(); return
         if self.render_queue:
             answer=QMessageBox.question(self,'Render-Queue schließen?',
                 f'{len(self.render_queue)} Exporte sind noch eingereiht und werden beim Schließen verworfen.',
@@ -5514,7 +5626,9 @@ class Editor(QMainWindow):
                 event.ignore();return
             self.render_queue.clear(); self.update_render_queue_button()
         if self.can_discard():
+            self.compare_released()
             self._closing=True
+            self.close_smooth()
             if self.cinema_dialog is not None:
                 self.cinema_dialog.close()
             self.autosave_timer.stop(); self.live_preview_timer.stop(); self.transport_timer.stop()

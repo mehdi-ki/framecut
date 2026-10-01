@@ -36,7 +36,7 @@ class GuiTest(unittest.TestCase):
         # software-only CI preview path than a plain timeline render.
         for _ in range(500):
             QTest.qWait(40)
-            if w.worker is None and w.preview_worker is None:return
+            if w.worker is None and w.preview_worker is None and not w.independent_jobs and w.visual_job is None and w.compare_job is None:return
         self.fail('Background job did not finish after 20 seconds')
 
     def test_visual_workspace_structure(self):

@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Release tag to build
         required: true
-        default: v3.7
+        default: v3.23.0
         type: string
 
 permissions:
@@ -21,6 +21,7 @@ env:
 jobs:
   release:
     runs-on: ubuntu-22.04
+    timeout-minutes: 25
     steps:
       - name: Repository auschecken
         uses: actions/checkout@v4
@@ -46,8 +47,11 @@ jobs:
       - name: Tests ausführen
         env:
           QT_QPA_PLATFORM: offscreen
+          FRAMECUT_DISABLE_UPDATE_CHECK: '1'
         run: |
-          "$RUNNER_TEMP/framecut-venv/bin/python" -m unittest -q test_delivery.py test_core.py test_gui.py
+          bash -n start.sh install.sh build_release.sh build_deb.sh build_appimage.sh
+          "$RUNNER_TEMP/framecut-venv/bin/python" -m compileall -q .
+          "$RUNNER_TEMP/framecut-venv/bin/python" -m unittest -q test_delivery.py test_core.py test_transcription.py test_gui.py test_smooth.py
 
       - name: Offizielles AppImage-Werkzeug laden
         run: |
@@ -60,11 +64,19 @@ jobs:
         env:
           APPIMAGETOOL: ${{ runner.temp }}/appimagetool
           ARCH: x86_64
+          APPIMAGE_EXTRACT_AND_RUN: '1'
           FRAMECUT_RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}
         run: |
           chmod +x build_release.sh build_appimage.sh build_deb.sh
           mkdir -p "$RUNNER_TEMP/release"
           ./build_release.sh "$RUNNER_TEMP/release"
+
+      - name: Pakete und Update-Manifest prüfen
+        env:
+          QT_QPA_PLATFORM: offscreen
+          FRAMECUT_DISABLE_UPDATE_CHECK: '1'
+        run: |
+          "$RUNNER_TEMP/framecut-venv/bin/python" verify_release.py "$RUNNER_TEMP/release"
 
       - name: GitHub Release veröffentlichen
         env:
@@ -79,6 +91,7 @@ jobs:
             gh release create "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --title "Framecut ${RELEASE_TAG}" \
-              --generate-notes \
+              --target "${GITHUB_SHA}" \
+              --notes-file SMOOTH_WORKFLOW.md \
               "$RUNNER_TEMP/release"/*
           fi

@@ -44,7 +44,7 @@ if [[ -n "${FRAMECUT_RELEASE_BASE_URL:-}" ]]; then
     appimage_file="$APPIMAGE_OUTPUT"
     {
         printf '{\n  "product": "Framecut",\n  "version": "%s",\n' "$APP_VERSION"
-        printf '  "release_notes": ["Framecut %s: UX-Workbench mit Einfach-/Pro-Modus, Aufgaben-Layouts, Fokusansicht, kontextabhängigen Clip-Aktionen, Medienfavoriten und klarerer Timeline."],\n' "$APP_VERSION"
+        printf '  "release_notes": ["Framecut %s: Smooth Workflow mit 30 Verbesserungen, Hintergrundaufgaben, gespeichertem Arbeitsplatz, besserem Trimmen, Bearbeitungsverlauf und einfacherem Export."],\n' "$APP_VERSION"
         printf '  "artifacts": {\n'
         if [[ -f "$appimage_file" ]]; then
             printf '    "appimage": {"filename": "%s", "url": "%s/%s", "sha256": "%s"},\n' \
@@ -57,5 +57,11 @@ if [[ -n "${FRAMECUT_RELEASE_BASE_URL:-}" ]]; then
     printf 'Update-Manifest erstellt: %s\n' "$OUTPUT_DIR/updates.json"
 fi
 
-sha256sum "$ZIP_OUTPUT" "$OUTPUT_DIR/framecut_${APP_VERSION}_$(dpkg --print-architecture 2>/dev/null || printf 'amd64').deb" > "$OUTPUT_DIR/SHA256SUMS"
+(
+    cd -- "$OUTPUT_DIR"
+    files=("$(basename "$ZIP_OUTPUT")" "framecut_${APP_VERSION}_$(dpkg --print-architecture 2>/dev/null || printf 'amd64').deb")
+    [[ ! -f "$APPIMAGE_OUTPUT" ]] || files+=("$(basename "$APPIMAGE_OUTPUT")")
+    [[ ! -f updates.json ]] || files+=(updates.json)
+    sha256sum "${files[@]}" > SHA256SUMS
+)
 printf 'Prüfsummen erstellt: %s\n' "$OUTPUT_DIR/SHA256SUMS"

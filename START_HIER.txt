@@ -1,4 +1,11 @@
-FRAMECUT 3.22.0 — START
+FRAMECUT 3.23.0 — START
+
+NEU: Smooth Workflow mit 30 Verbesserungen an der vorhandenen Bedienung.
+Oben im ⋯-Menü: Bearbeitungsverlauf, Projektstatus, UI-Größe, reduzierte Bewegung.
+Strg+Alt+Z: Verlauf. Strg+Mausrad: Zoom am Zeiger. Mitteltaste: Timeline verschieben.
+B halten: Vergleich ohne Bild-Effekte. Esc: aktuelle Mausgeste verwerfen.
+Clip-Schnellbearbeitung und Audio-Fade-Griffe befinden sich direkt an der Timeline.
+Alle 30 Punkte und ihre Bedienung stehen in SMOOTH_WORKFLOW.md.
 
 1. Das ZIP vollständig in einen NEUEN Ordner entpacken.
 2. Den Ordner mit dieser Datei und start.sh öffnen.
